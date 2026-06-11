@@ -12,8 +12,8 @@ exclude-dev = false
 
 [advisories]
 version = 2
-unmaintained = "warn"
-unsound = "deny"
+unmaintained = "all"
+unsound = "all"
 yanked = "deny"
 ignore = []
 
