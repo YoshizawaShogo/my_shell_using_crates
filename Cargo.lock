@@ -704,6 +704,7 @@ dependencies = [
  "crossterm",
  "ratatui",
  "signal-hook 0.4.4",
+ "unicode-width",
 ]
 
 [[package]]
