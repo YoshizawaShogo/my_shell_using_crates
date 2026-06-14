@@ -1,3 +1,4 @@
+mod builtin;
 mod completion;
 mod editor;
 mod events;
@@ -20,6 +21,7 @@ use term::{RawModeGuard, setup_sigint_handler};
 struct Shell {
     ed: LineEditor,
     completion: Box<dyn CompletionSource>,
+    git_branch: Option<String>,
 }
 
 impl Shell {
@@ -27,7 +29,12 @@ impl Shell {
         Self {
             ed: LineEditor::default(),
             completion: Box::new(StubCompletion),
+            git_branch: fetch_git_branch(),
         }
+    }
+
+    fn redraw(&mut self) -> io::Result<()> {
+        redraw_prompt(&mut self.ed, self.git_branch.as_deref())
     }
 }
 
@@ -37,12 +44,11 @@ fn main() -> io::Result<()> {
     let result = run();
     let _ = execute!(stdout(), Print("\r\n"));
     result
-    // _guard の Drop で disable_raw_mode
 }
 
 fn run() -> io::Result<()> {
     let mut shell = Shell::new();
-    redraw_prompt(&mut shell.ed)?;
+    shell.redraw()?;
 
     'main: loop {
         let Event::Key(key) = event::read()? else {
@@ -51,7 +57,6 @@ fn run() -> io::Result<()> {
 
         let mut pending = handle_key(&mut shell.ed, key);
 
-        // 1 つのイベントが新たなイベントを生むため、空になるまで処理する
         while !pending.is_empty() {
             for ev in std::mem::take(&mut pending) {
                 match ev {
@@ -61,9 +66,11 @@ fn run() -> io::Result<()> {
                         execute!(stdout(), Print("^C\r\n"))?;
                         pending.push(ShellEvent::RedrawPrompt);
                     }
-                    ShellEvent::RedrawPrompt => redraw_prompt(&mut shell.ed)?,
+                    ShellEvent::RedrawPrompt => shell.redraw()?,
                     ShellEvent::ExecuteCommand(cmd) => {
                         execute_command(&cmd)?;
+                        // cd などで作業ディレクトリが変わるためブランチを再取得
+                        shell.git_branch = fetch_git_branch();
                         pending.push(ShellEvent::RedrawPrompt);
                     }
                     ShellEvent::ShowCompletion => {
@@ -74,7 +81,6 @@ fn run() -> io::Result<()> {
                         if let Some(choice) = run_completion_menu(&cands, lines_above)? {
                             shell.ed.set(choice);
                         }
-                        // メニュー終了後、カーソルはプロンプト先頭行・列0にいる
                         shell.ed.reset_cursor_tracking();
                         pending.push(ShellEvent::RedrawPrompt);
                     }
@@ -84,4 +90,15 @@ fn run() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn fetch_git_branch() -> Option<String> {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "HEAD")
 }

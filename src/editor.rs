@@ -1,24 +1,19 @@
 //! 行エディタ (readline 相当)。
-//!
-//! 入力バッファとカーソルを保持し、行の編集操作だけを担う。
-//! abbr / alias 展開や補完確定は、この型への操作として実装していく。
 
 use crossterm::{
     cursor, queue,
-    style::Print,
+    style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
 };
 use std::io::{self, Write, stdout};
 use unicode_width::UnicodeWidthStr;
-
-pub const PROMPT: &str = "$ ";
 
 #[derive(Default)]
 pub struct LineEditor {
     buf: String,
     /// カーソル位置 (buf 内のバイトオフセット。常に char 境界)
     cursor: usize,
-    /// プロンプト先頭行からカーソル行までの行数 (折り返し対応)
+    /// ヘッダ行を含む先頭行からカーソル行までの行数
     /// `redraw_prompt` が管理する。次回の `MoveUp` に使う。
     lines_above_cursor: u16,
 }
@@ -62,14 +57,12 @@ impl LineEditor {
         self.cursor = self.buf.len();
     }
 
-    /// 行を確定して取り出し、バッファを空に戻す
     pub fn take(&mut self) -> String {
         self.cursor = 0;
         self.lines_above_cursor = 0;
         std::mem::take(&mut self.buf)
     }
 
-    /// バッファ全体を置き換え、カーソルを末尾へ (補完確定で使用)
     pub fn set(&mut self, s: String) {
         self.buf = s;
         self.cursor = self.buf.len();
@@ -87,13 +80,10 @@ impl LineEditor {
         self.buf.is_empty()
     }
 
-    /// 補完メニュー後にカーソル追跡をリセットする
-    /// (カーソルがプロンプト先頭行・列0にいるとき呼ぶ)
     pub fn reset_cursor_tracking(&mut self) {
         self.lines_above_cursor = 0;
     }
 
-    /// `run_completion_menu` が MoveUp 量を決めるために参照する
     pub fn lines_above_cursor(&self) -> u16 {
         self.lines_above_cursor
     }
@@ -106,17 +96,18 @@ impl LineEditor {
     }
 }
 
-/// プロンプト行を再描画し、カーソルを正しい位置に置く。
+/// プロンプトを再描画する。
 ///
-/// 折り返し対応:
-///   - `lines_above_cursor` 行上がってプロンプト先頭行へ移動
-///   - `Clear(FromCursorDown)` で折り返し分を含む旧描画を一括消去
-///   - `SavePosition`/`RestorePosition` でカーソル位置を確定
-///     (カーソル手前まで印字 → 位置保存 → 残りを印字 → 位置復元)
-pub fn redraw_prompt(ed: &mut LineEditor) -> io::Result<()> {
+/// 画面構成:
+///   行 H : user@host ~/path (branch)  ← ヘッダ行
+///   行 H+1: [入力バッファ]              ← 入力行 (折り返し可)
+///
+/// `lines_above_cursor` は行 H からカーソル行までの距離を保持し、
+/// 次回の `MoveUp` でヘッダ先頭に戻るために使う。
+pub fn redraw_prompt(ed: &mut LineEditor, git_branch: Option<&str>) -> io::Result<()> {
     let (term_cols, _) = terminal::size()?;
 
-    // 1. プロンプト先頭行へ
+    // 1. ヘッダ先頭行へ移動してから全消去
     if ed.lines_above_cursor > 0 {
         queue!(stdout(), cursor::MoveUp(ed.lines_above_cursor))?;
     }
@@ -126,16 +117,37 @@ pub fn redraw_prompt(ed: &mut LineEditor) -> io::Result<()> {
         Clear(ClearType::FromCursorDown)
     )?;
 
-    // 2. カーソル手前を印字 → 位置保存 → 残りを印字 → 位置復元
+    // 2. ヘッダ行を描画
+    let user = std::env::var("USER").unwrap_or_else(|_| "?".to_string());
+    let host = hostname();
+    let cwd = abbreviated_cwd();
+    queue!(
+        stdout(),
+        SetForegroundColor(Color::Green),
+        Print(format!("{}@{}", user, host)),
+        ResetColor,
+        Print(" "),
+        SetForegroundColor(Color::Cyan),
+        Print(cwd),
+        ResetColor,
+    )?;
+    if let Some(branch) = git_branch {
+        queue!(
+            stdout(),
+            Print(" "),
+            SetForegroundColor(Color::Blue),
+            Print(format!("({})", branch)),
+            ResetColor,
+        )?;
+    }
+    queue!(stdout(), Print("\r\n"))?;
+
+    // 3. 入力行: カーソル手前を印字 → 位置保存 → 残りを印字 → 位置復元
     //
-    // wrap-pending 対策:
-    //   cursor_display が term_cols の倍数のとき、端末は「行末で折り返し待機」
-    //   状態になる。SavePosition がこの状態を保存すると、RestorePosition 後の
-    //   cursor 位置が前の行末 (col = term_cols-1) になり、次回の MoveUp が
-    //   1 行分ずれる (y軸ドリフト)。
-    //   → 折り返しを \r\n で明示して位置を確定してから SavePosition する。
-    let cursor_display = (PROMPT.width() + ed.buf[..ed.cursor].width()) as u16;
-    queue!(stdout(), Print(PROMPT), Print(&ed.buf[..ed.cursor]))?;
+    // wrap-pending 対策: cursor_display が term_cols の倍数のとき端末は行末待機状態
+    // になる。この状態で SavePosition すると位置がずれるため \r\n で折り返しを確定。
+    let cursor_display = ed.buf[..ed.cursor].width() as u16;
+    queue!(stdout(), Print(&ed.buf[..ed.cursor]))?;
     if cursor_display > 0 && cursor_display.is_multiple_of(term_cols) {
         queue!(stdout(), Print("\r\n"))?;
     }
@@ -146,8 +158,55 @@ pub fn redraw_prompt(ed: &mut LineEditor) -> io::Result<()> {
         cursor::RestorePosition,
     )?;
 
-    // 3. 次回の MoveUp 量を更新
-    ed.lines_above_cursor = cursor_display / term_cols;
+    // 4. +1 はヘッダ行の分
+    ed.lines_above_cursor = 1 + cursor_display / term_cols;
 
     stdout().flush()
+}
+
+fn hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| std::env::var("HOSTNAME").unwrap_or_else(|_| "?".to_string()))
+}
+
+fn abbreviated_cwd() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "?".to_string());
+
+    // ホームディレクトリを ~ に置換
+    let path = if !home.is_empty() && cwd.starts_with(&home) {
+        format!("~{}", &cwd[home.len()..])
+    } else {
+        cwd
+    };
+
+    // 最終コンポーネント以外を先頭 1 文字に短縮 (fish 方式)
+    // 隠しディレクトリ (.foo) は ".f" に短縮
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() <= 2 {
+        return path;
+    }
+    let mut result = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            result.push('/');
+        }
+        if i == parts.len() - 1 || part.is_empty() {
+            result.push_str(part);
+        } else {
+            let mut chars = part.chars();
+            if let Some(c) = chars.next() {
+                result.push(c);
+                if c == '.'
+                    && let Some(c2) = chars.next()
+                {
+                    result.push(c2);
+                }
+            }
+        }
+    }
+    result
 }
