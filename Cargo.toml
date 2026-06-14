@@ -5,4 +5,6 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-crossterm = "0.28"
+crossterm = "0.29"
+ratatui = "0.30.1"
+signal-hook = "0.4.4"
