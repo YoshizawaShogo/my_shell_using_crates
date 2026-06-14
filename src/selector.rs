@@ -20,25 +20,40 @@ pub enum Selection {
     Aborted,   // Ctrl+C
 }
 
-// ─── インライン menu (Tab) ────────────────────────────────────────────────────
+// ─── グリッドメニュー (Tab 補完) ──────────────────────────────────────────────
 
-/// 候補をインラインメニューで表示し、1 つ選ばせる。fish 風: 枠なし。
+/// fish スタイルの多列補完メニュー。
 ///
-/// **終了後の保証**: カーソルはプロンプト先頭行・列 0 に置かれる。
-pub fn run_menu(candidates: &[String], lines_above_cursor: u16) -> io::Result<Selection> {
+/// レイアウト (行優先): 候補を左→右→折り返しで並べる。
+/// - Tab / → : 次の候補
+/// - Shift+Tab / ← : 前の候補
+/// - ↓ / ↑ : 同列の次/前の行
+/// - Enter : 確定、Esc : キャンセル、Ctrl+C : 中断
+pub fn run_grid_menu(candidates: &[String], lines_above_cursor: u16) -> io::Result<Selection> {
     if candidates.is_empty() {
         return Ok(Selection::Dismissed);
     }
 
-    let (term_cols, _) = terminal::size()?;
-    let popup_height = candidates.len() as u16;
+    let (term_cols, term_rows) = terminal::size()?;
+    let cols = term_cols as usize;
+
+    // 列幅 = 最長候補 + 2 スペース
+    let max_item_w = candidates.iter().map(|s| s.width()).max().unwrap_or(1);
+    let col_width = (max_item_w + 2).min(cols);
+    let n_cols = (cols / col_width).max(1);
+    // 画面の半分まで使う (最小 4 行)
+    let max_rows = ((term_rows as usize) / 2).max(4);
+    let n_rows = candidates.len().div_ceil(n_cols).min(max_rows);
+    let visible = (n_rows * n_cols).min(candidates.len());
+    let items = &candidates[..visible];
+
     let mut selected = 0usize;
     let mut outcome = Selection::Dismissed;
 
     execute!(stdout(), Print("\r\n"))?;
 
     loop {
-        draw_menu(candidates, selected, term_cols, popup_height)?;
+        draw_grid(items, selected, n_cols, col_width, n_rows)?;
 
         let Event::Key(key) = event::read()? else {
             continue;
@@ -50,22 +65,32 @@ pub fn run_menu(candidates: &[String], lines_above_cursor: u16) -> io::Result<Se
                 break;
             }
             KeyCode::Esc => break,
-            KeyCode::Up | KeyCode::BackTab => {
-                selected = selected.checked_sub(1).unwrap_or(candidates.len() - 1);
-            }
-            KeyCode::Down | KeyCode::Tab => {
-                selected = (selected + 1) % candidates.len();
-            }
             KeyCode::Enter => {
-                if let Some(s) = candidates.get(selected).cloned() {
-                    outcome = Selection::Chosen(s);
-                }
+                outcome = Selection::Chosen(items[selected].clone());
                 break;
+            }
+            KeyCode::Tab | KeyCode::Right => {
+                selected = (selected + 1) % items.len();
+            }
+            KeyCode::BackTab | KeyCode::Left => {
+                selected = selected.checked_sub(1).unwrap_or(items.len() - 1);
+            }
+            KeyCode::Down => {
+                let next = selected + n_cols;
+                if next < items.len() {
+                    selected = next;
+                }
+            }
+            KeyCode::Up => {
+                if selected >= n_cols {
+                    selected -= n_cols;
+                }
             }
             _ => {}
         }
     }
 
+    // draw_grid はカーソルをグリッド先頭行に置いて終わる
     execute!(
         stdout(),
         Clear(ClearType::FromCursorDown),
@@ -76,44 +101,49 @@ pub fn run_menu(candidates: &[String], lines_above_cursor: u16) -> io::Result<Se
     Ok(outcome)
 }
 
-fn draw_menu(
-    candidates: &[String],
+fn draw_grid(
+    items: &[String],
     selected: usize,
-    term_cols: u16,
-    popup_height: u16,
+    n_cols: usize,
+    col_width: usize,
+    n_rows: usize,
 ) -> io::Result<()> {
-    let cols = term_cols as usize;
-    let n = candidates.len();
-
-    for (i, cand) in candidates.iter().enumerate() {
-        let text = truncate_to_cols(cand, cols);
-        let pad = cols.saturating_sub(text.width());
-
+    for row in 0..n_rows {
         queue!(
             stdout(),
             cursor::MoveToColumn(0),
             Clear(ClearType::CurrentLine)
         )?;
 
-        if i == selected {
-            queue!(
-                stdout(),
-                SetBackgroundColor(Color::Blue),
-                SetForegroundColor(Color::White),
-                Print(format!("{}{:pad$}", text, "", pad = pad)),
-                ResetColor,
-            )?;
-        } else {
-            queue!(stdout(), Print(text))?;
+        for col in 0..n_cols {
+            let idx = row * n_cols + col;
+            if idx >= items.len() {
+                break;
+            }
+            let text = truncate_to_cols(&items[idx], col_width.saturating_sub(1));
+            let pad = col_width.saturating_sub(text.width());
+
+            if idx == selected {
+                queue!(
+                    stdout(),
+                    SetBackgroundColor(Color::Blue),
+                    SetForegroundColor(Color::White),
+                    Print(format!("{}{:pad$}", text, "", pad = pad)),
+                    ResetColor,
+                )?;
+            } else {
+                queue!(stdout(), Print(format!("{}{:pad$}", text, "", pad = pad)))?;
+            }
         }
 
-        if i + 1 < n {
+        if row + 1 < n_rows {
             queue!(stdout(), Print("\r\n"))?;
         }
     }
 
-    if popup_height > 1 {
-        queue!(stdout(), cursor::MoveUp(popup_height - 1))?;
+    // カーソルをグリッド先頭行へ戻す
+    if n_rows > 1 {
+        queue!(stdout(), cursor::MoveUp(n_rows as u16 - 1))?;
     }
     queue!(stdout(), cursor::MoveToColumn(0))?;
     stdout().flush()
