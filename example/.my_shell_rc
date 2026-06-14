@@ -1,0 +1,36 @@
+# my_shell_rc - 起動時に読み込まれる設定ファイル
+# コメント行は # で始める。空行は無視される。
+# 使えるコマンド: alias, abbr, set, setenv, cd, reg_path
+
+# ── ls エイリアス (Ubuntu bashrc デフォルト相当) ─────────────────────────────
+alias ls "ls --color=auto"
+alias ll "ls -alF --color=auto"
+alias la "ls -A --color=auto"
+alias l  "ls -CF --color=auto"
+
+# ── grep エイリアス ───────────────────────────────────────────────────────────
+alias grep  "grep --color=auto"
+alias fgrep "fgrep --color=auto"
+alias egrep "egrep --color=auto"
+
+# ── 安全操作エイリアス ────────────────────────────────────────────────────────
+alias cp "cp -i"
+alias mv "mv -i"
+alias rm "rm -i"
+
+# ── ディレクトリ移動 abbr ─────────────────────────────────────────────────────
+abbr .. "cd .."
+abbr ... "cd ../.."
+
+# ── git abbr ─────────────────────────────────────────────────────────────────
+abbr g   git
+abbr ga  "git add"
+abbr gc  "git commit"
+abbr gst "git status"
+abbr gd  "git diff"
+abbr gl  "git log --oneline"
+abbr gp  "git push"
+
+# ── 環境変数 ──────────────────────────────────────────────────────────────────
+set EDITOR vim
+set PAGER  less
