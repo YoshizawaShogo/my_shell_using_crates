@@ -23,6 +23,13 @@ impl Builtin for Cd {
 
     fn run(&self, args: &[&str]) -> io::Result<()> {
         let target = match args.first().copied() {
+            Some("-") => {
+                // cd - : OLDPWD へ戻る (bash/fish と同じ方式)
+                let old = std::env::var("OLDPWD").map_err(|_| {
+                    io::Error::new(io::ErrorKind::NotFound, "OLDPWD が設定されていません")
+                })?;
+                std::path::PathBuf::from(old)
+            }
             Some(path) => expand_tilde(path),
             None => {
                 let home = std::env::var("HOME")
@@ -30,6 +37,14 @@ impl Builtin for Cd {
                 std::path::PathBuf::from(home)
             }
         };
+
+        // 移動前のディレクトリを OLDPWD に保存する
+        // SAFETY: メインスレッドからのみ呼ばれる。SIGINT ハンドラスレッドは
+        //         環境変数を参照しないため、データ競合は発生しない。
+        if let Ok(cwd) = std::env::current_dir() {
+            unsafe { std::env::set_var("OLDPWD", cwd) };
+        }
+
         std::env::set_current_dir(&target)
     }
 }

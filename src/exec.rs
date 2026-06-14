@@ -17,8 +17,12 @@ pub fn execute_command(cmd: &str) -> io::Result<()> {
     let args = &parts[1..];
 
     // 組み込みコマンドは raw mode を維持したまま実行する
+    // エラーはシェルを終了させず、メッセージを表示して続行する
     if let Some(builtin) = find_builtin(name) {
-        return builtin.run(args);
+        if let Err(e) = builtin.run(args) {
+            execute!(stdout(), Print(format!("{}: {}\r\n", name, e)))?;
+        }
+        return Ok(());
     }
 
     // 外部コマンド: raw mode を解除して子プロセスに端末を渡す
