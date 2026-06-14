@@ -42,7 +42,7 @@ fn main() -> io::Result<()> {
 
 fn run() -> io::Result<()> {
     let mut shell = Shell::new();
-    redraw_prompt(&shell.ed)?;
+    redraw_prompt(&mut shell.ed)?;
 
     'main: loop {
         let Event::Key(key) = event::read()? else {
@@ -61,16 +61,21 @@ fn run() -> io::Result<()> {
                         execute!(stdout(), Print("^C\r\n"))?;
                         pending.push(ShellEvent::RedrawPrompt);
                     }
-                    ShellEvent::RedrawPrompt => redraw_prompt(&shell.ed)?,
+                    ShellEvent::RedrawPrompt => redraw_prompt(&mut shell.ed)?,
                     ShellEvent::ExecuteCommand(cmd) => {
                         execute_command(&cmd)?;
                         pending.push(ShellEvent::RedrawPrompt);
                     }
                     ShellEvent::ShowCompletion => {
-                        let cands = shell.completion.complete(shell.ed.line(), shell.ed.cursor());
-                        if let Some(choice) = run_completion_menu(&cands)? {
+                        let cands = shell
+                            .completion
+                            .complete(shell.ed.line(), shell.ed.cursor());
+                        let lines_above = shell.ed.lines_above_cursor();
+                        if let Some(choice) = run_completion_menu(&cands, lines_above)? {
                             shell.ed.set(choice);
                         }
+                        // メニュー終了後、カーソルはプロンプト先頭行・列0にいる
+                        shell.ed.reset_cursor_tracking();
                         pending.push(ShellEvent::RedrawPrompt);
                     }
                 }
