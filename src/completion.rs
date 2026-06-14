@@ -1,169 +1,123 @@
-//! 補完。
+//! 補完オーケストレーション。
 //!
-//! `CompletionSource` が「何を候補にするか」を抽象化し、
-//! `run_completion_menu` が「候補から選ぶ UI」を担う。
+//! どの `CandidateProvider` と `selector` を組み合わせるかを決める層。
+//! main.rs はこのモジュールの公開関数だけを呼ぶ。
 
-use crossterm::{
-    cursor,
-    event::{self, Event, KeyCode, KeyModifiers},
-    execute, queue,
-    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
-    terminal::{self, Clear, ClearType},
+use crate::history::History;
+use crate::provider::{
+    CandidateProvider, CompletionContext, FileProvider, HistoryProvider, RegPathProvider,
 };
-use std::io::{self, Write, stdout};
-use unicode_width::UnicodeWidthStr;
+use crate::selector::{self, Selection};
+use std::path::{Path, PathBuf};
 
-// ─── 補完ソース ───────────────────────────────────────────────────────────────
+// ─── Tab 補完 ─────────────────────────────────────────────────────────────────
 
-#[allow(dead_code)]
-pub trait CompletionSource {
-    fn complete(&self, line: &str, cursor: usize) -> Vec<String>;
+pub struct TabContext<'a> {
+    /// カーソルまでの入力全体
+    pub prefix: &'a str,
+    pub cwd: &'a Path,
+    pub history: &'a History,
+    pub reg_paths: &'a [PathBuf],
+    pub lines_above_cursor: u16,
 }
 
-/// 仮実装: 固定候補を返すだけ
-#[allow(dead_code)]
-pub struct StubCompletion;
-
-#[allow(dead_code)]
-impl CompletionSource for StubCompletion {
-    fn complete(&self, _line: &str, _cursor: usize) -> Vec<String> {
-        ["ls", "ls -la", "cd", "cargo build", "cargo run"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
-    }
-}
-
-// ─── 補完メニュー ─────────────────────────────────────────────────────────────
-
-/// `run_completion_menu` の結果
-pub enum MenuOutcome {
-    /// ユーザーが候補を選択した
-    Selected(String),
-    /// Esc で閉じた (入力を変更しない)
-    Dismissed,
-    /// Ctrl+C で中断 (入力をクリアする)
-    Aborted,
-}
-
-/// 候補から 1 つ選ぶモーダルピッカー。fish shell 風: 枠なし・選択行のみハイライト。
+/// Tab 補完を実行する。
 ///
-/// **終了後の保証**: カーソルはプロンプト先頭行・列 0 に置かれる。
-/// 呼び出し元は `ed.reset_cursor_tracking()` を呼んだ後に `redraw_prompt` すること。
-pub fn run_completion_menu(
-    candidates: &[String],
-    lines_above_cursor: u16,
-) -> io::Result<MenuOutcome> {
-    if candidates.is_empty() {
-        return Ok(MenuOutcome::Dismissed);
-    }
-
-    let (term_cols, _) = terminal::size()?;
-    let popup_height = candidates.len() as u16;
-    let mut selected = 0usize;
-    let mut outcome = MenuOutcome::Dismissed;
-
-    // プロンプト行の 1 行下 (= メニュー先頭行) へ移動
-    execute!(stdout(), Print("\r\n"))?;
-
-    loop {
-        draw_menu(candidates, selected, term_cols, popup_height)?;
-
-        let Event::Key(key) = event::read()? else {
-            continue;
+/// - カーソル直前のトークンが `#` 単独 → reg_path + fzf
+/// - それ以外 → 履歴 + インラインメニュー
+pub fn tab_complete(ctx: TabContext<'_>) -> std::io::Result<Selection> {
+    if let Some(hash_start) = hash_token_start(ctx.prefix) {
+        // # トークン → 登録パスを fzf で選択
+        let pctx = make_pctx("", ctx.cwd, ctx.history, ctx.reg_paths);
+        let cands = RegPathProvider.candidates(&pctx);
+        return match selector::run_fzf(&cands, None)? {
+            Selection::Chosen(s) => {
+                // # の位置を選択結果で置換した行全体を返す
+                let new_line = format!("{}{}", &ctx.prefix[..hash_start], s);
+                Ok(Selection::Chosen(new_line))
+            }
+            other => Ok(other),
         };
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Char('c') if ctrl => {
-                outcome = MenuOutcome::Aborted;
-                break;
-            }
-            KeyCode::Esc => break,
-            KeyCode::Up => selected = selected.checked_sub(1).unwrap_or(candidates.len() - 1),
-            KeyCode::Down => selected = (selected + 1) % candidates.len(),
-            KeyCode::Tab | KeyCode::Enter => {
-                if let Some(s) = candidates.get(selected).cloned() {
-                    outcome = MenuOutcome::Selected(s);
-                }
-                break;
-            }
-            _ => {}
-        }
     }
 
-    // メニューを消去してプロンプト先頭行・列 0 へ戻る
-    //
-    // 現在地: メニュー先頭行 = プロンプト先頭行 + lines_above_cursor + 1
-    // MoveUp(lines_above_cursor + 1) でプロンプト先頭行へ
-    execute!(
-        stdout(),
-        Clear(ClearType::FromCursorDown),
-        cursor::MoveUp(lines_above_cursor + 1),
-        cursor::MoveToColumn(0),
-    )?;
-
-    Ok(outcome)
+    // デフォルト: 履歴からインラインメニュー
+    let pctx = make_pctx(ctx.prefix, ctx.cwd, ctx.history, ctx.reg_paths);
+    let cands = HistoryProvider.candidates(&pctx);
+    selector::run_menu(&cands, ctx.lines_above_cursor)
 }
 
-/// 候補リストを 1 フレーム描く (fish 風: 枠なし、選択行を青背景でハイライト)。
-/// 描画後、カーソルをメニュー先頭行・列 0 に戻す (次フレームのため)。
-fn draw_menu(
-    candidates: &[String],
-    selected: usize,
-    term_cols: u16,
-    popup_height: u16,
-) -> io::Result<()> {
-    let cols = term_cols as usize;
-    let n = candidates.len();
+// ─── Ctrl+R  ─────────────────────────────────────────────────────────────────
 
-    for (i, cand) in candidates.iter().enumerate() {
-        let text = truncate_to_cols(cand, cols);
-        let pad = cols.saturating_sub(text.width());
-
-        queue!(
-            stdout(),
-            cursor::MoveToColumn(0),
-            Clear(ClearType::CurrentLine)
-        )?;
-
-        if i == selected {
-            queue!(
-                stdout(),
-                SetBackgroundColor(Color::Blue),
-                SetForegroundColor(Color::White),
-                Print(format!("{}{:pad$}", text, "", pad = pad)),
-                ResetColor,
-            )?;
-        } else {
-            queue!(stdout(), Print(text))?;
-        }
-
-        if i + 1 < n {
-            queue!(stdout(), Print("\r\n"))?;
-        }
+/// 全履歴を fzf で検索する。`initial_query` は fzf の初期絞り込み文字列。
+pub fn fzf_history(
+    initial_query: &str,
+    cwd: &Path,
+    history: &History,
+) -> std::io::Result<Option<String>> {
+    let pctx = make_pctx("", cwd, history, &[]);
+    let cands = HistoryProvider.candidates(&pctx); // prefix="" で全履歴
+    match selector::run_fzf(&cands, Some(initial_query))? {
+        Selection::Chosen(s) => Ok(Some(s)),
+        _ => Ok(None),
     }
-
-    // カーソルをメニュー先頭行に戻す
-    if popup_height > 1 {
-        queue!(stdout(), cursor::MoveUp(popup_height - 1))?;
-    }
-    queue!(stdout(), cursor::MoveToColumn(0))?;
-
-    stdout().flush()
 }
 
-/// 文字列を表示幅 `max_cols` に収まるよう切り詰める
-fn truncate_to_cols(s: &str, max_cols: usize) -> &str {
-    use unicode_width::UnicodeWidthChar;
-    let mut width = 0;
-    let mut end = 0;
-    for (byte_idx, c) in s.char_indices() {
-        let w = c.width().unwrap_or(0);
-        if width + w > max_cols {
-            break;
-        }
-        width += w;
-        end = byte_idx + c.len_utf8();
+// ─── Ctrl+T ──────────────────────────────────────────────────────────────────
+
+/// カレントディレクトリ以下のファイルを fzf で選択する。
+pub fn fzf_files(cwd: &Path, history: &History) -> std::io::Result<Option<String>> {
+    let pctx = make_pctx("", cwd, history, &[]);
+    let cands = FileProvider::default().candidates(&pctx);
+    match selector::run_fzf(&cands, None)? {
+        Selection::Chosen(s) => Ok(Some(s)),
+        _ => Ok(None),
     }
-    &s[..end]
+}
+
+// ─── ゴーストテキスト (Ctrl+F / →) ──────────────────────────────────────────
+
+/// カーソル以降に表示するインライン補完テキストを返す。
+///
+/// 履歴の最上位候補の、prefix より後ろの部分だけを返す。
+/// カーソルが行末でない場合は None。
+pub fn get_ghost(prefix: &str, cwd: &Path, history: &History) -> Option<String> {
+    if prefix.is_empty() {
+        return None;
+    }
+    let pctx = make_pctx(prefix, cwd, history, &[]);
+    HistoryProvider
+        .candidates(&pctx)
+        .into_iter()
+        .next()
+        .map(|full| full[prefix.len()..].to_string())
+        .filter(|s| !s.is_empty())
+}
+
+// ─── ユーティリティ ───────────────────────────────────────────────────────────
+
+fn make_pctx<'a>(
+    prefix: &'a str,
+    cwd: &'a Path,
+    history: &'a History,
+    reg_paths: &'a [PathBuf],
+) -> CompletionContext<'a> {
+    CompletionContext {
+        prefix,
+        cwd,
+        history,
+        reg_paths,
+    }
+}
+
+/// カーソルまでの入力の末尾トークンが `#` 単独であれば、その開始バイト位置を返す。
+fn hash_token_start(prefix: &str) -> Option<usize> {
+    let token_start = prefix
+        .rfind(|c: char| c.is_whitespace())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    if prefix[token_start..] == *"#" {
+        Some(token_start)
+    } else {
+        None
+    }
 }

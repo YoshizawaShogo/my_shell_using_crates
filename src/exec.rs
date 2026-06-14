@@ -12,7 +12,11 @@ pub fn execute_command(cmd: &str, ctx: &mut ShellContext) -> io::Result<()> {
         return Ok(());
     }
 
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    // abbr → alias の順で先頭トークンを展開 (ネスト展開なし)
+    let expanded = expand_first_token(trimmed, ctx);
+    let effective = expanded.trim();
+
+    let parts: Vec<&str> = effective.split_whitespace().collect();
     let name = parts[0];
     let args = &parts[1..];
 
@@ -26,14 +30,31 @@ pub fn execute_command(cmd: &str, ctx: &mut ShellContext) -> io::Result<()> {
     }
 
     // 外部コマンド: raw mode を解除して子プロセスに端末を渡す
-    //
-    // TODO(job-control): 現状は子とシェルが同一プロセスグループのため、
-    //   実行中の Ctrl+C で SIGINT がシェルにも届く。setpgid/tcsetpgrp で
-    //   子を独立したプロセスグループに置く必要がある。
     terminal::disable_raw_mode()?;
     std::process::Command::new("sh")
         .arg("-c")
-        .arg(cmd)
+        .arg(effective)
         .status()?;
     terminal::enable_raw_mode()
+}
+
+/// abbr → alias の順で先頭トークンを展開する。
+fn expand_first_token(cmd: &str, ctx: &ShellContext) -> String {
+    let (first, rest) = split_first(cmd);
+    if let Some(expanded) = ctx.abbrs.get(first).or_else(|| ctx.aliases.get(first)) {
+        if rest.is_empty() {
+            expanded.clone()
+        } else {
+            format!("{} {}", expanded, rest)
+        }
+    } else {
+        cmd.to_string()
+    }
+}
+
+fn split_first(s: &str) -> (&str, &str) {
+    match s.find(char::is_whitespace) {
+        Some(i) => (&s[..i], s[i..].trim_start()),
+        None => (s, ""),
+    }
 }

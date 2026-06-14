@@ -4,6 +4,8 @@ mod editor;
 mod events;
 mod exec;
 mod history;
+mod provider;
+mod selector;
 mod term;
 
 use crossterm::{
@@ -14,11 +16,12 @@ use crossterm::{
 use std::io::{self, stdout};
 
 use builtin::ShellContext;
-use completion::{MenuOutcome, run_completion_menu};
+use completion::TabContext;
 use editor::{LineEditor, redraw_prompt};
 use events::{ShellEvent, handle_key};
 use exec::execute_command;
 use history::History;
+use selector::Selection;
 use term::{RawModeGuard, setup_sigint_handler};
 
 /// RC ファイルパス (起動時に読み込む設定ファイル)
@@ -31,6 +34,7 @@ struct Shell {
     history: History,
     git_branch: Option<String>,
     ctx: ShellContext,
+    ghost: Option<String>,
 }
 
 impl Shell {
@@ -40,11 +44,16 @@ impl Shell {
             history: History::load(),
             git_branch: fetch_git_branch(),
             ctx: ShellContext::default(),
+            ghost: None,
         }
     }
 
     fn redraw(&mut self) -> io::Result<()> {
-        redraw_prompt(&mut self.ed, self.git_branch.as_deref())
+        redraw_prompt(
+            &mut self.ed,
+            self.git_branch.as_deref(),
+            self.ghost.as_deref(),
+        )
     }
 }
 
@@ -66,6 +75,7 @@ fn run() -> io::Result<()> {
     // RC ファイルを読み込んで各行を実行する
     load_rc(&mut shell.ctx);
 
+    shell.ghost = compute_ghost(&shell.ed, &shell.history);
     shell.redraw()?;
 
     'main: loop {
@@ -82,33 +92,80 @@ fn run() -> io::Result<()> {
 
                     ShellEvent::CancelInput => {
                         shell.ed.take();
+                        shell.ghost = None;
                         execute!(stdout(), Print("^C\r\n"))?;
                         pending.push(ShellEvent::RedrawPrompt);
                     }
 
-                    ShellEvent::RedrawPrompt => shell.redraw()?,
+                    ShellEvent::RedrawPrompt => {
+                        shell.ghost = compute_ghost(&shell.ed, &shell.history);
+                        shell.redraw()?;
+                    }
 
                     ShellEvent::ExecuteCommand(cmd) => {
                         // cwd は実行前に記録する (cd 後に変わるため)
                         let cwd = std::env::current_dir().unwrap_or_default();
                         execute_command(&cmd, &mut shell.ctx)?;
-                        shell.history.add(&cmd, &cwd);
+                        if !cmd.trim().is_empty() {
+                            shell.history.add(&cmd, &cwd);
+                        }
                         shell.git_branch = fetch_git_branch();
+                        shell.ghost = None;
+                        pending.push(ShellEvent::RedrawPrompt);
+                    }
+
+                    ShellEvent::AcceptGhost => {
+                        if let Some(ghost) = shell.ghost.take() {
+                            let new_buf = shell.ed.line().to_string() + &ghost;
+                            shell.ed.set(new_buf);
+                        }
                         pending.push(ShellEvent::RedrawPrompt);
                     }
 
                     ShellEvent::ShowCompletion => {
                         let prefix = shell.ed.line()[..shell.ed.cursor()].to_string();
                         let cwd = std::env::current_dir().unwrap_or_default();
-                        let cands = shell.history.search_completions(&prefix, &cwd);
-
                         let lines_above = shell.ed.lines_above_cursor();
-                        match run_completion_menu(&cands, lines_above)? {
-                            MenuOutcome::Selected(choice) => shell.ed.set(choice),
-                            MenuOutcome::Aborted => {
+                        let tab_ctx = TabContext {
+                            prefix: &prefix,
+                            cwd: &cwd,
+                            history: &shell.history,
+                            reg_paths: &shell.ctx.reg_paths,
+                            lines_above_cursor: lines_above,
+                        };
+                        match completion::tab_complete(tab_ctx)? {
+                            Selection::Chosen(choice) => shell.ed.set(choice),
+                            Selection::Aborted => {
                                 shell.ed.take();
                             }
-                            MenuOutcome::Dismissed => {}
+                            Selection::Dismissed => {}
+                        }
+                        shell.ed.reset_cursor_tracking();
+                        pending.push(ShellEvent::RedrawPrompt);
+                    }
+
+                    ShellEvent::ShowHistoryFzf => {
+                        let query = shell.ed.line().to_string();
+                        let cwd = std::env::current_dir().unwrap_or_default();
+                        match completion::fzf_history(&query, &cwd, &shell.history) {
+                            Ok(Some(s)) => shell.ed.set(s),
+                            Ok(None) => {}
+                            Err(e) => {
+                                execute!(stdout(), Print(format!("fzf: {}\r\n", e)))?;
+                            }
+                        }
+                        shell.ed.reset_cursor_tracking();
+                        pending.push(ShellEvent::RedrawPrompt);
+                    }
+
+                    ShellEvent::ShowFileFzf => {
+                        let cwd = std::env::current_dir().unwrap_or_default();
+                        match completion::fzf_files(&cwd, &shell.history) {
+                            Ok(Some(s)) => shell.ed.insert_str(&s),
+                            Ok(None) => {}
+                            Err(e) => {
+                                execute!(stdout(), Print(format!("fzf: {}\r\n", e)))?;
+                            }
                         }
                         shell.ed.reset_cursor_tracking();
                         pending.push(ShellEvent::RedrawPrompt);
@@ -134,13 +191,21 @@ fn load_rc(ctx: &mut ShellContext) {
             continue;
         }
         if let Err(e) = execute_command(line, ctx) {
-            // RC ファイルのエラーは警告表示して続行する
             eprintln!("rc: {}: {}", line, e);
         }
     }
 }
 
 // ─── ユーティリティ ───────────────────────────────────────────────────────────
+
+/// カーソルが行末のときだけゴーストテキストを計算する。
+fn compute_ghost(ed: &LineEditor, history: &History) -> Option<String> {
+    if ed.cursor() != ed.line().len() {
+        return None;
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    completion::get_ghost(ed.line(), &cwd, history)
+}
 
 fn fetch_git_branch() -> Option<String> {
     std::process::Command::new("git")

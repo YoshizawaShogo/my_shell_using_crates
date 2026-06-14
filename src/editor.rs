@@ -81,6 +81,11 @@ impl LineEditor {
         self.cursor = self.buf.len();
     }
 
+    pub fn insert_str(&mut self, s: &str) {
+        self.buf.insert_str(self.cursor, s);
+        self.cursor += s.len();
+    }
+
     pub fn line(&self) -> &str {
         &self.buf
     }
@@ -117,7 +122,11 @@ impl LineEditor {
 ///
 /// `lines_above_cursor` は行 H からカーソル行までの距離を保持し、
 /// 次回の `MoveUp` でヘッダ先頭に戻るために使う。
-pub fn redraw_prompt(ed: &mut LineEditor, git_branch: Option<&str>) -> io::Result<()> {
+pub fn redraw_prompt(
+    ed: &mut LineEditor,
+    git_branch: Option<&str>,
+    ghost: Option<&str>,
+) -> io::Result<()> {
     let (term_cols, _) = terminal::size()?;
 
     // 1. ヘッダ先頭行へ移動してから全消去
@@ -164,12 +173,16 @@ pub fn redraw_prompt(ed: &mut LineEditor, git_branch: Option<&str>) -> io::Resul
     if cursor_display > 0 && cursor_display.is_multiple_of(term_cols) {
         queue!(stdout(), Print("\r\n"))?;
     }
-    queue!(
-        stdout(),
-        cursor::SavePosition,
-        Print(&ed.buf[ed.cursor..]),
-        cursor::RestorePosition,
-    )?;
+    queue!(stdout(), cursor::SavePosition, Print(&ed.buf[ed.cursor..]))?;
+    if let Some(g) = ghost {
+        queue!(
+            stdout(),
+            SetForegroundColor(Color::DarkGrey),
+            Print(g),
+            ResetColor,
+        )?;
+    }
+    queue!(stdout(), cursor::RestorePosition)?;
 
     // 4. +1 はヘッダ行の分
     ed.lines_above_cursor = 1 + cursor_display / term_cols;

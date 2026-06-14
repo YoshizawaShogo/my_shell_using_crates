@@ -7,4 +7,5 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 crossterm = "0.29"
 signal-hook = "0.4.4"
+skim = "4.7.0"
 unicode-width = "0.2.2"

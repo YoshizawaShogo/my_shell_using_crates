@@ -1,16 +1,58 @@
 //! シェル組み込みコマンド。
 
 use crate::history::expand_tilde;
-use std::io;
+use crossterm::{execute, style::Print};
+use std::collections::HashMap;
+use std::io::{self, stdout};
 use std::path::PathBuf;
+
+// ─── 定数 ─────────────────────────────────────────────────────────────────────
+
+pub const REG_PATHS_FILE: &str = "~/.my_shell_paths";
 
 // ─── シェル状態 ───────────────────────────────────────────────────────────────
 
 /// ビルトインコマンドが読み書きするシェル状態
-#[derive(Default)]
 pub struct ShellContext {
     /// cd が積み上げるディレクトリスタック (pushd 相当)
     pub dir_stack: Vec<PathBuf>,
+    /// reg_path add で登録したパス一覧 (永続化: ~/.my_shell_paths)
+    pub reg_paths: Vec<PathBuf>,
+    /// abbr で定義した略語 (FROM → TO)
+    pub abbrs: HashMap<String, String>,
+    /// alias で定義したエイリアス (FROM → TO)
+    pub aliases: HashMap<String, String>,
+}
+
+impl Default for ShellContext {
+    fn default() -> Self {
+        Self {
+            dir_stack: Vec::new(),
+            reg_paths: load_reg_paths(),
+            abbrs: HashMap::new(),
+            aliases: HashMap::new(),
+        }
+    }
+}
+
+fn load_reg_paths() -> Vec<PathBuf> {
+    let path = expand_tilde(REG_PATHS_FILE);
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn save_reg_paths(paths: &[PathBuf]) -> io::Result<()> {
+    let path = expand_tilde(REG_PATHS_FILE);
+    let content = paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(path, format!("{}\n", content))
 }
 
 // ─── トレイト ─────────────────────────────────────────────────────────────────
@@ -70,9 +112,127 @@ impl Builtin for Popd {
     }
 }
 
+// ─── reg_path ─────────────────────────────────────────────────────────────────
+
+pub struct RegPath;
+
+impl Builtin for RegPath {
+    fn name(&self) -> &'static str {
+        "reg_path"
+    }
+
+    fn run(&self, args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
+        match args.first().copied() {
+            Some("add") => {
+                let path = match args.get(1) {
+                    Some(&p) => expand_tilde(p),
+                    None => std::env::current_dir()?,
+                };
+                let path = path.canonicalize().unwrap_or(path);
+                if !ctx.reg_paths.contains(&path) {
+                    ctx.reg_paths.push(path);
+                    save_reg_paths(&ctx.reg_paths)?;
+                }
+                Ok(())
+            }
+            Some("list") => {
+                for p in &ctx.reg_paths {
+                    execute!(stdout(), Print(format!("{}\r\n", p.display())))?;
+                }
+                Ok(())
+            }
+            _ => Err(io::Error::other("使い方: reg_path add [path] | list")),
+        }
+    }
+}
+
+// ─── abbr ─────────────────────────────────────────────────────────────────────
+
+pub struct Abbr;
+
+impl Builtin for Abbr {
+    fn name(&self) -> &'static str {
+        "abbr"
+    }
+
+    fn run(&self, args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
+        match (args.first(), args.get(1)) {
+            (Some(&from), Some(&to)) => {
+                ctx.abbrs.insert(from.to_string(), to.to_string());
+                Ok(())
+            }
+            _ => Err(io::Error::other("使い方: abbr FROM TO")),
+        }
+    }
+}
+
+// ─── alias ────────────────────────────────────────────────────────────────────
+
+pub struct Alias;
+
+impl Builtin for Alias {
+    fn name(&self) -> &'static str {
+        "alias"
+    }
+
+    fn run(&self, args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
+        match (args.first(), args.get(1)) {
+            (Some(&from), Some(&to)) => {
+                ctx.aliases.insert(from.to_string(), to.to_string());
+                Ok(())
+            }
+            _ => Err(io::Error::other("使い方: alias FROM TO")),
+        }
+    }
+}
+
+// ─── set ──────────────────────────────────────────────────────────────────────
+
+pub struct Set;
+
+impl Builtin for Set {
+    fn name(&self) -> &'static str {
+        "set"
+    }
+
+    fn run(&self, args: &[&str], _ctx: &mut ShellContext) -> io::Result<()> {
+        match (args.first(), args.get(1)) {
+            (Some(&var), Some(&val)) => {
+                // SAFETY: メインスレッドからのみ呼ばれる。
+                //         SIGINT ハンドラスレッドは環境変数を参照しない。
+                unsafe { std::env::set_var(var, val) };
+                Ok(())
+            }
+            _ => Err(io::Error::other("使い方: set VAR VAL")),
+        }
+    }
+}
+
+// ─── setenv ───────────────────────────────────────────────────────────────────
+
+pub struct Setenv;
+
+impl Builtin for Setenv {
+    fn name(&self) -> &'static str {
+        "setenv"
+    }
+
+    fn run(&self, args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
+        Set.run(args, ctx)
+    }
+}
+
 // ─── レジストリ ───────────────────────────────────────────────────────────────
 
 pub fn find_builtin(name: &str) -> Option<Box<dyn Builtin>> {
-    let candidates: Vec<Box<dyn Builtin>> = vec![Box::new(Cd), Box::new(Popd)];
+    let candidates: Vec<Box<dyn Builtin>> = vec![
+        Box::new(Cd),
+        Box::new(Popd),
+        Box::new(RegPath),
+        Box::new(Abbr),
+        Box::new(Alias),
+        Box::new(Set),
+        Box::new(Setenv),
+    ];
     candidates.into_iter().find(|b| b.name() == name)
 }

@@ -13,11 +13,15 @@ pub enum ShellEvent {
     RedrawPrompt,
     ExecuteCommand(String),
     ShowCompletion,
+    AcceptGhost,
+    ShowHistoryFzf,
+    ShowFileFzf,
 }
 
 pub fn handle_key(ed: &mut LineEditor, key: KeyEvent) -> Vec<ShellEvent> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let at_end = ed.cursor() == ed.line().len();
 
     match key.code {
         // 空行での C-d のみ終了 (fish と同じ)
@@ -35,14 +39,21 @@ pub fn handle_key(ed: &mut LineEditor, key: KeyEvent) -> Vec<ShellEvent> {
             ed.move_left();
             vec![ShellEvent::RedrawPrompt]
         }
+        // 行末なら ghost 受け入れ、そうでなければ右移動
         KeyCode::Char('f') if ctrl => {
-            ed.move_right();
-            vec![ShellEvent::RedrawPrompt]
+            if at_end {
+                vec![ShellEvent::AcceptGhost]
+            } else {
+                ed.move_right();
+                vec![ShellEvent::RedrawPrompt]
+            }
         }
         KeyCode::Char('w') if ctrl => {
             ed.delete_word_backward();
             vec![ShellEvent::RedrawPrompt]
         }
+        KeyCode::Char('r') if ctrl => vec![ShellEvent::ShowHistoryFzf],
+        KeyCode::Char('t') if ctrl => vec![ShellEvent::ShowFileFzf],
 
         KeyCode::Tab => vec![ShellEvent::ShowCompletion],
         KeyCode::Enter => vec![ShellEvent::ExecuteCommand(ed.take())],
@@ -51,9 +62,14 @@ pub fn handle_key(ed: &mut LineEditor, key: KeyEvent) -> Vec<ShellEvent> {
             ed.move_left();
             vec![ShellEvent::RedrawPrompt]
         }
+        // 行末なら ghost 受け入れ、そうでなければ右移動
         KeyCode::Right => {
-            ed.move_right();
-            vec![ShellEvent::RedrawPrompt]
+            if at_end {
+                vec![ShellEvent::AcceptGhost]
+            } else {
+                ed.move_right();
+                vec![ShellEvent::RedrawPrompt]
+            }
         }
         KeyCode::Home => {
             ed.move_home();
