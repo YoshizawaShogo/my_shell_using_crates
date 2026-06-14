@@ -35,6 +35,10 @@ struct Shell {
     git_branch: Option<String>,
     ctx: ShellContext,
     ghost: Option<String>,
+    /// 履歴ナビゲーション中の位置 (None = ナビゲーション外)
+    hist_idx: Option<usize>,
+    /// ナビゲーション開始前の入力を保存する
+    saved_input: String,
 }
 
 impl Shell {
@@ -45,6 +49,8 @@ impl Shell {
             git_branch: fetch_git_branch(),
             ctx: ShellContext::default(),
             ghost: None,
+            hist_idx: None,
+            saved_input: String::new(),
         }
     }
 
@@ -93,6 +99,8 @@ fn run() -> io::Result<()> {
                     ShellEvent::CancelInput => {
                         shell.ed.take();
                         shell.ghost = None;
+                        shell.hist_idx = None;
+                        shell.saved_input.clear();
                         execute!(stdout(), Print("^C\r\n"))?;
                         pending.push(ShellEvent::RedrawPrompt);
                     }
@@ -111,6 +119,8 @@ fn run() -> io::Result<()> {
                         }
                         shell.git_branch = fetch_git_branch();
                         shell.ghost = None;
+                        shell.hist_idx = None;
+                        shell.saved_input.clear();
                         pending.push(ShellEvent::RedrawPrompt);
                     }
 
@@ -141,6 +151,47 @@ fn run() -> io::Result<()> {
                             Selection::Dismissed => {}
                         }
                         shell.ed.reset_cursor_tracking();
+                        pending.push(ShellEvent::RedrawPrompt);
+                    }
+
+                    ShellEvent::HistoryPrev => {
+                        let n = shell.history.len();
+                        if n == 0 {
+                            continue;
+                        }
+                        let new_idx = match shell.hist_idx {
+                            None => {
+                                shell.saved_input = shell.ed.line().to_string();
+                                n - 1
+                            }
+                            Some(0) => 0, // 最古のエントリ、それ以上戻れない
+                            Some(i) => i - 1,
+                        };
+                        shell.hist_idx = Some(new_idx);
+                        if let Some(cmd) = shell.history.get_cmd(new_idx) {
+                            shell.ed.set(cmd.to_string());
+                        }
+                        pending.push(ShellEvent::RedrawPrompt);
+                    }
+
+                    ShellEvent::HistoryNext => {
+                        match shell.hist_idx {
+                            None => {} // ナビゲーション外では無視
+                            Some(i) => {
+                                let n = shell.history.len();
+                                if i + 1 >= n {
+                                    // 最新エントリを超えたら保存済み入力を復元
+                                    shell.hist_idx = None;
+                                    let saved = std::mem::take(&mut shell.saved_input);
+                                    shell.ed.set(saved);
+                                } else {
+                                    shell.hist_idx = Some(i + 1);
+                                    if let Some(cmd) = shell.history.get_cmd(i + 1) {
+                                        shell.ed.set(cmd.to_string());
+                                    }
+                                }
+                            }
+                        }
                         pending.push(ShellEvent::RedrawPrompt);
                     }
 

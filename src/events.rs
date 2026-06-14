@@ -16,6 +16,8 @@ pub enum ShellEvent {
     AcceptGhost,
     ShowHistoryFzf,
     ShowFileFzf,
+    HistoryPrev,
+    HistoryNext,
 }
 
 pub fn handle_key(ed: &mut LineEditor, key: KeyEvent) -> Vec<ShellEvent> {
@@ -52,6 +54,8 @@ pub fn handle_key(ed: &mut LineEditor, key: KeyEvent) -> Vec<ShellEvent> {
             ed.delete_word_backward();
             vec![ShellEvent::RedrawPrompt]
         }
+        KeyCode::Char('p') if ctrl => vec![ShellEvent::HistoryPrev],
+        KeyCode::Char('n') if ctrl => vec![ShellEvent::HistoryNext],
         KeyCode::Char('r') if ctrl => vec![ShellEvent::ShowHistoryFzf],
         KeyCode::Char('t') if ctrl => vec![ShellEvent::ShowFileFzf],
 
@@ -71,6 +75,8 @@ pub fn handle_key(ed: &mut LineEditor, key: KeyEvent) -> Vec<ShellEvent> {
                 vec![ShellEvent::RedrawPrompt]
             }
         }
+        KeyCode::Up => vec![ShellEvent::HistoryPrev],
+        KeyCode::Down => vec![ShellEvent::HistoryNext],
         KeyCode::Home => {
             ed.move_home();
             vec![ShellEvent::RedrawPrompt]

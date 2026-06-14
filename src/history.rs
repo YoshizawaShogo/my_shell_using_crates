@@ -58,6 +58,15 @@ impl History {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// インデックス指定でコマンド文字列を取得する (履歴ナビゲーション用)。
+    pub fn get_cmd(&self, idx: usize) -> Option<&str> {
+        self.entries.get(idx).map(|e| e.cmd.as_str())
+    }
+
     /// 全エントリを HISTORY_FILE に書き出す (シェル終了時に呼ぶ)。
     pub fn save(&self) -> io::Result<()> {
         let path = expand_tilde(HISTORY_FILE);
