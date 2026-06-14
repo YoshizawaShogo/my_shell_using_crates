@@ -4,8 +4,7 @@
 //! abbr / alias 展開や補完確定は、この型への操作として実装していく。
 
 use crossterm::{
-    cursor,
-    queue,
+    cursor, queue,
     style::Print,
     terminal::{self, Clear, ClearType},
 };
@@ -121,7 +120,11 @@ pub fn redraw_prompt(ed: &mut LineEditor) -> io::Result<()> {
     if ed.lines_above_cursor > 0 {
         queue!(stdout(), cursor::MoveUp(ed.lines_above_cursor))?;
     }
-    queue!(stdout(), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
+    queue!(
+        stdout(),
+        cursor::MoveToColumn(0),
+        Clear(ClearType::FromCursorDown)
+    )?;
 
     // 2. カーソル手前を印字 → 位置保存 → 残りを印字 → 位置復元
     //
@@ -133,7 +136,7 @@ pub fn redraw_prompt(ed: &mut LineEditor) -> io::Result<()> {
     //   → 折り返しを \r\n で明示して位置を確定してから SavePosition する。
     let cursor_display = (PROMPT.width() + ed.buf[..ed.cursor].width()) as u16;
     queue!(stdout(), Print(PROMPT), Print(&ed.buf[..ed.cursor]))?;
-    if cursor_display > 0 && cursor_display % term_cols == 0 {
+    if cursor_display > 0 && cursor_display.is_multiple_of(term_cols) {
         queue!(stdout(), Print("\r\n"))?;
     }
     queue!(

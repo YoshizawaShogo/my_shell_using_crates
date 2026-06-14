@@ -100,7 +100,11 @@ fn draw_menu(
         let text = truncate_to_cols(cand, cols);
         let pad = cols.saturating_sub(text.width());
 
-        queue!(stdout(), cursor::MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+        queue!(
+            stdout(),
+            cursor::MoveToColumn(0),
+            Clear(ClearType::CurrentLine)
+        )?;
 
         if i == selected {
             queue!(
