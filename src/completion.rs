@@ -5,7 +5,7 @@
 
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute, queue,
     style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
@@ -15,13 +15,16 @@ use unicode_width::UnicodeWidthStr;
 
 // ─── 補完ソース ───────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 pub trait CompletionSource {
     fn complete(&self, line: &str, cursor: usize) -> Vec<String>;
 }
 
 /// 仮実装: 固定候補を返すだけ
+#[allow(dead_code)]
 pub struct StubCompletion;
 
+#[allow(dead_code)]
 impl CompletionSource for StubCompletion {
     fn complete(&self, _line: &str, _cursor: usize) -> Vec<String> {
         ["ls", "ls -la", "cd", "cargo build", "cargo run"]
@@ -33,6 +36,16 @@ impl CompletionSource for StubCompletion {
 
 // ─── 補完メニュー ─────────────────────────────────────────────────────────────
 
+/// `run_completion_menu` の結果
+pub enum MenuOutcome {
+    /// ユーザーが候補を選択した
+    Selected(String),
+    /// Esc で閉じた (入力を変更しない)
+    Dismissed,
+    /// Ctrl+C で中断 (入力をクリアする)
+    Aborted,
+}
+
 /// 候補から 1 つ選ぶモーダルピッカー。fish shell 風: 枠なし・選択行のみハイライト。
 ///
 /// **終了後の保証**: カーソルはプロンプト先頭行・列 0 に置かれる。
@@ -40,15 +53,15 @@ impl CompletionSource for StubCompletion {
 pub fn run_completion_menu(
     candidates: &[String],
     lines_above_cursor: u16,
-) -> io::Result<Option<String>> {
+) -> io::Result<MenuOutcome> {
     if candidates.is_empty() {
-        return Ok(None);
+        return Ok(MenuOutcome::Dismissed);
     }
 
     let (term_cols, _) = terminal::size()?;
     let popup_height = candidates.len() as u16;
     let mut selected = 0usize;
-    let mut chosen = None;
+    let mut outcome = MenuOutcome::Dismissed;
 
     // プロンプト行の 1 行下 (= メニュー先頭行) へ移動
     execute!(stdout(), Print("\r\n"))?;
@@ -59,12 +72,19 @@ pub fn run_completion_menu(
         let Event::Key(key) = event::read()? else {
             continue;
         };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
+            KeyCode::Char('c') if ctrl => {
+                outcome = MenuOutcome::Aborted;
+                break;
+            }
             KeyCode::Esc => break,
             KeyCode::Up => selected = selected.checked_sub(1).unwrap_or(candidates.len() - 1),
             KeyCode::Down => selected = (selected + 1) % candidates.len(),
             KeyCode::Tab | KeyCode::Enter => {
-                chosen = candidates.get(selected).cloned();
+                if let Some(s) = candidates.get(selected).cloned() {
+                    outcome = MenuOutcome::Selected(s);
+                }
                 break;
             }
             _ => {}
@@ -82,7 +102,7 @@ pub fn run_completion_menu(
         cursor::MoveToColumn(0),
     )?;
 
-    Ok(chosen)
+    Ok(outcome)
 }
 
 /// 候補リストを 1 フレーム描く (fish 風: 枠なし、選択行を青背景でハイライト)。

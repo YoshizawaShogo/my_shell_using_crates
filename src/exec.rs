@@ -1,10 +1,10 @@
 //! コマンド実行。
 
-use crate::builtin::find_builtin;
+use crate::builtin::{ShellContext, find_builtin};
 use crossterm::{execute, style::Print, terminal};
 use std::io::{self, stdout};
 
-pub fn execute_command(cmd: &str) -> io::Result<()> {
+pub fn execute_command(cmd: &str, ctx: &mut ShellContext) -> io::Result<()> {
     execute!(stdout(), Print("\r\n"))?;
 
     let trimmed = cmd.trim();
@@ -19,7 +19,7 @@ pub fn execute_command(cmd: &str) -> io::Result<()> {
     // 組み込みコマンドは raw mode を維持したまま実行する
     // エラーはシェルを終了させず、メッセージを表示して続行する
     if let Some(builtin) = find_builtin(name) {
-        if let Err(e) = builtin.run(args) {
+        if let Err(e) = builtin.run(args, ctx) {
             execute!(stdout(), Print(format!("{}: {}\r\n", name, e)))?;
         }
         return Ok(());

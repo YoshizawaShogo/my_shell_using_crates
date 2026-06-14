@@ -1,15 +1,23 @@
 //! シェル組み込みコマンド。
-//!
-//! 外部プロセスに委譲できないコマンド (cd など) はここに実装する。
-//! `Builtin` トレイトを実装して `find_builtin` に登録すれば認識される。
 
+use crate::history::expand_tilde;
 use std::io;
+use std::path::PathBuf;
+
+// ─── シェル状態 ───────────────────────────────────────────────────────────────
+
+/// ビルトインコマンドが読み書きするシェル状態
+#[derive(Default)]
+pub struct ShellContext {
+    /// cd が積み上げるディレクトリスタック (pushd 相当)
+    pub dir_stack: Vec<PathBuf>,
+}
 
 // ─── トレイト ─────────────────────────────────────────────────────────────────
 
 pub trait Builtin {
     fn name(&self) -> &'static str;
-    fn run(&self, args: &[&str]) -> io::Result<()>;
+    fn run(&self, args: &[&str], ctx: &mut ShellContext) -> io::Result<()>;
 }
 
 // ─── cd ───────────────────────────────────────────────────────────────────────
@@ -21,54 +29,50 @@ impl Builtin for Cd {
         "cd"
     }
 
-    fn run(&self, args: &[&str]) -> io::Result<()> {
+    /// デフォルトで pushd 挙動: 移動前のディレクトリをスタックに積む。
+    /// `cd -` は OLDPWD へ移動 (スタックとは独立)。
+    fn run(&self, args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
         let target = match args.first().copied() {
-            Some("-") => {
-                // cd - : OLDPWD へ戻る (bash/fish と同じ方式)
-                let old = std::env::var("OLDPWD").map_err(|_| {
-                    io::Error::new(io::ErrorKind::NotFound, "OLDPWD が設定されていません")
-                })?;
-                std::path::PathBuf::from(old)
-            }
+            Some("-") => std::env::var("OLDPWD")
+                .map(PathBuf::from)
+                .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "OLDPWD が未設定です"))?,
             Some(path) => expand_tilde(path),
-            None => {
-                let home = std::env::var("HOME")
-                    .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?;
-                std::path::PathBuf::from(home)
-            }
+            None => std::env::var("HOME")
+                .map(PathBuf::from)
+                .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?,
         };
 
-        // 移動前のディレクトリを OLDPWD に保存する
-        // SAFETY: メインスレッドからのみ呼ばれる。SIGINT ハンドラスレッドは
-        //         環境変数を参照しないため、データ競合は発生しない。
         if let Ok(cwd) = std::env::current_dir() {
-            unsafe { std::env::set_var("OLDPWD", cwd) };
+            // SAFETY: メインスレッドからのみ呼ばれる。
+            //         SIGINT ハンドラスレッドは環境変数を参照しない。
+            unsafe { std::env::set_var("OLDPWD", &cwd) };
+            ctx.dir_stack.push(cwd);
         }
 
         std::env::set_current_dir(&target)
     }
 }
 
-// ─── レジストリ ───────────────────────────────────────────────────────────────
+// ─── popd ─────────────────────────────────────────────────────────────────────
 
-/// 名前に対応する組み込みコマンドを返す
-pub fn find_builtin(name: &str) -> Option<Box<dyn Builtin>> {
-    let candidates: Vec<Box<dyn Builtin>> = vec![Box::new(Cd)];
-    candidates.into_iter().find(|b| b.name() == name)
+pub struct Popd;
+
+impl Builtin for Popd {
+    fn name(&self) -> &'static str {
+        "popd"
+    }
+
+    fn run(&self, _args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
+        match ctx.dir_stack.pop() {
+            Some(prev) => std::env::set_current_dir(&prev),
+            None => Err(io::Error::other("ディレクトリスタックが空です")),
+        }
+    }
 }
 
-// ─── ユーティリティ ───────────────────────────────────────────────────────────
+// ─── レジストリ ───────────────────────────────────────────────────────────────
 
-fn expand_tilde(path: &str) -> std::path::PathBuf {
-    if path == "~" {
-        std::env::var("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("~"))
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        std::env::var("HOME")
-            .map(|h| std::path::PathBuf::from(h).join(rest))
-            .unwrap_or_else(|_| std::path::PathBuf::from(path))
-    } else {
-        std::path::PathBuf::from(path)
-    }
+pub fn find_builtin(name: &str) -> Option<Box<dyn Builtin>> {
+    let candidates: Vec<Box<dyn Builtin>> = vec![Box::new(Cd), Box::new(Popd)];
+    candidates.into_iter().find(|b| b.name() == name)
 }

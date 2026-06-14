@@ -31,6 +31,18 @@ pub fn handle_key(ed: &mut LineEditor, key: KeyEvent) -> Vec<ShellEvent> {
             ed.move_end();
             vec![ShellEvent::RedrawPrompt]
         }
+        KeyCode::Char('b') if ctrl => {
+            ed.move_left();
+            vec![ShellEvent::RedrawPrompt]
+        }
+        KeyCode::Char('f') if ctrl => {
+            ed.move_right();
+            vec![ShellEvent::RedrawPrompt]
+        }
+        KeyCode::Char('w') if ctrl => {
+            ed.delete_word_backward();
+            vec![ShellEvent::RedrawPrompt]
+        }
 
         KeyCode::Tab => vec![ShellEvent::ShowCompletion],
         KeyCode::Enter => vec![ShellEvent::ExecuteCommand(ed.take())],

@@ -57,6 +57,19 @@ impl LineEditor {
         self.cursor = self.buf.len();
     }
 
+    /// Ctrl+W: カーソル直前の単語 (空白を含む) を削除する (Unix word rubout)
+    pub fn delete_word_backward(&mut self) {
+        let new_end = self.buf[..self.cursor]
+            .char_indices()
+            .rev()
+            .skip_while(|(_, c)| c.is_whitespace())
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        self.buf.drain(new_end..self.cursor);
+        self.cursor = new_end;
+    }
+
     pub fn take(&mut self) -> String {
         self.cursor = 0;
         self.lines_above_cursor = 0;
