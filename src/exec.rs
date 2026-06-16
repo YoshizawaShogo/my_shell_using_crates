@@ -3,6 +3,7 @@
 use crate::builtin::{ShellContext, find_builtin};
 use crossterm::{execute, style::Print, terminal};
 use std::io::{self, stdout};
+use std::os::unix::process::CommandExt;
 
 /// `interactive`: true のとき実行前に `\r\n` を出力してプロンプトと出力を分離する。
 /// load_rc からは false で呼ぶ (起動時に空行が大量発生するのを防ぐ)。
@@ -62,11 +63,18 @@ pub fn execute_command(cmd: &str, ctx: &mut ShellContext, interactive: bool) -> 
 
     // 外部コマンド: 展開済みのトークンを shell_words::join で再クォートして sh -c へ渡す
     let sh_cmd = shell_words::join(parts.iter().map(|s| s.as_str()));
+    let mut command = std::process::Command::new("sh");
+    command.arg("-c").arg(&sh_cmd);
+    // 親シェルは SIGINT を無視しているが、子ではデフォルト動作へ戻し、
+    // Ctrl+C が実行中の外部コマンドだけに効くようにする。
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            Ok(())
+        });
+    }
     terminal::disable_raw_mode()?;
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&sh_cmd)
-        .status()?;
+    let status = command.status()?;
     ctx.last_status = status.code().unwrap_or(1);
     terminal::enable_raw_mode()
 }

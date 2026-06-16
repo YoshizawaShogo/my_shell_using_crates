@@ -67,6 +67,13 @@ impl Shell {
 // ─── エントリポイント ─────────────────────────────────────────────────────────
 
 fn main() -> io::Result<()> {
+    // glibc の malloc arena を1個に固定し、skim 使用による VSZ 肥大を防ぐ。
+    // このシェルは実質シングルスレッドなので arena 分割の利点が無く、
+    // 短命スレッド (skim) が arena を量産して仮想メモリが膨らむのを抑える。
+    #[cfg(target_env = "gnu")]
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 1);
+    }
     setup_sigint_handler()?;
     let _guard = RawModeGuard::new()?;
     let result = run();
