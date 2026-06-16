@@ -6,10 +6,10 @@
 use crate::history::History;
 use crate::provider::{
     CandidateProvider, CommandProvider, CompletionContext, EnvVarProvider, FileProvider,
-    HistoryProvider, PathProvider, RegPathProvider,
+    HistoryProvider, PathProvider,
 };
 use crate::selector::{self, Selection};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 // ─── Tab 補完 ─────────────────────────────────────────────────────────────────
 
@@ -18,7 +18,6 @@ pub struct TabContext<'a> {
     pub prefix: &'a str,
     pub cwd: &'a Path,
     pub history: &'a History,
-    pub reg_paths: &'a [PathBuf],
     pub lines_above_cursor: u16,
 }
 
@@ -36,7 +35,6 @@ pub fn tab_complete(ctx: TabContext<'_>) -> std::io::Result<Selection> {
         prefix: token,
         cwd: ctx.cwd,
         history: ctx.history,
-        reg_paths: ctx.reg_paths,
     };
 
     let cands = match &kind {
@@ -46,7 +44,6 @@ pub fn tab_complete(ctx: TabContext<'_>) -> std::io::Result<Selection> {
         }
         .candidates(&pctx),
         CompletionKind::EnvVar => EnvVarProvider.candidates(&pctx),
-        CompletionKind::RegPath => RegPathProvider.candidates(&pctx),
     };
 
     if cands.is_empty() {
@@ -64,17 +61,10 @@ pub fn tab_complete(ctx: TabContext<'_>) -> std::io::Result<Selection> {
         return Ok(Selection::Chosen(replace_token(ctx.prefix, cp)));
     }
 
-    // RegPath は skim、それ以外はグリッドメニュー
-    if matches!(kind, CompletionKind::RegPath) {
-        match selector::run_fzf(&cands, None)? {
-            Selection::Chosen(s) => Ok(Selection::Chosen(replace_token(ctx.prefix, &s))),
-            other => Ok(other),
-        }
-    } else {
-        match selector::run_grid_menu(&cands, ctx.lines_above_cursor)? {
-            Selection::Chosen(s) => Ok(Selection::Chosen(replace_token(ctx.prefix, &s))),
-            other => Ok(other),
-        }
+    // グリッドメニュー
+    match selector::run_grid_menu(&cands, ctx.lines_above_cursor)? {
+        Selection::Chosen(s) => Ok(Selection::Chosen(replace_token(ctx.prefix, &s))),
+        other => Ok(other),
     }
 }
 
@@ -90,7 +80,6 @@ pub fn fzf_history(
         prefix: "",
         cwd,
         history,
-        reg_paths: &[],
     };
     let cands = HistoryProvider.candidates(&pctx);
     match selector::run_fzf(&cands, Some(initial_query))? {
@@ -107,9 +96,22 @@ pub fn fzf_files(cwd: &Path, history: &History) -> std::io::Result<Option<String
         prefix: "",
         cwd,
         history,
-        reg_paths: &[],
     };
     let cands = FileProvider::default().candidates(&pctx);
+    match selector::run_fzf(&cands, None)? {
+        Selection::Chosen(s) => Ok(Some(s)),
+        _ => Ok(None),
+    }
+}
+
+// ─── Ctrl+Q ──────────────────────────────────────────────────────────────────
+
+/// 登録済みパスを skim で選択する。
+pub fn fzf_reg_paths(reg_paths: &[std::path::PathBuf]) -> std::io::Result<Option<String>> {
+    let cands: Vec<String> = reg_paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
     match selector::run_fzf(&cands, None)? {
         Selection::Chosen(s) => Ok(Some(s)),
         _ => Ok(None),
@@ -127,7 +129,6 @@ pub fn get_ghost(prefix: &str, cwd: &Path, history: &History) -> Option<String> 
         prefix,
         cwd,
         history,
-        reg_paths: &[],
     };
     HistoryProvider
         .candidates(&pctx)
@@ -147,8 +148,6 @@ enum CompletionKind {
     Path { dirs_only: bool },
     /// 環境変数 ($VAR)
     EnvVar,
-    /// 登録パス (#)
-    RegPath,
 }
 
 /// カーソル直前の入力状態から補完種別を判定する。
@@ -174,12 +173,7 @@ fn classify(prefix: &str) -> CompletionKind {
         return CompletionKind::Command;
     }
 
-    // 第2トークン以降
-    if token == "#" {
-        return CompletionKind::RegPath;
-    }
-
-    // コマンド名によってファイル/ディレクトリを切り替え
+    // 第2トークン以降: コマンド名によってファイル/ディレクトリを切り替え
     let cmd = prefix[..token_start]
         .split_whitespace()
         .next()

@@ -1243,6 +1243,7 @@ name = "my_shell_using_crates"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "shell-words",
  "signal-hook 0.4.4",
  "skim",
  "unicode-width",

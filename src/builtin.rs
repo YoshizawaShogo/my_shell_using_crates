@@ -22,6 +22,8 @@ pub struct ShellContext {
     pub abbrs: HashMap<String, String>,
     /// alias で定義したエイリアス (FROM → TO)
     pub aliases: HashMap<String, String>,
+    /// 直前のコマンドの終了ステータス ($? に対応)
+    pub last_status: i32,
 }
 
 impl Default for ShellContext {
@@ -31,6 +33,7 @@ impl Default for ShellContext {
             reg_paths: load_reg_paths(),
             abbrs: HashMap::new(),
             aliases: HashMap::new(),
+            last_status: 0,
         }
     }
 }

@@ -13,7 +13,6 @@ pub struct CompletionContext<'a> {
     pub prefix: &'a str,
     pub cwd: &'a Path,
     pub history: &'a History,
-    pub reg_paths: &'a [PathBuf],
 }
 
 // ─── トレイト ─────────────────────────────────────────────────────────────────
@@ -215,16 +214,3 @@ fn visit(root: &Path, dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<
     }
 }
 
-// ─── RegPathProvider ─────────────────────────────────────────────────────────
-
-/// `reg_path add` で登録済みのパスを候補にする (`#` トークン補完用)。
-pub struct RegPathProvider;
-
-impl CandidateProvider for RegPathProvider {
-    fn candidates(&self, ctx: &CompletionContext<'_>) -> Vec<String> {
-        ctx.reg_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect()
-    }
-}

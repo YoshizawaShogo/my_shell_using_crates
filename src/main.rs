@@ -19,6 +19,7 @@ use builtin::ShellContext;
 use completion::TabContext;
 use editor::{LineEditor, redraw_prompt};
 use events::{ShellEvent, handle_key};
+use std::collections::HashMap;
 use exec::execute_command;
 use history::History;
 use selector::Selection;
@@ -110,10 +111,18 @@ fn run() -> io::Result<()> {
                         shell.redraw()?;
                     }
 
-                    ShellEvent::ExecuteCommand(cmd) => {
-                        // cwd は実行前に記録する (cd 後に変わるため)
+                    ShellEvent::ExecuteCommand => {
+                        // 1. abbr を視覚展開してカーソルを行末へ
+                        shell.ed.move_end();
+                        try_expand_abbr(&mut shell.ed, &shell.ctx.abbrs);
+                        // 2. ゴーストを消してクリーンな表示にしてから改行
+                        shell.ghost = None;
+                        shell.redraw()?;
+                        // 3. バッファを取得してエディタをクリア
+                        let cmd = shell.ed.take();
+                        // 4. 実行 (cwd は cd 前に記録)
                         let cwd = std::env::current_dir().unwrap_or_default();
-                        execute_command(&cmd, &mut shell.ctx)?;
+                        execute_command(&cmd, &mut shell.ctx, true)?;
                         if !cmd.trim().is_empty() {
                             shell.history.add(&cmd, &cwd);
                         }
@@ -140,7 +149,6 @@ fn run() -> io::Result<()> {
                             prefix: &prefix,
                             cwd: &cwd,
                             history: &shell.history,
-                            reg_paths: &shell.ctx.reg_paths,
                             lines_above_cursor: lines_above,
                         };
                         match completion::tab_complete(tab_ctx)? {
@@ -149,8 +157,13 @@ fn run() -> io::Result<()> {
                                 shell.ed.take();
                             }
                             Selection::Dismissed => {}
+                            Selection::InsertChar(c) => shell.ed.insert(c),
+                            Selection::Backspace => shell.ed.backspace(),
                         }
-                        shell.ed.reset_cursor_tracking();
+                        // reset_cursor_tracking は呼ばない:
+                        // グリッドメニューは MoveUp(1) で入力行に戻るので
+                        // lines_above_cursor をそのまま使って redraw できる。
+                        // 候補なし (Dismissed) のときは cursor が動いていないため特に重要。
                         pending.push(ShellEvent::RedrawPrompt);
                     }
 
@@ -198,6 +211,8 @@ fn run() -> io::Result<()> {
                     ShellEvent::ShowHistoryFzf => {
                         let query = shell.ed.line().to_string();
                         let cwd = std::env::current_dir().unwrap_or_default();
+                        execute!(stdout(), Print("\r\n"))?;
+                        shell.ed.note_newline();
                         match completion::fzf_history(&query, &cwd, &shell.history) {
                             Ok(Some(s)) => shell.ed.set(s),
                             Ok(None) => {}
@@ -205,12 +220,13 @@ fn run() -> io::Result<()> {
                                 execute!(stdout(), Print(format!("fzf: {}\r\n", e)))?;
                             }
                         }
-                        shell.ed.reset_cursor_tracking();
                         pending.push(ShellEvent::RedrawPrompt);
                     }
 
                     ShellEvent::ShowFileFzf => {
                         let cwd = std::env::current_dir().unwrap_or_default();
+                        execute!(stdout(), Print("\r\n"))?;
+                        shell.ed.note_newline();
                         match completion::fzf_files(&cwd, &shell.history) {
                             Ok(Some(s)) => shell.ed.insert_str(&s),
                             Ok(None) => {}
@@ -218,7 +234,25 @@ fn run() -> io::Result<()> {
                                 execute!(stdout(), Print(format!("fzf: {}\r\n", e)))?;
                             }
                         }
-                        shell.ed.reset_cursor_tracking();
+                        pending.push(ShellEvent::RedrawPrompt);
+                    }
+
+                    ShellEvent::ShowRegPathFzf => {
+                        execute!(stdout(), Print("\r\n"))?;
+                        shell.ed.note_newline();
+                        match completion::fzf_reg_paths(&shell.ctx.reg_paths) {
+                            Ok(Some(s)) => shell.ed.insert_str(&s),
+                            Ok(None) => {}
+                            Err(e) => {
+                                execute!(stdout(), Print(format!("fzf: {}\r\n", e)))?;
+                            }
+                        }
+                        pending.push(ShellEvent::RedrawPrompt);
+                    }
+
+                    ShellEvent::InsertSpace => {
+                        try_expand_abbr(&mut shell.ed, &shell.ctx.abbrs);
+                        shell.ed.insert(' ');
                         pending.push(ShellEvent::RedrawPrompt);
                     }
                 }
@@ -227,6 +261,25 @@ fn run() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+// ─── abbr 展開 ────────────────────────────────────────────────────────────────
+
+/// バッファがちょうど 1 トークン (= abbr キー) のとき展開してバッファを書き換える。
+/// Space 押下時に呼ぶ (fish と同じ視覚展開)。
+fn try_expand_abbr(ed: &mut LineEditor, abbrs: &HashMap<String, String>) {
+    // カーソルが行末でなければ展開しない
+    if ed.cursor() != ed.line().len() {
+        return;
+    }
+    let trimmed = ed.line().trim();
+    // 空か、すでに複数トークンなら展開しない
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return;
+    }
+    if let Some(expansion) = abbrs.get(trimmed) {
+        ed.set(expansion.clone());
+    }
 }
 
 // ─── RC ファイル ──────────────────────────────────────────────────────────────
@@ -241,7 +294,7 @@ fn load_rc(ctx: &mut ShellContext) {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Err(e) = execute_command(line, ctx) {
+        if let Err(e) = execute_command(line, ctx, false) {
             eprintln!("rc: {}: {}", line, e);
         }
     }

@@ -57,17 +57,21 @@ impl LineEditor {
         self.cursor = self.buf.len();
     }
 
-    /// Ctrl+W: カーソル直前の単語 (空白を含む) を削除する (Unix word rubout)
+    /// Ctrl+Left: 単語または '/' 単位でカーソルを左へ移動する
+    pub fn move_word_left(&mut self) {
+        self.cursor = word_left_pos(&self.buf[..self.cursor]);
+    }
+
+    /// Ctrl+Right: 単語または '/' 単位でカーソルを右へ移動する
+    pub fn move_word_right(&mut self) {
+        self.cursor = word_right_pos(&self.buf, self.cursor);
+    }
+
+    /// Ctrl+W: 単語または '/' 単位でカーソル直前を削除する
     pub fn delete_word_backward(&mut self) {
-        let new_end = self.buf[..self.cursor]
-            .char_indices()
-            .rev()
-            .skip_while(|(_, c)| c.is_whitespace())
-            .find(|(_, c)| c.is_whitespace())
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
-        self.buf.drain(new_end..self.cursor);
-        self.cursor = new_end;
+        let new_pos = word_left_pos(&self.buf[..self.cursor]);
+        self.buf.drain(new_pos..self.cursor);
+        self.cursor = new_pos;
     }
 
     pub fn take(&mut self) -> String {
@@ -98,12 +102,14 @@ impl LineEditor {
         self.buf.is_empty()
     }
 
-    pub fn reset_cursor_tracking(&mut self) {
-        self.lines_above_cursor = 0;
-    }
-
     pub fn lines_above_cursor(&self) -> u16 {
         self.lines_above_cursor
+    }
+
+    /// skim 起動前に \r\n を出力した分だけ lines_above_cursor を +1 する。
+    /// これにより redraw_prompt が正しくヘッダ行まで遡れる。
+    pub fn note_newline(&mut self) {
+        self.lines_above_cursor += 1;
     }
 
     fn prev_boundary(&self) -> Option<usize> {
@@ -164,12 +170,20 @@ pub fn redraw_prompt(
     }
     queue!(stdout(), Print("\r\n"))?;
 
-    // 3. 入力行: カーソル手前を印字 → 位置保存 → 残りを印字 → 位置復元
+    // 3. 入力行: "$ " プレフィックス → カーソル手前 → 位置保存 → 残りを印字 → 位置復元
     //
     // wrap-pending 対策: cursor_display が term_cols の倍数のとき端末は行末待機状態
     // になる。この状態で SavePosition すると位置がずれるため \r\n で折り返しを確定。
-    let cursor_display = ed.buf[..ed.cursor].width() as u16;
-    queue!(stdout(), Print(&ed.buf[..ed.cursor]))?;
+    const PREFIX: &str = "$ ";
+    const PREFIX_WIDTH: u16 = 2; // "$ " は常に 2 列
+    let cursor_display = PREFIX_WIDTH + ed.buf[..ed.cursor].width() as u16;
+    queue!(
+        stdout(),
+        SetForegroundColor(Color::White),
+        Print(PREFIX),
+        ResetColor,
+        Print(&ed.buf[..ed.cursor]),
+    )?;
     if cursor_display > 0 && cursor_display.is_multiple_of(term_cols) {
         queue!(stdout(), Print("\r\n"))?;
     }
@@ -188,6 +202,30 @@ pub fn redraw_prompt(
     ed.lines_above_cursor = 1 + cursor_display / term_cols;
 
     stdout().flush()
+}
+
+fn is_word_sep(c: char) -> bool {
+    c.is_whitespace() || c == '/'
+}
+
+fn word_left_pos(s: &str) -> usize {
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let n = chars.len();
+    let mut i = n;
+    while i > 0 && is_word_sep(chars[i - 1].1) { i -= 1; }
+    if i == 0 { return 0; }
+    while i > 0 && !is_word_sep(chars[i - 1].1) { i -= 1; }
+    if i == 0 { 0 } else { chars[i].0 }
+}
+
+fn word_right_pos(s: &str, cursor: usize) -> usize {
+    let rest = &s[cursor..];
+    let chars: Vec<(usize, char)> = rest.char_indices().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n && is_word_sep(chars[i].1) { i += 1; }
+    while i < n && !is_word_sep(chars[i].1) { i += 1; }
+    if i == n { s.len() } else { cursor + chars[i].0 }
 }
 
 fn hostname() -> String {

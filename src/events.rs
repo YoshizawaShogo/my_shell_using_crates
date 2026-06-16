@@ -11,13 +11,16 @@ pub enum ShellEvent {
     Exit,
     CancelInput,
     RedrawPrompt,
-    ExecuteCommand(String),
+    ExecuteCommand,
     ShowCompletion,
     AcceptGhost,
     ShowHistoryFzf,
     ShowFileFzf,
+    ShowRegPathFzf,
     HistoryPrev,
     HistoryNext,
+    /// Space キー押下。main.rs で abbr 展開を試みてからスペースを挿入する。
+    InsertSpace,
 }
 
 pub fn handle_key(ed: &mut LineEditor, key: KeyEvent) -> Vec<ShellEvent> {
@@ -26,8 +29,17 @@ pub fn handle_key(ed: &mut LineEditor, key: KeyEvent) -> Vec<ShellEvent> {
     let at_end = ed.cursor() == ed.line().len();
 
     match key.code {
-        // 空行での C-d のみ終了 (fish と同じ)
+        // 空行での C-d のみ終了 (fish と同じ)、それ以外は Delete (カーソル後の1文字削除)
         KeyCode::Char('d') if ctrl && ed.is_empty() => vec![ShellEvent::Exit],
+        KeyCode::Char('d') if ctrl => {
+            ed.delete();
+            vec![ShellEvent::RedrawPrompt]
+        }
+        // C-h は Backspace と同義
+        KeyCode::Char('h') if ctrl => {
+            ed.backspace();
+            vec![ShellEvent::RedrawPrompt]
+        }
         KeyCode::Char('c') if ctrl => vec![ShellEvent::CancelInput],
         KeyCode::Char('a') if ctrl => {
             ed.move_home();
@@ -56,14 +68,24 @@ pub fn handle_key(ed: &mut LineEditor, key: KeyEvent) -> Vec<ShellEvent> {
         }
         KeyCode::Char('p') if ctrl => vec![ShellEvent::HistoryPrev],
         KeyCode::Char('n') if ctrl => vec![ShellEvent::HistoryNext],
+        KeyCode::Char('q') if ctrl => vec![ShellEvent::ShowRegPathFzf],
         KeyCode::Char('r') if ctrl => vec![ShellEvent::ShowHistoryFzf],
         KeyCode::Char('t') if ctrl => vec![ShellEvent::ShowFileFzf],
 
         KeyCode::Tab => vec![ShellEvent::ShowCompletion],
-        KeyCode::Enter => vec![ShellEvent::ExecuteCommand(ed.take())],
+        // ゴースト消去・abbr 展開は main.rs 側で行うため take() しない
+        KeyCode::Enter => vec![ShellEvent::ExecuteCommand],
 
+        KeyCode::Left if ctrl => {
+            ed.move_word_left();
+            vec![ShellEvent::RedrawPrompt]
+        }
         KeyCode::Left => {
             ed.move_left();
+            vec![ShellEvent::RedrawPrompt]
+        }
+        KeyCode::Right if ctrl => {
+            ed.move_word_right();
             vec![ShellEvent::RedrawPrompt]
         }
         // 行末なら ghost 受け入れ、そうでなければ右移動
@@ -93,6 +115,9 @@ pub fn handle_key(ed: &mut LineEditor, key: KeyEvent) -> Vec<ShellEvent> {
             ed.delete();
             vec![ShellEvent::RedrawPrompt]
         }
+
+        // Space: abbr 展開の機会を main.rs に委譲する
+        KeyCode::Char(' ') if !ctrl && !alt => vec![ShellEvent::InsertSpace],
 
         // 通常の文字入力 (制御・Alt 修飾は除外)
         KeyCode::Char(c) if !ctrl && !alt => {

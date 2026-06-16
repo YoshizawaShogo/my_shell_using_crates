@@ -16,8 +16,10 @@ use unicode_width::UnicodeWidthStr;
 
 pub enum Selection {
     Chosen(String),
-    Dismissed, // Esc / 候補なし
-    Aborted,   // Ctrl+C
+    Dismissed,        // Esc / 候補なし
+    Aborted,          // Ctrl+C
+    InsertChar(char), // メニュー中に文字を打った → 挿入してメニュー閉じ
+    Backspace,        // メニュー中に Backspace → 削除してメニュー閉じ
 }
 
 // ─── グリッドメニュー (Tab 補完) ──────────────────────────────────────────────
@@ -29,7 +31,7 @@ pub enum Selection {
 /// - Shift+Tab / ← : 前の候補
 /// - ↓ / ↑ : 同列の次/前の行
 /// - Enter : 確定、Esc : キャンセル、Ctrl+C : 中断
-pub fn run_grid_menu(candidates: &[String], lines_above_cursor: u16) -> io::Result<Selection> {
+pub fn run_grid_menu(candidates: &[String], _lines_above_cursor: u16) -> io::Result<Selection> {
     if candidates.is_empty() {
         return Ok(Selection::Dismissed);
     }
@@ -86,15 +88,26 @@ pub fn run_grid_menu(candidates: &[String], lines_above_cursor: u16) -> io::Resu
                     selected -= n_cols;
                 }
             }
+            // 文字入力でメニューを閉じてエディタへ委譲
+            KeyCode::Backspace => {
+                outcome = Selection::Backspace;
+                break;
+            }
+            KeyCode::Char(c) if !ctrl => {
+                outcome = Selection::InsertChar(c);
+                break;
+            }
             _ => {}
         }
     }
 
-    // draw_grid はカーソルをグリッド先頭行に置いて終わる
+    // draw_grid はカーソルをグリッド先頭行 (入力行 +1) に置いて終わる。
+    // \r\n で 1 行下がっているので MoveUp(1) で入力行に戻る。
+    // その後 redraw_prompt が lines_above_cursor を使ってヘッダー行まで遡る。
     execute!(
         stdout(),
         Clear(ClearType::FromCursorDown),
-        cursor::MoveUp(lines_above_cursor + 1),
+        cursor::MoveUp(1),
         cursor::MoveToColumn(0),
     )?;
 
