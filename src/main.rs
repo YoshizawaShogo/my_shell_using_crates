@@ -225,10 +225,42 @@ fn run() -> io::Result<()> {
 
                     ShellEvent::ShowFileFzf => {
                         let cwd = std::env::current_dir().unwrap_or_default();
+                        // カーソル前のトークンを取得（owned にして借用を切る）
+                        let token: String = {
+                            let before = &shell.ed.line()[..shell.ed.cursor()];
+                            let token_start = before.rfind(' ').map(|i| i + 1).unwrap_or(0);
+                            before[token_start..].to_owned()
+                        };
+                        // トークンに '/' が含まれる場合はそのディレクトリをルートにする
+                        let (root, initial_query, dir_part) = if !token.is_empty() && token.contains('/') {
+                            let last_slash = token.rfind('/').unwrap();
+                            let dir = token[..=last_slash].to_owned();
+                            let file_part = token[last_slash + 1..].to_owned();
+                            let root = if dir.starts_with('/') {
+                                std::path::PathBuf::from(&dir)
+                            } else if let Some(rest) = dir.strip_prefix("~/") {
+                                let home = std::env::var("HOME").unwrap_or_default();
+                                std::path::PathBuf::from(home).join(rest)
+                            } else {
+                                cwd.join(&dir)
+                            };
+                            let query = if file_part.is_empty() { None } else { Some(file_part) };
+                            (root, query, Some(dir))
+                        } else {
+                            (cwd.clone(), None, None)
+                        };
                         execute!(stdout(), Print("\r\n"))?;
                         shell.ed.note_newline();
-                        match completion::fzf_files(&cwd, &shell.history) {
-                            Ok(Some(s)) => shell.ed.insert_str(&s),
+                        match completion::fzf_files(&root, initial_query.as_deref()) {
+                            Ok(Some(s)) => {
+                                if let Some(ref dir) = dir_part {
+                                    shell.ed.delete_before_cursor(token.len());
+                                    let filename = s.strip_prefix("./").unwrap_or(&s);
+                                    shell.ed.insert_str(&format!("{}{}", dir, filename));
+                                } else {
+                                    shell.ed.insert_str(&s);
+                                }
+                            }
                             Ok(None) => {}
                             Err(e) => {
                                 execute!(stdout(), Print(format!("fzf: {}\r\n", e)))?;

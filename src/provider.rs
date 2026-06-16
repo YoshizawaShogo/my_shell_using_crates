@@ -180,6 +180,12 @@ impl Default for FileProvider {
     }
 }
 
+impl FileProvider {
+    pub fn collect(&self, root: &Path) -> Vec<String> {
+        collect_files(root, self.max_depth)
+    }
+}
+
 impl CandidateProvider for FileProvider {
     fn candidates(&self, ctx: &CompletionContext<'_>) -> Vec<String> {
         collect_files(ctx.cwd, self.max_depth)
@@ -205,10 +211,11 @@ fn visit(root: &Path, dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<
         }
         let path = entry.path();
         let rel = path.strip_prefix(root).unwrap_or(&path);
-        let display = format!("./{}", rel.to_string_lossy());
+        let rel = rel.to_string_lossy();
         if path.is_file() {
-            out.push(display);
+            out.push(format!("./{}", rel));
         } else if path.is_dir() {
+            out.push(format!("./{}/", rel));
             visit(root, &path, depth + 1, max_depth, out);
         }
     }

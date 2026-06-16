@@ -90,21 +90,16 @@ pub fn fzf_history(
 
 // ─── Ctrl+T ──────────────────────────────────────────────────────────────────
 
-/// カレントディレクトリ以下のファイルを skim で選択する。
-pub fn fzf_files(cwd: &Path, history: &History) -> std::io::Result<Option<String>> {
-    let pctx = CompletionContext {
-        prefix: "",
-        cwd,
-        history,
-    };
-    let cands = FileProvider::default().candidates(&pctx);
-    match selector::run_fzf(&cands, None)? {
+/// `root` 以下のファイル/ディレクトリを fzf で選択する。
+pub fn fzf_files(root: &Path, initial_query: Option<&str>) -> std::io::Result<Option<String>> {
+    let cands = FileProvider::default().collect(root);
+    match selector::run_fzf(&cands, initial_query)? {
         Selection::Chosen(s) => Ok(Some(s)),
         _ => Ok(None),
     }
 }
 
-// ─── Ctrl+Q ──────────────────────────────────────────────────────────────────
+// ─── Ctrl+G ──────────────────────────────────────────────────────────────────
 
 /// 登録済みパスを skim で選択する。
 pub fn fzf_reg_paths(reg_paths: &[std::path::PathBuf]) -> std::io::Result<Option<String>> {

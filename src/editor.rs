@@ -74,6 +74,14 @@ impl LineEditor {
         self.cursor = new_pos;
     }
 
+    /// カーソル前の `n` バイトを削除する。
+    pub fn delete_before_cursor(&mut self, n: usize) {
+        let end = self.cursor;
+        let start = end.saturating_sub(n);
+        self.buf.drain(start..end);
+        self.cursor = start;
+    }
+
     pub fn take(&mut self) -> String {
         self.cursor = 0;
         self.lines_above_cursor = 0;
@@ -124,7 +132,7 @@ impl LineEditor {
 ///
 /// 画面構成:
 ///   行 H : user@host ~/path (branch)  ← ヘッダ行
-///   行 H+1: [入力バッファ]              ← 入力行 (折り返し可)
+///   行 H+1: \[入力バッファ\]              ← 入力行 (折り返し可)
 ///
 /// `lines_above_cursor` は行 H からカーソル行までの距離を保持し、
 /// 次回の `MoveUp` でヘッダ先頭に戻るために使う。

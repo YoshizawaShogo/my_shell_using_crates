@@ -68,7 +68,7 @@ pub fn handle_key(ed: &mut LineEditor, key: KeyEvent) -> Vec<ShellEvent> {
         }
         KeyCode::Char('p') if ctrl => vec![ShellEvent::HistoryPrev],
         KeyCode::Char('n') if ctrl => vec![ShellEvent::HistoryNext],
-        KeyCode::Char('q') if ctrl => vec![ShellEvent::ShowRegPathFzf],
+        KeyCode::Char('g') if ctrl => vec![ShellEvent::ShowRegPathFzf],
         KeyCode::Char('r') if ctrl => vec![ShellEvent::ShowHistoryFzf],
         KeyCode::Char('t') if ctrl => vec![ShellEvent::ShowFileFzf],
 
