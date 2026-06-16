@@ -232,23 +232,28 @@ fn run() -> io::Result<()> {
                             before[token_start..].to_owned()
                         };
                         // トークンに '/' が含まれる場合はそのディレクトリをルートにする
-                        let (root, initial_query, dir_part) = if !token.is_empty() && token.contains('/') {
-                            let last_slash = token.rfind('/').unwrap();
-                            let dir = token[..=last_slash].to_owned();
-                            let file_part = token[last_slash + 1..].to_owned();
-                            let root = if dir.starts_with('/') {
-                                std::path::PathBuf::from(&dir)
-                            } else if let Some(rest) = dir.strip_prefix("~/") {
-                                let home = std::env::var("HOME").unwrap_or_default();
-                                std::path::PathBuf::from(home).join(rest)
+                        let (root, initial_query, dir_part) =
+                            if !token.is_empty() && token.contains('/') {
+                                let last_slash = token.rfind('/').unwrap();
+                                let dir = token[..=last_slash].to_owned();
+                                let file_part = token[last_slash + 1..].to_owned();
+                                let root = if dir.starts_with('/') {
+                                    std::path::PathBuf::from(&dir)
+                                } else if let Some(rest) = dir.strip_prefix("~/") {
+                                    let home = std::env::var("HOME").unwrap_or_default();
+                                    std::path::PathBuf::from(home).join(rest)
+                                } else {
+                                    cwd.join(&dir)
+                                };
+                                let query = if file_part.is_empty() {
+                                    None
+                                } else {
+                                    Some(file_part)
+                                };
+                                (root, query, Some(dir))
                             } else {
-                                cwd.join(&dir)
+                                (cwd.clone(), None, None)
                             };
-                            let query = if file_part.is_empty() { None } else { Some(file_part) };
-                            (root, query, Some(dir))
-                        } else {
-                            (cwd.clone(), None, None)
-                        };
                         execute!(stdout(), Print("\r\n"))?;
                         shell.ed.note_newline();
                         match completion::fzf_files(&root, initial_query.as_deref()) {
