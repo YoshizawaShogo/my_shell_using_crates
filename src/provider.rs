@@ -180,43 +180,59 @@ impl Default for FileProvider {
     }
 }
 
-impl FileProvider {
-    pub fn collect(&self, root: &Path) -> Vec<String> {
-        collect_files(root, self.max_depth)
-    }
-}
-
 impl CandidateProvider for FileProvider {
     fn candidates(&self, ctx: &CompletionContext<'_>) -> Vec<String> {
-        collect_files(ctx.cwd, self.max_depth)
+        let mut out = Vec::new();
+        walk_files(ctx.cwd, self.max_depth, &mut |s| {
+            out.push(s);
+            true
+        });
+        out
     }
 }
 
-fn collect_files(root: &Path, max_depth: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    visit(root, root, 0, max_depth, &mut out);
-    out
+/// `root` 以下のファイル/ディレクトリを再帰列挙し、各エントリ
+/// (例: `./src/`, `./src/main.rs`) を `emit` へ逐次渡す。
+///
+/// `emit` が false を返したら (消費側が中断したら) 走査を即座に打ち切る。
+/// 巨大なツリーをストリーミング表示しつつ Ctrl+C/Esc で中断できるようにするため、
+/// 全件を Vec に溜めず逐次コールバックする設計にしている。
+pub fn walk_files(root: &Path, max_depth: usize, emit: &mut dyn FnMut(String) -> bool) {
+    walk_visit(root, root, 0, max_depth, emit);
 }
 
-fn visit(root: &Path, dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<String>) {
+/// 戻り値: 走査を続けてよいなら true、消費側が中断したら false。
+fn walk_visit(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    emit: &mut dyn FnMut(String) -> bool,
+) -> bool {
     if depth > max_depth {
-        return;
+        return true;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return true;
     };
     for entry in entries.flatten() {
         if entry.file_name().to_string_lossy().starts_with('.') {
             continue;
         }
         let path = entry.path();
-        let rel = path.strip_prefix(root).unwrap_or(&path);
-        let rel = rel.to_string_lossy();
+        let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
         if path.is_file() {
-            out.push(format!("./{}", rel));
+            if !emit(format!("./{}", rel)) {
+                return false;
+            }
         } else if path.is_dir() {
-            out.push(format!("./{}/", rel));
-            visit(root, &path, depth + 1, max_depth, out);
+            if !emit(format!("./{}/", rel)) {
+                return false;
+            }
+            if !walk_visit(root, &path, depth + 1, max_depth, emit) {
+                return false;
+            }
         }
     }
+    true
 }

@@ -212,3 +212,48 @@ pub fn run_fzf(candidates: &[String], initial_query: Option<&str>) -> io::Result
         _ => Ok(Selection::Dismissed),
     }
 }
+
+/// 候補をストリーミングしながら skim で選択させる。
+///
+/// `produce` は別スレッドで実行され、`emit(String)` を呼んで候補を1件ずつ送る。
+/// `emit` が false を返したとき (= skim が終了して受信側が閉じたとき) は走査を
+/// 中断してよい。これにより巨大なツリーでも「検索したものから順に表示」でき、
+/// 列挙の途中でも Ctrl+C / Esc で即中断できる。
+pub fn run_fzf_streaming<F>(produce: F, initial_query: Option<&str>) -> io::Result<Selection>
+where
+    F: FnOnce(&mut dyn FnMut(String) -> bool) + Send + 'static,
+{
+    use skim::prelude::{
+        Arc, Skim, SkimItem, SkimItemReceiver, SkimItemSender, SkimOptionsBuilder, unbounded,
+    };
+
+    let (tx, rx): (SkimItemSender, SkimItemReceiver) = unbounded();
+    // 候補生成は別スレッドで。skim が終了すると rx が閉じ、send が Err を返すので
+    // emit が false → produce 側はそこで走査を打ち切れる。
+    std::thread::spawn(move || {
+        let mut emit =
+            |s: String| -> bool { tx.send(vec![Arc::new(s) as Arc<dyn SkimItem>]).is_ok() };
+        produce(&mut emit);
+    });
+
+    let mut builder = SkimOptionsBuilder::default();
+    builder.height("40%").reverse(true).no_sort(true);
+    if let Some(q) = initial_query.filter(|q| !q.is_empty()) {
+        builder.query(q);
+    }
+    let options = builder
+        .build()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    terminal::disable_raw_mode()?;
+    let result = Skim::run_with(options, Some(rx)).map_err(|e| io::Error::other(e.to_string()));
+    terminal::enable_raw_mode()?;
+
+    match result? {
+        output if !output.is_abort => match output.selected_items.first() {
+            Some(item) => Ok(Selection::Chosen(item.output().to_string())),
+            None => Ok(Selection::Dismissed),
+        },
+        _ => Ok(Selection::Dismissed),
+    }
+}

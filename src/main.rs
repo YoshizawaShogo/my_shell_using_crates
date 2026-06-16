@@ -23,6 +23,7 @@ use exec::execute_command;
 use history::History;
 use selector::Selection;
 use std::collections::HashMap;
+use std::os::unix::process::CommandExt;
 use term::{RawModeGuard, setup_sigint_handler};
 
 /// RC ファイルパス (起動時に読み込む設定ファイル)
@@ -67,6 +68,21 @@ impl Shell {
 // ─── エントリポイント ─────────────────────────────────────────────────────────
 
 fn main() -> io::Result<()> {
+    // skim が global_allocator として mimalloc を強制しており、mimalloc は
+    // 起動時に既定 1GiB の arena を予約して仮想メモリ(VSZ)を肥大させる。
+    // mimalloc は main より前に初期化されるため set_var では間に合わない。
+    // そこで環境変数を設定して一度だけ自分自身を exec し直す
+    // (exec なので PID は不変・プロセス数も増えない)。
+    if std::env::var_os("MIMALLOC_ARENA_RESERVE").is_none() {
+        unsafe {
+            std::env::set_var("MIMALLOC_ARENA_RESERVE", "65536"); // KiB = 64MB
+        }
+        let exe = std::env::current_exe()?;
+        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        // exec が成功すればこのプロセスイメージは置き換わり、以降は実行されない。
+        return Err(std::process::Command::new(exe).args(args).exec());
+    }
+
     // glibc の malloc arena を1個に固定し、skim 使用による VSZ 肥大を防ぐ。
     // このシェルは実質シングルスレッドなので arena 分割の利点が無く、
     // 短命スレッド (skim) が arena を量産して仮想メモリが膨らむのを抑える。

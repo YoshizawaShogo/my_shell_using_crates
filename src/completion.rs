@@ -6,7 +6,7 @@
 use crate::history::History;
 use crate::provider::{
     CandidateProvider, CommandProvider, CompletionContext, EnvVarProvider, FileProvider,
-    HistoryProvider, PathProvider,
+    HistoryProvider, PathProvider, walk_files,
 };
 use crate::selector::{self, Selection};
 use std::path::Path;
@@ -90,10 +90,17 @@ pub fn fzf_history(
 
 // ─── Ctrl+T ──────────────────────────────────────────────────────────────────
 
-/// `root` 以下のファイル/ディレクトリを fzf で選択する。
+/// `root` 以下のファイル/ディレクトリをストリーミングしながら fzf で選択する。
+///
+/// ツリーが巨大でも列挙の途中から検索・表示でき、Ctrl+C / Esc で中断できる。
 pub fn fzf_files(root: &Path, initial_query: Option<&str>) -> std::io::Result<Option<String>> {
-    let cands = FileProvider::default().collect(root);
-    match selector::run_fzf(&cands, initial_query)? {
+    let root = root.to_path_buf();
+    let max_depth = FileProvider::default().max_depth;
+    let sel = selector::run_fzf_streaming(
+        move |emit| walk_files(&root, max_depth, emit),
+        initial_query,
+    )?;
+    match sel {
         Selection::Chosen(s) => Ok(Some(s)),
         _ => Ok(None),
     }
