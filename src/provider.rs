@@ -213,4 +213,3 @@ fn visit(root: &Path, dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<
         }
     }
 }
-

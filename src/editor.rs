@@ -212,9 +212,15 @@ fn word_left_pos(s: &str) -> usize {
     let chars: Vec<(usize, char)> = s.char_indices().collect();
     let n = chars.len();
     let mut i = n;
-    while i > 0 && is_word_sep(chars[i - 1].1) { i -= 1; }
-    if i == 0 { return 0; }
-    while i > 0 && !is_word_sep(chars[i - 1].1) { i -= 1; }
+    while i > 0 && is_word_sep(chars[i - 1].1) {
+        i -= 1;
+    }
+    if i == 0 {
+        return 0;
+    }
+    while i > 0 && !is_word_sep(chars[i - 1].1) {
+        i -= 1;
+    }
     if i == 0 { 0 } else { chars[i].0 }
 }
 
@@ -223,8 +229,12 @@ fn word_right_pos(s: &str, cursor: usize) -> usize {
     let chars: Vec<(usize, char)> = rest.char_indices().collect();
     let n = chars.len();
     let mut i = 0;
-    while i < n && is_word_sep(chars[i].1) { i += 1; }
-    while i < n && !is_word_sep(chars[i].1) { i += 1; }
+    while i < n && is_word_sep(chars[i].1) {
+        i += 1;
+    }
+    while i < n && !is_word_sep(chars[i].1) {
+        i += 1;
+    }
     if i == n { s.len() } else { cursor + chars[i].0 }
 }
 

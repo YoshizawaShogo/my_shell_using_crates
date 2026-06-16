@@ -19,10 +19,10 @@ use builtin::ShellContext;
 use completion::TabContext;
 use editor::{LineEditor, redraw_prompt};
 use events::{ShellEvent, handle_key};
-use std::collections::HashMap;
 use exec::execute_command;
 use history::History;
 use selector::Selection;
+use std::collections::HashMap;
 use term::{RawModeGuard, setup_sigint_handler};
 
 /// RC ファイルパス (起動時に読み込む設定ファイル)
