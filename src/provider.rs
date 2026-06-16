@@ -3,6 +3,7 @@
 //! 「何を補完候補にするか」だけを担う。
 //! UI (どう表示・選択するか) は `selector` モジュールが担う。
 
+use crate::builtin::builtin_names;
 use crate::history::History;
 use std::path::{Path, PathBuf};
 
@@ -37,15 +38,12 @@ impl CandidateProvider for HistoryProvider {
 /// $PATH 上の実行ファイルとビルトイン名を候補にする (第1トークン補完用)。
 pub struct CommandProvider;
 
-const BUILTINS: &[&str] = &["cd", "popd", "reg_path", "abbr", "alias", "set", "setenv"];
-
 impl CandidateProvider for CommandProvider {
     fn candidates(&self, ctx: &CompletionContext<'_>) -> Vec<String> {
         let prefix = ctx.prefix;
-        let mut cmds: Vec<String> = BUILTINS
-            .iter()
-            .filter(|&&b| b.starts_with(prefix))
-            .map(|&b| b.to_string())
+        let mut cmds: Vec<String> = builtin_names()
+            .filter(|name| name.starts_with(prefix))
+            .map(|name| name.to_string())
             .collect();
 
         if let Ok(path_var) = std::env::var("PATH") {
@@ -235,4 +233,36 @@ fn walk_visit(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_token_relative() {
+        let cwd = Path::new("/home/x");
+        let (dir, file, disp) = parse_path_token("fo", cwd);
+        assert_eq!(dir, PathBuf::from("/home/x"));
+        assert_eq!(file, "fo");
+        assert_eq!(disp, "");
+    }
+
+    #[test]
+    fn path_token_absolute() {
+        let cwd = Path::new("/home/x");
+        let (dir, file, disp) = parse_path_token("/tmp/fo", cwd);
+        assert_eq!(dir, PathBuf::from("/tmp/"));
+        assert_eq!(file, "fo");
+        assert_eq!(disp, "/tmp/");
+    }
+
+    #[test]
+    fn path_token_subdir() {
+        let cwd = Path::new("/home/x");
+        let (dir, file, disp) = parse_path_token("sub/fo", cwd);
+        assert_eq!(dir, PathBuf::from("/home/x/sub/"));
+        assert_eq!(file, "fo");
+        assert_eq!(disp, "sub/");
+    }
 }

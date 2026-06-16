@@ -8,6 +8,16 @@ use crossterm::{
 use std::io::{self, Write, stdout};
 use unicode_width::UnicodeWidthStr;
 
+// ─── 配色・プロンプト定数 ─────────────────────────────────────────────────────
+
+const PROMPT_PREFIX: &str = "$ ";
+const PROMPT_PREFIX_WIDTH: u16 = 2; // "$ " は常に 2 列
+const COLOR_USER_HOST: Color = Color::Green;
+const COLOR_CWD: Color = Color::Cyan;
+const COLOR_BRANCH: Color = Color::Blue;
+const COLOR_PROMPT: Color = Color::White;
+const COLOR_GHOST: Color = Color::DarkGrey;
+
 #[derive(Default)]
 pub struct LineEditor {
     buf: String,
@@ -74,6 +84,17 @@ impl LineEditor {
         self.cursor = new_pos;
     }
 
+    /// Ctrl+U: カーソルより前をすべて削除する。
+    pub fn kill_to_start(&mut self) {
+        self.buf.drain(..self.cursor);
+        self.cursor = 0;
+    }
+
+    /// Ctrl+K: カーソル以降をすべて削除する。
+    pub fn kill_to_end(&mut self) {
+        self.buf.truncate(self.cursor);
+    }
+
     /// カーソル前の `n` バイトを削除する。
     pub fn delete_before_cursor(&mut self, n: usize) {
         let end = self.cursor;
@@ -120,6 +141,11 @@ impl LineEditor {
         self.lines_above_cursor += 1;
     }
 
+    /// 画面クリア (Ctrl+L) 後に呼ぶ: カーソルが最上段に移ったので追跡をリセットする。
+    pub fn reset_lines_above(&mut self) {
+        self.lines_above_cursor = 0;
+    }
+
     fn prev_boundary(&self) -> Option<usize> {
         self.buf[..self.cursor]
             .char_indices()
@@ -159,11 +185,11 @@ pub fn redraw_prompt(
     let cwd = abbreviated_cwd();
     queue!(
         stdout(),
-        SetForegroundColor(Color::Green),
+        SetForegroundColor(COLOR_USER_HOST),
         Print(format!("{}@{}", user, host)),
         ResetColor,
         Print(" "),
-        SetForegroundColor(Color::Cyan),
+        SetForegroundColor(COLOR_CWD),
         Print(cwd),
         ResetColor,
     )?;
@@ -171,7 +197,7 @@ pub fn redraw_prompt(
         queue!(
             stdout(),
             Print(" "),
-            SetForegroundColor(Color::Blue),
+            SetForegroundColor(COLOR_BRANCH),
             Print(format!("({})", branch)),
             ResetColor,
         )?;
@@ -182,13 +208,11 @@ pub fn redraw_prompt(
     //
     // wrap-pending 対策: cursor_display が term_cols の倍数のとき端末は行末待機状態
     // になる。この状態で SavePosition すると位置がずれるため \r\n で折り返しを確定。
-    const PREFIX: &str = "$ ";
-    const PREFIX_WIDTH: u16 = 2; // "$ " は常に 2 列
-    let cursor_display = PREFIX_WIDTH + ed.buf[..ed.cursor].width() as u16;
+    let cursor_display = PROMPT_PREFIX_WIDTH + ed.buf[..ed.cursor].width() as u16;
     queue!(
         stdout(),
-        SetForegroundColor(Color::White),
-        Print(PREFIX),
+        SetForegroundColor(COLOR_PROMPT),
+        Print(PROMPT_PREFIX),
         ResetColor,
         Print(&ed.buf[..ed.cursor]),
     )?;
@@ -199,7 +223,7 @@ pub fn redraw_prompt(
     if let Some(g) = ghost {
         queue!(
             stdout(),
-            SetForegroundColor(Color::DarkGrey),
+            SetForegroundColor(COLOR_GHOST),
             Print(g),
             ResetColor,
         )?;
@@ -266,29 +290,83 @@ fn abbreviated_cwd() -> String {
     };
 
     // 最終コンポーネント以外を先頭 1 文字に短縮 (fish 方式)
-    // 隠しディレクトリ (.foo) は ".f" に短縮
     let parts: Vec<&str> = path.split('/').collect();
     if parts.len() <= 2 {
         return path;
     }
-    let mut result = String::new();
-    for (i, part) in parts.iter().enumerate() {
-        if i > 0 {
-            result.push('/');
-        }
-        if i == parts.len() - 1 || part.is_empty() {
-            result.push_str(part);
-        } else {
-            let mut chars = part.chars();
-            if let Some(c) = chars.next() {
-                result.push(c);
-                if c == '.'
-                    && let Some(c2) = chars.next()
-                {
-                    result.push(c2);
-                }
+    let last = parts.len() - 1;
+    parts
+        .iter()
+        .enumerate()
+        .map(|(i, part)| {
+            if i == last || part.is_empty() {
+                part.to_string()
+            } else {
+                shorten_component(part)
             }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// パスの 1 コンポーネントを先頭 1 文字に短縮する。
+/// 隠しディレクトリ (`.foo`) は `.f` のように先頭 2 文字を残す。
+fn shorten_component(part: &str) -> String {
+    let mut chars = part.chars();
+    let mut out = String::new();
+    if let Some(c) = chars.next() {
+        out.push(c);
+        if c == '.'
+            && let Some(c2) = chars.next()
+        {
+            out.push(c2);
         }
     }
-    result
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn word_left_skips_separators() {
+        assert_eq!(word_left_pos("foo bar"), 4);
+        assert_eq!(word_left_pos("foo bar "), 4);
+        assert_eq!(word_left_pos("foo"), 0);
+        assert_eq!(word_left_pos("a/b/c"), 4);
+        assert_eq!(word_left_pos(""), 0);
+    }
+
+    #[test]
+    fn word_right_advances() {
+        assert_eq!(word_right_pos("foo bar", 0), 3);
+        assert_eq!(word_right_pos("foo bar", 3), 7);
+        assert_eq!(word_right_pos("a/b", 0), 1);
+    }
+
+    #[test]
+    fn shorten_handles_hidden() {
+        assert_eq!(shorten_component("usr"), "u");
+        assert_eq!(shorten_component(".config"), ".c");
+        assert_eq!(shorten_component(""), "");
+    }
+
+    #[test]
+    fn kill_to_start_and_end() {
+        let mut ed = LineEditor::default();
+        ed.set("hello world".to_string());
+        ed.move_home();
+        ed.move_word_right(); // cursor after "hello"
+        let cur = ed.cursor();
+        ed.kill_to_end();
+        assert_eq!(ed.line(), "hello");
+        assert_eq!(ed.cursor(), cur);
+
+        let mut ed2 = LineEditor::default();
+        ed2.set("hello world".to_string()); // cursor at end
+        ed2.kill_to_start();
+        assert_eq!(ed2.line(), "");
+        assert_eq!(ed2.cursor(), 0);
+    }
 }

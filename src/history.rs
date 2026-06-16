@@ -67,6 +67,11 @@ impl History {
         self.entries.get(idx).map(|e| e.cmd.as_str())
     }
 
+    /// 最新の履歴コマンドを返す (Alt+. の最終引数挿入用)。
+    pub fn last_cmd(&self) -> Option<&str> {
+        self.entries.last().map(|e| e.cmd.as_str())
+    }
+
     /// 全エントリを HISTORY_FILE に書き出す (シェル終了時に呼ぶ)。
     pub fn save(&self) -> io::Result<()> {
         let path = expand_tilde(HISTORY_FILE);
@@ -190,4 +195,36 @@ fn unescape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_roundtrip() {
+        for s in ["plain", "a\tb", "a\nb", "a\\b", "\\t literal", "mix\t\n\\"] {
+            assert_eq!(unescape(&escape(s)), s, "roundtrip failed for {:?}", s);
+        }
+    }
+
+    #[test]
+    fn parse_line_ok() {
+        let e = parse_line("123\t/tmp\tls -la").unwrap();
+        assert_eq!(e.timestamp, 123);
+        assert_eq!(e.cwd, PathBuf::from("/tmp"));
+        assert_eq!(e.cmd, "ls -la");
+    }
+
+    #[test]
+    fn parse_line_unescapes() {
+        let e = parse_line("1\t/a\\tb\tcmd\\nnext").unwrap();
+        assert_eq!(e.cwd, PathBuf::from("/a\tb"));
+        assert_eq!(e.cmd, "cmd\nnext");
+    }
+
+    #[test]
+    fn parse_line_rejects_bad_timestamp() {
+        assert!(parse_line("notanum\t/tmp\tls").is_none());
+    }
 }

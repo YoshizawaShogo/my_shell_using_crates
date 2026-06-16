@@ -221,3 +221,37 @@ fn common_prefix(candidates: &[String]) -> &str {
     }
     &first[..end]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_start() {
+        assert_eq!(token_start_pos("git comm"), 4);
+        assert_eq!(token_start_pos("git"), 0);
+        assert_eq!(token_start_pos("a b c"), 4);
+    }
+
+    #[test]
+    fn current_token_is_last() {
+        assert_eq!(current_token("git comm"), "comm");
+        assert_eq!(current_token("ls"), "ls");
+    }
+
+    #[test]
+    fn replace_last_token() {
+        assert_eq!(replace_token("git comm", "commit"), "git commit");
+        assert_eq!(replace_token("ls", "ls"), "ls");
+    }
+
+    #[test]
+    fn common_prefix_basic() {
+        let two = vec!["commit".to_string(), "config".to_string()];
+        assert_eq!(common_prefix(&two), "co");
+        let one = vec!["abc".to_string()];
+        assert_eq!(common_prefix(&one), "abc");
+        let none = vec!["x".to_string(), "y".to_string()];
+        assert_eq!(common_prefix(&none), "");
+    }
+}

@@ -58,184 +58,127 @@ fn save_reg_paths(paths: &[PathBuf]) -> io::Result<()> {
     std::fs::write(path, format!("{}\n", content))
 }
 
-// ─── トレイト ─────────────────────────────────────────────────────────────────
+// ─── 登録テーブル ─────────────────────────────────────────────────────────────
 
-pub trait Builtin {
-    fn name(&self) -> &'static str;
-    fn run(&self, args: &[&str], ctx: &mut ShellContext) -> io::Result<()>;
+/// ビルトイン実装の関数ポインタ。
+type BuiltinFn = fn(&[&str], &mut ShellContext) -> io::Result<()>;
+
+/// `(名前, 実装)` の唯一の真実の源。
+///
+/// 実行 (`find_builtin`) もコマンド名補完 (`builtin_names`) もこの表だけを参照する。
+/// ビルトインを増やすときはここに 1 行足せばよい。
+const BUILTINS: &[(&str, BuiltinFn)] = &[
+    ("cd", cd),
+    ("popd", popd),
+    ("reg_path", reg_path),
+    ("abbr", abbr),
+    ("alias", alias),
+    ("set", set),
+    ("setenv", set), // setenv は set のエイリアス
+];
+
+/// 名前に対応するビルトイン実装を返す。
+pub fn find_builtin(name: &str) -> Option<BuiltinFn> {
+    BUILTINS.iter().find(|&&(n, _)| n == name).map(|&(_, f)| f)
+}
+
+/// 登録済みビルトイン名を列挙する (コマンド名補完用)。
+pub fn builtin_names() -> impl Iterator<Item = &'static str> {
+    BUILTINS.iter().map(|&(n, _)| n)
 }
 
 // ─── cd ───────────────────────────────────────────────────────────────────────
 
-pub struct Cd;
+/// デフォルトで pushd 挙動: 移動前のディレクトリをスタックに積む。
+/// `cd -` は OLDPWD へ移動 (スタックとは独立)。
+fn cd(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
+    let target = match args.first().copied() {
+        Some("-") => std::env::var("OLDPWD")
+            .map(PathBuf::from)
+            .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "OLDPWD が未設定です"))?,
+        Some(path) => expand_tilde(path),
+        None => std::env::var("HOME")
+            .map(PathBuf::from)
+            .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?,
+    };
 
-impl Builtin for Cd {
-    fn name(&self) -> &'static str {
-        "cd"
+    if let Ok(cwd) = std::env::current_dir() {
+        // SAFETY: メインスレッドからのみ呼ばれ、呼び出し時点で他スレッドは存在しない。
+        unsafe { std::env::set_var("OLDPWD", &cwd) };
+        ctx.dir_stack.push(cwd);
     }
 
-    /// デフォルトで pushd 挙動: 移動前のディレクトリをスタックに積む。
-    /// `cd -` は OLDPWD へ移動 (スタックとは独立)。
-    fn run(&self, args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
-        let target = match args.first().copied() {
-            Some("-") => std::env::var("OLDPWD")
-                .map(PathBuf::from)
-                .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "OLDPWD が未設定です"))?,
-            Some(path) => expand_tilde(path),
-            None => std::env::var("HOME")
-                .map(PathBuf::from)
-                .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?,
-        };
-
-        if let Ok(cwd) = std::env::current_dir() {
-            // SAFETY: メインスレッドからのみ呼ばれる。
-            //         SIGINT ハンドラスレッドは環境変数を参照しない。
-            unsafe { std::env::set_var("OLDPWD", &cwd) };
-            ctx.dir_stack.push(cwd);
-        }
-
-        std::env::set_current_dir(&target)
-    }
+    std::env::set_current_dir(&target)
 }
 
 // ─── popd ─────────────────────────────────────────────────────────────────────
 
-pub struct Popd;
-
-impl Builtin for Popd {
-    fn name(&self) -> &'static str {
-        "popd"
-    }
-
-    fn run(&self, _args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
-        match ctx.dir_stack.pop() {
-            Some(prev) => std::env::set_current_dir(&prev),
-            None => Err(io::Error::other("ディレクトリスタックが空です")),
-        }
+fn popd(_args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
+    match ctx.dir_stack.pop() {
+        Some(prev) => std::env::set_current_dir(&prev),
+        None => Err(io::Error::other("ディレクトリスタックが空です")),
     }
 }
 
 // ─── reg_path ─────────────────────────────────────────────────────────────────
 
-pub struct RegPath;
-
-impl Builtin for RegPath {
-    fn name(&self) -> &'static str {
-        "reg_path"
-    }
-
-    fn run(&self, args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
-        match args.first().copied() {
-            Some("add") => {
-                let path = match args.get(1) {
-                    Some(&p) => expand_tilde(p),
-                    None => std::env::current_dir()?,
-                };
-                let path = path.canonicalize().unwrap_or(path);
-                if !ctx.reg_paths.contains(&path) {
-                    ctx.reg_paths.push(path);
-                    save_reg_paths(&ctx.reg_paths)?;
-                }
-                Ok(())
+fn reg_path(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
+    match args.first().copied() {
+        Some("add") => {
+            let path = match args.get(1) {
+                Some(&p) => expand_tilde(p),
+                None => std::env::current_dir()?,
+            };
+            let path = path.canonicalize().unwrap_or(path);
+            if !ctx.reg_paths.contains(&path) {
+                ctx.reg_paths.push(path);
+                save_reg_paths(&ctx.reg_paths)?;
             }
-            Some("list") => {
-                for p in &ctx.reg_paths {
-                    execute!(stdout(), Print(format!("{}\r\n", p.display())))?;
-                }
-                Ok(())
-            }
-            _ => Err(io::Error::other("使い方: reg_path add [path] | list")),
+            Ok(())
         }
+        Some("list") => {
+            for p in &ctx.reg_paths {
+                execute!(stdout(), Print(format!("{}\r\n", p.display())))?;
+            }
+            Ok(())
+        }
+        _ => Err(io::Error::other("使い方: reg_path add [path] | list")),
     }
 }
 
 // ─── abbr ─────────────────────────────────────────────────────────────────────
 
-pub struct Abbr;
-
-impl Builtin for Abbr {
-    fn name(&self) -> &'static str {
-        "abbr"
-    }
-
-    fn run(&self, args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
-        match (args.first(), args.get(1)) {
-            (Some(&from), Some(&to)) => {
-                ctx.abbrs.insert(from.to_string(), to.to_string());
-                Ok(())
-            }
-            _ => Err(io::Error::other("使い方: abbr FROM TO")),
+fn abbr(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
+    match (args.first(), args.get(1)) {
+        (Some(&from), Some(&to)) => {
+            ctx.abbrs.insert(from.to_string(), to.to_string());
+            Ok(())
         }
+        _ => Err(io::Error::other("使い方: abbr FROM TO")),
     }
 }
 
 // ─── alias ────────────────────────────────────────────────────────────────────
 
-pub struct Alias;
-
-impl Builtin for Alias {
-    fn name(&self) -> &'static str {
-        "alias"
-    }
-
-    fn run(&self, args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
-        match (args.first(), args.get(1)) {
-            (Some(&from), Some(&to)) => {
-                ctx.aliases.insert(from.to_string(), to.to_string());
-                Ok(())
-            }
-            _ => Err(io::Error::other("使い方: alias FROM TO")),
+fn alias(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
+    match (args.first(), args.get(1)) {
+        (Some(&from), Some(&to)) => {
+            ctx.aliases.insert(from.to_string(), to.to_string());
+            Ok(())
         }
+        _ => Err(io::Error::other("使い方: alias FROM TO")),
     }
 }
 
-// ─── set ──────────────────────────────────────────────────────────────────────
+// ─── set / setenv ─────────────────────────────────────────────────────────────
 
-pub struct Set;
-
-impl Builtin for Set {
-    fn name(&self) -> &'static str {
-        "set"
-    }
-
-    fn run(&self, args: &[&str], _ctx: &mut ShellContext) -> io::Result<()> {
-        match (args.first(), args.get(1)) {
-            (Some(&var), Some(&val)) => {
-                // SAFETY: メインスレッドからのみ呼ばれる。
-                //         SIGINT ハンドラスレッドは環境変数を参照しない。
-                unsafe { std::env::set_var(var, val) };
-                Ok(())
-            }
-            _ => Err(io::Error::other("使い方: set VAR VAL")),
+fn set(args: &[&str], _ctx: &mut ShellContext) -> io::Result<()> {
+    match (args.first(), args.get(1)) {
+        (Some(&var), Some(&val)) => {
+            // SAFETY: メインスレッドからのみ呼ばれ、呼び出し時点で他スレッドは存在しない。
+            unsafe { std::env::set_var(var, val) };
+            Ok(())
         }
+        _ => Err(io::Error::other("使い方: set VAR VAL")),
     }
-}
-
-// ─── setenv ───────────────────────────────────────────────────────────────────
-
-pub struct Setenv;
-
-impl Builtin for Setenv {
-    fn name(&self) -> &'static str {
-        "setenv"
-    }
-
-    fn run(&self, args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
-        Set.run(args, ctx)
-    }
-}
-
-// ─── レジストリ ───────────────────────────────────────────────────────────────
-
-pub fn find_builtin(name: &str) -> Option<Box<dyn Builtin>> {
-    let candidates: Vec<Box<dyn Builtin>> = vec![
-        Box::new(Cd),
-        Box::new(Popd),
-        Box::new(RegPath),
-        Box::new(Abbr),
-        Box::new(Alias),
-        Box::new(Set),
-        Box::new(Setenv),
-    ];
-    candidates.into_iter().find(|b| b.name() == name)
 }

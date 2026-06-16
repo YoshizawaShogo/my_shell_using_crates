@@ -9,9 +9,11 @@ mod selector;
 mod term;
 
 use crossterm::{
+    cursor,
     event::{self, Event},
     execute,
     style::Print,
+    terminal::{Clear, ClearType},
 };
 use std::io::{self, stdout};
 
@@ -63,6 +65,229 @@ impl Shell {
             self.ghost.as_deref(),
         )
     }
+
+    /// 1 個の `ShellEvent` を処理する。
+    ///
+    /// 端末 I/O を伴うため戻り値は `io::Result`。終了要求なら `Ok(true)` を返す。
+    /// 後続処理 (主に再描画) は `pending` に積んで呼び出し側のキューに委ねる。
+    fn handle_event(&mut self, ev: ShellEvent, pending: &mut Vec<ShellEvent>) -> io::Result<bool> {
+        match ev {
+            ShellEvent::Exit => return Ok(true),
+
+            ShellEvent::CancelInput => {
+                self.ed.take();
+                self.ghost = None;
+                self.hist_idx = None;
+                self.saved_input.clear();
+                execute!(stdout(), Print("^C\r\n"))?;
+                pending.push(ShellEvent::RedrawPrompt);
+            }
+
+            ShellEvent::RedrawPrompt => {
+                self.ghost = compute_ghost(&self.ed, &self.history);
+                self.redraw()?;
+            }
+
+            ShellEvent::ExecuteCommand => {
+                // 1. abbr を視覚展開してカーソルを行末へ
+                self.ed.move_end();
+                try_expand_abbr(&mut self.ed, &self.ctx.abbrs);
+                // 2. ゴーストを消してクリーンな表示にしてから改行
+                self.ghost = None;
+                self.redraw()?;
+                // 3. バッファを取得してエディタをクリア
+                let cmd = self.ed.take();
+                // 4. 実行 (cwd は cd 前に記録)
+                let cwd = std::env::current_dir().unwrap_or_default();
+                execute_command(&cmd, &mut self.ctx, true)?;
+                if !cmd.trim().is_empty() {
+                    self.history.add(&cmd, &cwd);
+                }
+                self.git_branch = fetch_git_branch();
+                self.ghost = None;
+                self.hist_idx = None;
+                self.saved_input.clear();
+                pending.push(ShellEvent::RedrawPrompt);
+            }
+
+            ShellEvent::AcceptGhost => {
+                if let Some(ghost) = self.ghost.take() {
+                    let new_buf = self.ed.line().to_string() + &ghost;
+                    self.ed.set(new_buf);
+                }
+                pending.push(ShellEvent::RedrawPrompt);
+            }
+
+            ShellEvent::ShowCompletion => {
+                let prefix = self.ed.line()[..self.ed.cursor()].to_string();
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let lines_above = self.ed.lines_above_cursor();
+                let tab_ctx = TabContext {
+                    prefix: &prefix,
+                    cwd: &cwd,
+                    history: &self.history,
+                    lines_above_cursor: lines_above,
+                };
+                match completion::tab_complete(tab_ctx)? {
+                    Selection::Chosen(choice) => self.ed.set(choice),
+                    Selection::Aborted => {
+                        self.ed.take();
+                    }
+                    Selection::Dismissed => {}
+                    Selection::InsertChar(c) => self.ed.insert(c),
+                    Selection::Backspace => self.ed.backspace(),
+                }
+                // reset_cursor_tracking は呼ばない:
+                // グリッドメニューは MoveUp(1) で入力行に戻るので
+                // lines_above_cursor をそのまま使って redraw できる。
+                // 候補なし (Dismissed) のときは cursor が動いていないため特に重要。
+                pending.push(ShellEvent::RedrawPrompt);
+            }
+
+            ShellEvent::HistoryPrev => {
+                let n = self.history.len();
+                if n == 0 {
+                    return Ok(false);
+                }
+                let new_idx = match self.hist_idx {
+                    None => {
+                        self.saved_input = self.ed.line().to_string();
+                        n - 1
+                    }
+                    Some(0) => 0, // 最古のエントリ、それ以上戻れない
+                    Some(i) => i - 1,
+                };
+                self.hist_idx = Some(new_idx);
+                if let Some(cmd) = self.history.get_cmd(new_idx) {
+                    self.ed.set(cmd.to_string());
+                }
+                pending.push(ShellEvent::RedrawPrompt);
+            }
+
+            ShellEvent::HistoryNext => {
+                match self.hist_idx {
+                    None => {} // ナビゲーション外では無視
+                    Some(i) => {
+                        let n = self.history.len();
+                        if i + 1 >= n {
+                            // 最新エントリを超えたら保存済み入力を復元
+                            self.hist_idx = None;
+                            let saved = std::mem::take(&mut self.saved_input);
+                            self.ed.set(saved);
+                        } else {
+                            self.hist_idx = Some(i + 1);
+                            if let Some(cmd) = self.history.get_cmd(i + 1) {
+                                self.ed.set(cmd.to_string());
+                            }
+                        }
+                    }
+                }
+                pending.push(ShellEvent::RedrawPrompt);
+            }
+
+            ShellEvent::ShowHistoryFzf => {
+                let query = self.ed.line().to_string();
+                let cwd = std::env::current_dir().unwrap_or_default();
+                execute!(stdout(), Print("\r\n"))?;
+                self.ed.note_newline();
+                match completion::fzf_history(&query, &cwd, &self.history) {
+                    Ok(Some(s)) => self.ed.set(s),
+                    Ok(None) => {}
+                    Err(e) => {
+                        execute!(stdout(), Print(format!("fzf: {}\r\n", e)))?;
+                    }
+                }
+                pending.push(ShellEvent::RedrawPrompt);
+            }
+
+            ShellEvent::ShowFileFzf => {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                // カーソル前のトークンを取得（owned にして借用を切る）
+                let token: String = {
+                    let before = &self.ed.line()[..self.ed.cursor()];
+                    let token_start = before.rfind(' ').map(|i| i + 1).unwrap_or(0);
+                    before[token_start..].to_owned()
+                };
+                // トークンに '/' が含まれる場合はそのディレクトリをルートにする
+                let (root, initial_query, dir_part) = if !token.is_empty() && token.contains('/') {
+                    let last_slash = token.rfind('/').unwrap();
+                    let dir = token[..=last_slash].to_owned();
+                    let file_part = token[last_slash + 1..].to_owned();
+                    let root = if dir.starts_with('/') {
+                        std::path::PathBuf::from(&dir)
+                    } else if let Some(rest) = dir.strip_prefix("~/") {
+                        let home = std::env::var("HOME").unwrap_or_default();
+                        std::path::PathBuf::from(home).join(rest)
+                    } else {
+                        cwd.join(&dir)
+                    };
+                    let query = if file_part.is_empty() {
+                        None
+                    } else {
+                        Some(file_part)
+                    };
+                    (root, query, Some(dir))
+                } else {
+                    (cwd.clone(), None, None)
+                };
+                execute!(stdout(), Print("\r\n"))?;
+                self.ed.note_newline();
+                match completion::fzf_files(&root, initial_query.as_deref()) {
+                    Ok(Some(s)) => {
+                        if let Some(ref dir) = dir_part {
+                            self.ed.delete_before_cursor(token.len());
+                            let filename = s.strip_prefix("./").unwrap_or(&s);
+                            self.ed.insert_str(&format!("{}{}", dir, filename));
+                        } else {
+                            self.ed.insert_str(&s);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        execute!(stdout(), Print(format!("fzf: {}\r\n", e)))?;
+                    }
+                }
+                pending.push(ShellEvent::RedrawPrompt);
+            }
+
+            ShellEvent::ShowRegPathFzf => {
+                execute!(stdout(), Print("\r\n"))?;
+                self.ed.note_newline();
+                match completion::fzf_reg_paths(&self.ctx.reg_paths) {
+                    Ok(Some(s)) => self.ed.insert_str(&s),
+                    Ok(None) => {}
+                    Err(e) => {
+                        execute!(stdout(), Print(format!("fzf: {}\r\n", e)))?;
+                    }
+                }
+                pending.push(ShellEvent::RedrawPrompt);
+            }
+
+            ShellEvent::InsertSpace => {
+                try_expand_abbr(&mut self.ed, &self.ctx.abbrs);
+                self.ed.insert(' ');
+                pending.push(ShellEvent::RedrawPrompt);
+            }
+
+            ShellEvent::ClearScreen => {
+                execute!(stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+                self.ed.reset_lines_above();
+                pending.push(ShellEvent::RedrawPrompt);
+            }
+
+            ShellEvent::InsertLastArg => {
+                let last_arg = self
+                    .history
+                    .last_cmd()
+                    .and_then(|cmd| cmd.split_whitespace().last().map(str::to_string));
+                if let Some(arg) = last_arg {
+                    self.ed.insert_str(&arg);
+                }
+                pending.push(ShellEvent::RedrawPrompt);
+            }
+        }
+        Ok(false)
+    }
 }
 
 // ─── エントリポイント ─────────────────────────────────────────────────────────
@@ -108,219 +333,22 @@ fn run() -> io::Result<()> {
     shell.ghost = compute_ghost(&shell.ed, &shell.history);
     shell.redraw()?;
 
-    'main: loop {
+    loop {
         let Event::Key(key) = event::read()? else {
             continue;
         };
 
         let mut pending = handle_key(&mut shell.ed, key);
 
+        // イベント処理が新たなイベント (主に再描画) を生むため、空になるまで回す。
         while !pending.is_empty() {
             for ev in std::mem::take(&mut pending) {
-                match ev {
-                    ShellEvent::Exit => break 'main,
-
-                    ShellEvent::CancelInput => {
-                        shell.ed.take();
-                        shell.ghost = None;
-                        shell.hist_idx = None;
-                        shell.saved_input.clear();
-                        execute!(stdout(), Print("^C\r\n"))?;
-                        pending.push(ShellEvent::RedrawPrompt);
-                    }
-
-                    ShellEvent::RedrawPrompt => {
-                        shell.ghost = compute_ghost(&shell.ed, &shell.history);
-                        shell.redraw()?;
-                    }
-
-                    ShellEvent::ExecuteCommand => {
-                        // 1. abbr を視覚展開してカーソルを行末へ
-                        shell.ed.move_end();
-                        try_expand_abbr(&mut shell.ed, &shell.ctx.abbrs);
-                        // 2. ゴーストを消してクリーンな表示にしてから改行
-                        shell.ghost = None;
-                        shell.redraw()?;
-                        // 3. バッファを取得してエディタをクリア
-                        let cmd = shell.ed.take();
-                        // 4. 実行 (cwd は cd 前に記録)
-                        let cwd = std::env::current_dir().unwrap_or_default();
-                        execute_command(&cmd, &mut shell.ctx, true)?;
-                        if !cmd.trim().is_empty() {
-                            shell.history.add(&cmd, &cwd);
-                        }
-                        shell.git_branch = fetch_git_branch();
-                        shell.ghost = None;
-                        shell.hist_idx = None;
-                        shell.saved_input.clear();
-                        pending.push(ShellEvent::RedrawPrompt);
-                    }
-
-                    ShellEvent::AcceptGhost => {
-                        if let Some(ghost) = shell.ghost.take() {
-                            let new_buf = shell.ed.line().to_string() + &ghost;
-                            shell.ed.set(new_buf);
-                        }
-                        pending.push(ShellEvent::RedrawPrompt);
-                    }
-
-                    ShellEvent::ShowCompletion => {
-                        let prefix = shell.ed.line()[..shell.ed.cursor()].to_string();
-                        let cwd = std::env::current_dir().unwrap_or_default();
-                        let lines_above = shell.ed.lines_above_cursor();
-                        let tab_ctx = TabContext {
-                            prefix: &prefix,
-                            cwd: &cwd,
-                            history: &shell.history,
-                            lines_above_cursor: lines_above,
-                        };
-                        match completion::tab_complete(tab_ctx)? {
-                            Selection::Chosen(choice) => shell.ed.set(choice),
-                            Selection::Aborted => {
-                                shell.ed.take();
-                            }
-                            Selection::Dismissed => {}
-                            Selection::InsertChar(c) => shell.ed.insert(c),
-                            Selection::Backspace => shell.ed.backspace(),
-                        }
-                        // reset_cursor_tracking は呼ばない:
-                        // グリッドメニューは MoveUp(1) で入力行に戻るので
-                        // lines_above_cursor をそのまま使って redraw できる。
-                        // 候補なし (Dismissed) のときは cursor が動いていないため特に重要。
-                        pending.push(ShellEvent::RedrawPrompt);
-                    }
-
-                    ShellEvent::HistoryPrev => {
-                        let n = shell.history.len();
-                        if n == 0 {
-                            continue;
-                        }
-                        let new_idx = match shell.hist_idx {
-                            None => {
-                                shell.saved_input = shell.ed.line().to_string();
-                                n - 1
-                            }
-                            Some(0) => 0, // 最古のエントリ、それ以上戻れない
-                            Some(i) => i - 1,
-                        };
-                        shell.hist_idx = Some(new_idx);
-                        if let Some(cmd) = shell.history.get_cmd(new_idx) {
-                            shell.ed.set(cmd.to_string());
-                        }
-                        pending.push(ShellEvent::RedrawPrompt);
-                    }
-
-                    ShellEvent::HistoryNext => {
-                        match shell.hist_idx {
-                            None => {} // ナビゲーション外では無視
-                            Some(i) => {
-                                let n = shell.history.len();
-                                if i + 1 >= n {
-                                    // 最新エントリを超えたら保存済み入力を復元
-                                    shell.hist_idx = None;
-                                    let saved = std::mem::take(&mut shell.saved_input);
-                                    shell.ed.set(saved);
-                                } else {
-                                    shell.hist_idx = Some(i + 1);
-                                    if let Some(cmd) = shell.history.get_cmd(i + 1) {
-                                        shell.ed.set(cmd.to_string());
-                                    }
-                                }
-                            }
-                        }
-                        pending.push(ShellEvent::RedrawPrompt);
-                    }
-
-                    ShellEvent::ShowHistoryFzf => {
-                        let query = shell.ed.line().to_string();
-                        let cwd = std::env::current_dir().unwrap_or_default();
-                        execute!(stdout(), Print("\r\n"))?;
-                        shell.ed.note_newline();
-                        match completion::fzf_history(&query, &cwd, &shell.history) {
-                            Ok(Some(s)) => shell.ed.set(s),
-                            Ok(None) => {}
-                            Err(e) => {
-                                execute!(stdout(), Print(format!("fzf: {}\r\n", e)))?;
-                            }
-                        }
-                        pending.push(ShellEvent::RedrawPrompt);
-                    }
-
-                    ShellEvent::ShowFileFzf => {
-                        let cwd = std::env::current_dir().unwrap_or_default();
-                        // カーソル前のトークンを取得（owned にして借用を切る）
-                        let token: String = {
-                            let before = &shell.ed.line()[..shell.ed.cursor()];
-                            let token_start = before.rfind(' ').map(|i| i + 1).unwrap_or(0);
-                            before[token_start..].to_owned()
-                        };
-                        // トークンに '/' が含まれる場合はそのディレクトリをルートにする
-                        let (root, initial_query, dir_part) =
-                            if !token.is_empty() && token.contains('/') {
-                                let last_slash = token.rfind('/').unwrap();
-                                let dir = token[..=last_slash].to_owned();
-                                let file_part = token[last_slash + 1..].to_owned();
-                                let root = if dir.starts_with('/') {
-                                    std::path::PathBuf::from(&dir)
-                                } else if let Some(rest) = dir.strip_prefix("~/") {
-                                    let home = std::env::var("HOME").unwrap_or_default();
-                                    std::path::PathBuf::from(home).join(rest)
-                                } else {
-                                    cwd.join(&dir)
-                                };
-                                let query = if file_part.is_empty() {
-                                    None
-                                } else {
-                                    Some(file_part)
-                                };
-                                (root, query, Some(dir))
-                            } else {
-                                (cwd.clone(), None, None)
-                            };
-                        execute!(stdout(), Print("\r\n"))?;
-                        shell.ed.note_newline();
-                        match completion::fzf_files(&root, initial_query.as_deref()) {
-                            Ok(Some(s)) => {
-                                if let Some(ref dir) = dir_part {
-                                    shell.ed.delete_before_cursor(token.len());
-                                    let filename = s.strip_prefix("./").unwrap_or(&s);
-                                    shell.ed.insert_str(&format!("{}{}", dir, filename));
-                                } else {
-                                    shell.ed.insert_str(&s);
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                execute!(stdout(), Print(format!("fzf: {}\r\n", e)))?;
-                            }
-                        }
-                        pending.push(ShellEvent::RedrawPrompt);
-                    }
-
-                    ShellEvent::ShowRegPathFzf => {
-                        execute!(stdout(), Print("\r\n"))?;
-                        shell.ed.note_newline();
-                        match completion::fzf_reg_paths(&shell.ctx.reg_paths) {
-                            Ok(Some(s)) => shell.ed.insert_str(&s),
-                            Ok(None) => {}
-                            Err(e) => {
-                                execute!(stdout(), Print(format!("fzf: {}\r\n", e)))?;
-                            }
-                        }
-                        pending.push(ShellEvent::RedrawPrompt);
-                    }
-
-                    ShellEvent::InsertSpace => {
-                        try_expand_abbr(&mut shell.ed, &shell.ctx.abbrs);
-                        shell.ed.insert(' ');
-                        pending.push(ShellEvent::RedrawPrompt);
-                    }
+                if shell.handle_event(ev, &mut pending)? {
+                    return Ok(());
                 }
             }
         }
     }
-
-    Ok(())
 }
 
 // ─── abbr 展開 ────────────────────────────────────────────────────────────────

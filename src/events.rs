@@ -21,6 +21,10 @@ pub enum ShellEvent {
     HistoryNext,
     /// Space キー押下。main.rs で abbr 展開を試みてからスペースを挿入する。
     InsertSpace,
+    /// Ctrl+L: 画面をクリアしてプロンプトを再描画する。
+    ClearScreen,
+    /// Alt+.: 直前コマンドの最終引数を挿入する。
+    InsertLastArg,
 }
 
 pub fn handle_key(ed: &mut LineEditor, key: KeyEvent) -> Vec<ShellEvent> {
@@ -66,6 +70,16 @@ pub fn handle_key(ed: &mut LineEditor, key: KeyEvent) -> Vec<ShellEvent> {
             ed.delete_word_backward();
             vec![ShellEvent::RedrawPrompt]
         }
+        // Ctrl+U: カーソルより前を削除 / Ctrl+K: カーソル以降を削除
+        KeyCode::Char('u') if ctrl => {
+            ed.kill_to_start();
+            vec![ShellEvent::RedrawPrompt]
+        }
+        KeyCode::Char('k') if ctrl => {
+            ed.kill_to_end();
+            vec![ShellEvent::RedrawPrompt]
+        }
+        KeyCode::Char('l') if ctrl => vec![ShellEvent::ClearScreen],
         KeyCode::Char('p') if ctrl => vec![ShellEvent::HistoryPrev],
         KeyCode::Char('n') if ctrl => vec![ShellEvent::HistoryNext],
         KeyCode::Char('g') if ctrl => vec![ShellEvent::ShowRegPathFzf],
@@ -115,6 +129,9 @@ pub fn handle_key(ed: &mut LineEditor, key: KeyEvent) -> Vec<ShellEvent> {
             ed.delete();
             vec![ShellEvent::RedrawPrompt]
         }
+
+        // Alt+.: 直前コマンドの最終引数を挿入する
+        KeyCode::Char('.') if alt => vec![ShellEvent::InsertLastArg],
 
         // Space: abbr 展開の機会を main.rs に委譲する
         KeyCode::Char(' ') if !ctrl && !alt => vec![ShellEvent::InsertSpace],

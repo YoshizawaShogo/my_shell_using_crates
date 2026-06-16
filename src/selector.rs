@@ -257,3 +257,16 @@ where
         _ => Ok(Selection::Dismissed),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_ascii() {
+        assert_eq!(truncate_to_cols("hello", 3), "hel");
+        assert_eq!(truncate_to_cols("hi", 10), "hi");
+        assert_eq!(truncate_to_cols("", 5), "");
+        assert_eq!(truncate_to_cols("abc", 0), "");
+    }
+}
