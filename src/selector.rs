@@ -9,7 +9,11 @@ use crossterm::{
     style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
 };
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher};
 use std::io::{self, Write, stdout};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::Duration;
 use unicode_width::UnicodeWidthStr;
 
 // ─── 選択結果 ─────────────────────────────────────────────────────────────────
@@ -177,85 +181,223 @@ fn truncate_to_cols(s: &str, max_cols: usize) -> &str {
     &s[..end]
 }
 
-// ─── skim ────────────────────────────────────────────────────────────────────
+// ─── fuzzy ピッカー (Ctrl+R / Ctrl+T / Ctrl+G) ─────────────────────────────────
 
-/// 候補を skim でインタラクティブに選択させる。
+/// 候補を fuzzy 絞り込みでインタラクティブに選択させる。
 ///
-/// `initial_query` は skim の初期検索文字列として渡す。
+/// `initial_query` は初期クエリ。マッチングは nucleo-matcher、UI は crossterm で
+/// 自前実装する (外部バイナリ不要・本体プロセスで完結)。
 pub fn run_fzf(candidates: &[String], initial_query: Option<&str>) -> io::Result<Selection> {
-    use skim::prelude::{Skim, SkimOptionsBuilder};
-
     if candidates.is_empty() {
         return Ok(Selection::Dismissed);
     }
-
-    let mut builder = SkimOptionsBuilder::default();
-    builder.height("40%").reverse(true).no_sort(true);
-    if let Some(q) = initial_query.filter(|q| !q.is_empty()) {
-        builder.query(q);
-    }
-    let options = builder
-        .build()
-        .map_err(|e| io::Error::other(e.to_string()))?;
-
-    // crossterm の raw mode を解除してから skim (ratatui) に端末を渡す
-    terminal::disable_raw_mode()?;
-    let result = Skim::run_items(options, candidates.iter().cloned())
-        .map_err(|e| io::Error::other(e.to_string()));
-    terminal::enable_raw_mode()?;
-
-    match result? {
-        output if !output.is_abort => match output.selected_items.first() {
-            Some(item) => Ok(Selection::Chosen(item.output().to_string())),
-            None => Ok(Selection::Dismissed),
-        },
-        _ => Ok(Selection::Dismissed),
-    }
+    run_picker(candidates.to_vec(), None, initial_query)
 }
 
-/// 候補をストリーミングしながら skim で選択させる。
+/// 候補をストリーミングしながら fuzzy 選択させる。
 ///
 /// `produce` は別スレッドで実行され、`emit(String)` を呼んで候補を1件ずつ送る。
-/// `emit` が false を返したとき (= skim が終了して受信側が閉じたとき) は走査を
-/// 中断してよい。これにより巨大なツリーでも「検索したものから順に表示」でき、
+/// `emit` が false を返したとき (= ピッカーが終了して rx が drop されたとき) は走査を
+/// 中断してよい。これにより巨大なツリーでも「列挙したものから順に表示」でき、
 /// 列挙の途中でも Ctrl+C / Esc で即中断できる。
 pub fn run_fzf_streaming<F>(produce: F, initial_query: Option<&str>) -> io::Result<Selection>
 where
     F: FnOnce(&mut dyn FnMut(String) -> bool) + Send + 'static,
 {
-    use skim::prelude::{
-        Arc, Skim, SkimItem, SkimItemReceiver, SkimItemSender, SkimOptionsBuilder, unbounded,
-    };
-
-    let (tx, rx): (SkimItemSender, SkimItemReceiver) = unbounded();
-    // 候補生成は別スレッドで。skim が終了すると rx が閉じ、send が Err を返すので
-    // emit が false → produce 側はそこで走査を打ち切れる。
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    // 候補生成は別スレッドで。ピッカーが終了して rx が drop されると send が Err を
+    // 返すので emit が false → produce 側はそこで走査を打ち切れる。
     std::thread::spawn(move || {
-        let mut emit =
-            |s: String| -> bool { tx.send(vec![Arc::new(s) as Arc<dyn SkimItem>]).is_ok() };
+        let mut emit = |s: String| -> bool { tx.send(s).is_ok() };
         produce(&mut emit);
     });
+    run_picker(Vec::new(), Some(rx), initial_query)
+}
 
-    let mut builder = SkimOptionsBuilder::default();
-    builder.height("40%").reverse(true).no_sort(true);
-    if let Some(q) = initial_query.filter(|q| !q.is_empty()) {
-        builder.query(q);
+/// 自前 fuzzy ピッカーの本体。
+///
+/// `master` は初期候補、`rx` があれば候補がストリーミング流入する。
+/// raw mode は呼び出し側で有効なまま使う (skim と違い端末を明け渡さない)。
+/// レイアウトは reverse: 最上段にクエリ行、その下にスコア順の候補を並べる。
+fn run_picker(
+    mut master: Vec<String>,
+    rx: Option<Receiver<String>>,
+    initial_query: Option<&str>,
+) -> io::Result<Selection> {
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut query = initial_query.unwrap_or("").to_string();
+    let mut selected = 0usize;
+    let mut offset = 0usize;
+    let mut filtered: Vec<String> = Vec::new();
+    let mut dirty = true; // 候補かクエリが変化したら再絞り込み
+    let mut outcome = Selection::Dismissed;
+
+    loop {
+        // 1. ストリーミング候補を取り込む
+        let mut streaming = false;
+        if let Some(rx) = &rx {
+            streaming = true;
+            loop {
+                match rx.try_recv() {
+                    Ok(s) => {
+                        master.push(s);
+                        dirty = true;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        streaming = false; // 生成完了 → 以降はブロッキング待機
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 2. 絞り込み (クエリ空なら入力順を維持)
+        if dirty {
+            filtered = filter_candidates(&master, &query, &mut matcher);
+            if selected >= filtered.len() {
+                selected = filtered.len().saturating_sub(1);
+            }
+            dirty = false;
+        }
+
+        // 3. 描画
+        draw_picker(&query, &filtered, selected, &mut offset)?;
+
+        // 4. キー入力 (ストリーミング中はタイムアウト付きで流入を取りこぼさない)
+        if streaming && !event::poll(Duration::from_millis(50))? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Char('c') if ctrl => {
+                outcome = Selection::Aborted;
+                break;
+            }
+            KeyCode::Char('g') if ctrl => {
+                outcome = Selection::Aborted;
+                break;
+            }
+            KeyCode::Esc => break,
+            KeyCode::Enter => {
+                if let Some(s) = filtered.get(selected) {
+                    outcome = Selection::Chosen(s.clone());
+                }
+                break;
+            }
+            KeyCode::Up => selected = selected.saturating_sub(1),
+            KeyCode::Char('p') if ctrl => selected = selected.saturating_sub(1),
+            KeyCode::Down => {
+                if selected + 1 < filtered.len() {
+                    selected += 1;
+                }
+            }
+            KeyCode::Char('n') if ctrl => {
+                if selected + 1 < filtered.len() {
+                    selected += 1;
+                }
+            }
+            KeyCode::Backspace => {
+                query.pop();
+                selected = 0;
+                dirty = true;
+            }
+            KeyCode::Char(c) if !ctrl && !alt => {
+                query.push(c);
+                selected = 0;
+                dirty = true;
+            }
+            _ => {}
+        }
     }
-    let options = builder
-        .build()
-        .map_err(|e| io::Error::other(e.to_string()))?;
 
-    terminal::disable_raw_mode()?;
-    let result = Skim::run_with(options, Some(rx)).map_err(|e| io::Error::other(e.to_string()));
-    terminal::enable_raw_mode()?;
+    // 後始末: 描画領域を消してカーソルを開始行に戻す (redraw_prompt が続きを描く)
+    execute!(
+        stdout(),
+        cursor::MoveToColumn(0),
+        Clear(ClearType::FromCursorDown)
+    )?;
+    Ok(outcome)
+}
 
-    match result? {
-        output if !output.is_abort => match output.selected_items.first() {
-            Some(item) => Ok(Selection::Chosen(item.output().to_string())),
-            None => Ok(Selection::Dismissed),
-        },
-        _ => Ok(Selection::Dismissed),
+/// `master` を `query` で fuzzy 絞り込みする。空クエリなら入力順をそのまま返す。
+fn filter_candidates(master: &[String], query: &str, matcher: &mut Matcher) -> Vec<String> {
+    if query.is_empty() {
+        return master.to_vec();
     }
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    // match_list はスコア降順 (最良が先頭) で返す。
+    pattern
+        .match_list(master.iter(), matcher)
+        .into_iter()
+        .map(|(s, _)| s.clone())
+        .collect()
+}
+
+/// ピッカーを 1 フレーム描画する。
+///
+/// カーソルは開始行の桁0にある前提で、クエリ行＋候補を下方向に描き、
+/// 最後に開始行へ戻す。`offset` は選択がウィンドウ内に収まるよう更新する。
+/// 行折り返しによる `MoveUp` のずれを避けるため各行は端末幅で切り詰める。
+fn draw_picker(
+    query: &str,
+    filtered: &[String],
+    selected: usize,
+    offset: &mut usize,
+) -> io::Result<()> {
+    let (term_cols, term_rows) = terminal::size()?;
+    let cols = term_cols as usize;
+
+    // 候補表示の高さ: 端末の約40% (最小3行)。
+    // grid menu と同様、現在のカーソル行は問い合わせず (cursor::position は端末への
+    // DSR 往復が必要で本コードベースは避けている)、画面の一部に収まる範囲に留める。
+    let view = ((term_rows as usize) * 2 / 5).max(3);
+
+    // 選択がウィンドウ内に収まるよう offset を調整
+    if selected < *offset {
+        *offset = selected;
+    } else if selected >= *offset + view {
+        *offset = selected + 1 - view;
+    }
+    let visible = filtered.len().saturating_sub(*offset).min(view);
+
+    // クエリ行
+    queue!(
+        stdout(),
+        cursor::MoveToColumn(0),
+        Clear(ClearType::FromCursorDown),
+        SetForegroundColor(Color::Cyan),
+        Print(truncate_to_cols(&format!("> {}", query), cols)),
+        ResetColor,
+        Print("\r\n"),
+    )?;
+
+    // 候補行 (選択行を反転表示)
+    for i in 0..visible {
+        let idx = *offset + i;
+        let text = truncate_to_cols(&filtered[idx], cols);
+        if idx == selected {
+            queue!(
+                stdout(),
+                SetBackgroundColor(Color::Blue),
+                SetForegroundColor(Color::White),
+                Print(text),
+                ResetColor,
+            )?;
+        } else {
+            queue!(stdout(), Print(text))?;
+        }
+        queue!(stdout(), Print("\r\n"))?;
+    }
+
+    // 開始行へカーソルを戻す (printした行数 = クエリ1 + visible)
+    let drawn = (1 + visible) as u16;
+    queue!(stdout(), cursor::MoveUp(drawn), cursor::MoveToColumn(0))?;
+    stdout().flush()
 }
 
 #[cfg(test)]
