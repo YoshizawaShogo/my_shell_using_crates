@@ -136,13 +136,32 @@ fn reg_path(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
             }
             Ok(())
         }
+        Some("rm") => {
+            // add と同じ正規化で対象を求め、一致する登録を消す。
+            let path = match args.get(1) {
+                Some(&p) => expand_tilde(p),
+                None => std::env::current_dir()?,
+            };
+            let path = path.canonicalize().unwrap_or(path);
+            let before = ctx.reg_paths.len();
+            ctx.reg_paths.retain(|p| p != &path);
+            if ctx.reg_paths.len() == before {
+                return Err(io::Error::other(format!(
+                    "登録されていません: {}",
+                    path.display()
+                )));
+            }
+            save_reg_paths(&ctx.reg_paths)
+        }
         Some("list") => {
             for p in &ctx.reg_paths {
                 execute!(stdout(), Print(format!("{}\r\n", p.display())))?;
             }
             Ok(())
         }
-        _ => Err(io::Error::other("使い方: reg_path add [path] | list")),
+        _ => Err(io::Error::other(
+            "使い方: reg_path add [path] | rm [path] | list",
+        )),
     }
 }
 
