@@ -230,9 +230,16 @@ impl Shell {
                 } else {
                     (cwd.clone(), None, None)
                 };
+                // 行頭のコマンドが cd のときはディレクトリのみに絞る
+                let dirs_only = self
+                    .ed
+                    .line()
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|cmd| cmd == "cd");
                 execute!(stdout(), Print("\r\n"))?;
                 self.ed.note_newline();
-                match completion::fzf_files(&root, initial_query.as_deref()) {
+                match completion::fzf_files(&root, initial_query.as_deref(), dirs_only) {
                     Ok(Some(s)) => {
                         if let Some(ref dir) = dir_part {
                             self.ed.delete_before_cursor(token.len());

@@ -196,7 +196,12 @@ impl CandidateProvider for FileProvider {
 /// 巨大なツリーをストリーミング表示しつつ Ctrl+C/Esc で中断できるようにするため、
 /// 全件を Vec に溜めず逐次コールバックする設計にしている。
 pub fn walk_files(root: &Path, max_depth: usize, emit: &mut dyn FnMut(String) -> bool) {
-    walk_visit(root, root, 0, max_depth, emit);
+    walk_visit(root, root, 0, max_depth, false, emit);
+}
+
+/// `walk_files` のディレクトリのみ版 (cd の Ctrl+T 補完用)。
+pub fn walk_dirs(root: &Path, max_depth: usize, emit: &mut dyn FnMut(String) -> bool) {
+    walk_visit(root, root, 0, max_depth, true, emit);
 }
 
 /// 戻り値: 走査を続けてよいなら true、消費側が中断したら false。
@@ -205,6 +210,7 @@ fn walk_visit(
     dir: &Path,
     depth: usize,
     max_depth: usize,
+    dirs_only: bool,
     emit: &mut dyn FnMut(String) -> bool,
 ) -> bool {
     if depth > max_depth {
@@ -220,6 +226,9 @@ fn walk_visit(
         let path = entry.path();
         let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
         if path.is_file() {
+            if dirs_only {
+                continue;
+            }
             if !emit(format!("./{}", rel)) {
                 return false;
             }
@@ -227,7 +236,7 @@ fn walk_visit(
             if !emit(format!("./{}/", rel)) {
                 return false;
             }
-            if !walk_visit(root, &path, depth + 1, max_depth, emit) {
+            if !walk_visit(root, &path, depth + 1, max_depth, dirs_only, emit) {
                 return false;
             }
         }
