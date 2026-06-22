@@ -102,13 +102,19 @@ fn cd(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
             .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?,
     };
 
-    if let Ok(cwd) = std::env::current_dir() {
-        // SAFETY: メインスレッドからのみ呼ばれ、呼び出し時点で他スレッドは存在しない。
+    // 移動前の cwd を控えておき、cd が成功したときだけ OLDPWD とスタックを更新する。
+    // (存在しないディレクトリへの cd で OLDPWD やスタックが壊れるのを防ぐ)
+    let prev = std::env::current_dir();
+    std::env::set_current_dir(&target)?;
+
+    if let Ok(cwd) = prev {
+        // SAFETY: ビルトインはメインスレッドからのみ実行される。Ctrl+T 列挙で一時的に
+        // spawn されるワーカースレッドは getenv/setenv を一切呼ばないため、environ への
+        // 並行アクセスは発生しない。
         unsafe { std::env::set_var("OLDPWD", &cwd) };
         ctx.dir_stack.push(cwd);
     }
-
-    std::env::set_current_dir(&target)
+    Ok(())
 }
 
 // ─── popd ─────────────────────────────────────────────────────────────────────
@@ -194,7 +200,9 @@ fn alias(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
 fn set(args: &[&str], _ctx: &mut ShellContext) -> io::Result<()> {
     match (args.first(), args.get(1)) {
         (Some(&var), Some(&val)) => {
-            // SAFETY: メインスレッドからのみ呼ばれ、呼び出し時点で他スレッドは存在しない。
+            // SAFETY: ビルトインはメインスレッドからのみ実行される。Ctrl+T 列挙で一時的に
+            // spawn されるワーカースレッドは getenv/setenv を一切呼ばないため、environ への
+            // 並行アクセスは発生しない。
             unsafe { std::env::set_var(var, val) };
             Ok(())
         }

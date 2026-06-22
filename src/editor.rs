@@ -221,12 +221,20 @@ pub fn redraw_prompt(
     }
     queue!(stdout(), cursor::SavePosition, Print(&ed.buf[ed.cursor..]))?;
     if let Some(g) = ghost {
-        queue!(
-            stdout(),
-            SetForegroundColor(COLOR_GHOST),
-            Print(g),
-            ResetColor,
-        )?;
+        // ghost はカーソル行末でのみ表示されるため、カーソル以降のバッファは空。
+        // 現在行の残り幅で打ち切り、ghost の折り返し (= 末尾スクロール時に
+        // SavePosition がずれる描画崩れ) を防ぐ。受理時は呼び出し側が全文を使う。
+        let col = (cursor_display % term_cols) as usize;
+        let avail = term_cols as usize - col;
+        let g = truncate_to_width(g, avail);
+        if !g.is_empty() {
+            queue!(
+                stdout(),
+                SetForegroundColor(COLOR_GHOST),
+                Print(g),
+                ResetColor,
+            )?;
+        }
     }
     queue!(stdout(), cursor::RestorePosition)?;
 
@@ -234,6 +242,22 @@ pub fn redraw_prompt(
     ed.lines_above_cursor = 1 + cursor_display / term_cols;
 
     stdout().flush()
+}
+
+/// 表示幅が `max_cols` を超えない最長の先頭部分文字列を返す (char 境界を保つ)。
+fn truncate_to_width(s: &str, max_cols: usize) -> &str {
+    use unicode_width::UnicodeWidthChar;
+    let mut width = 0;
+    let mut end = 0;
+    for (i, c) in s.char_indices() {
+        let w = c.width().unwrap_or(0);
+        if width + w > max_cols {
+            break;
+        }
+        width += w;
+        end = i + c.len_utf8();
+    }
+    &s[..end]
 }
 
 fn is_word_sep(c: char) -> bool {
