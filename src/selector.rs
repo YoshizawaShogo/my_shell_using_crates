@@ -330,6 +330,11 @@ fn run_picker(
     Ok(outcome)
 }
 
+/// ピッカーと同じ規則で `candidates` を `query` 絞り込みした結果を返す (件数判定などに使う)。
+pub fn filter(candidates: &[String], query: &str) -> Vec<String> {
+    filter_candidates(candidates, query)
+}
+
 /// `master` を `query` で絞り込む。空クエリなら入力順 (= MRU 順) をそのまま返す。
 ///
 /// クエリは空白区切りのワード列として扱い、各ワードを「連続部分一致・左→右の順序」で

@@ -28,6 +28,8 @@ pub struct ShellContext {
     pub aliases: HashMap<String, String>,
     /// 直前のコマンドの終了ステータス ($? に対応)
     pub last_status: i32,
+    /// ジョブ制御の表 (Ctrl+Z で停止したジョブと bg で再開したもの)
+    pub jobs: Vec<crate::job::Job>,
 }
 
 impl Default for ShellContext {
@@ -38,6 +40,7 @@ impl Default for ShellContext {
             abbrs: HashMap::new(),
             aliases: HashMap::new(),
             last_status: 0,
+            jobs: Vec::new(),
         }
     }
 }
@@ -110,6 +113,9 @@ const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("alias", alias),
     ("set", set),
     ("setenv", set), // setenv は set のエイリアス
+    ("fg", fg),
+    ("bg", bg),
+    ("jobs", jobs),
 ];
 
 /// 名前に対応するビルトイン実装を返す。
@@ -130,7 +136,7 @@ fn cd(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
     let target = match args.first().copied() {
         Some("-") => std::env::var("OLDPWD")
             .map(PathBuf::from)
-            .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "OLDPWD が未設定です"))?,
+            .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "OLDPWD not set"))?,
         Some(path) => expand_tilde(path),
         None => std::env::var("HOME")
             .map(PathBuf::from)
@@ -157,7 +163,7 @@ fn cd(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
 fn popd(_args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
     match ctx.dir_stack.pop() {
         Some(prev) => std::env::set_current_dir(&prev),
-        None => Err(io::Error::other("ディレクトリスタックが空です")),
+        None => Err(io::Error::other("directory stack is empty")),
     }
 }
 
@@ -169,7 +175,7 @@ fn abbr(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
             ctx.abbrs.insert(from.to_string(), to.to_string());
             Ok(())
         }
-        _ => Err(io::Error::other("使い方: abbr FROM TO")),
+        _ => Err(io::Error::other("usage: abbr FROM TO")),
     }
 }
 
@@ -181,7 +187,7 @@ fn alias(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
             ctx.aliases.insert(from.to_string(), to.to_string());
             Ok(())
         }
-        _ => Err(io::Error::other("使い方: alias FROM TO")),
+        _ => Err(io::Error::other("usage: alias FROM TO")),
     }
 }
 
@@ -196,6 +202,20 @@ fn set(args: &[&str], _ctx: &mut ShellContext) -> io::Result<()> {
             unsafe { std::env::set_var(var, val) };
             Ok(())
         }
-        _ => Err(io::Error::other("使い方: set VAR VAL")),
+        _ => Err(io::Error::other("usage: set VAR VAL")),
     }
+}
+
+// ─── fg / bg / jobs (ジョブ制御は job モジュールへ委譲) ────────────────────────
+
+fn fg(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
+    crate::job::fg(args.first().copied(), ctx)
+}
+
+fn bg(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
+    crate::job::bg(args.first().copied(), ctx)
+}
+
+fn jobs(_args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
+    crate::job::list(ctx)
 }

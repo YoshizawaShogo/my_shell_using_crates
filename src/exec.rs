@@ -1,7 +1,7 @@
 //! コマンド実行。
 
 use crate::builtin::{ShellContext, find_builtin};
-use crossterm::{execute, style::Print, terminal};
+use crossterm::{execute, style::Print};
 use std::collections::HashMap;
 use std::io::{self, stdout};
 use std::os::unix::process::CommandExt;
@@ -82,18 +82,26 @@ pub fn execute_command(cmd: &str, ctx: &mut ShellContext, interactive: bool) -> 
     let sh_cmd = format!("{}(exit {}); {}", prelude, ctx.last_status, abbr_line);
     let mut command = std::process::Command::new("sh");
     command.arg("-c").arg(&sh_cmd);
-    // 親シェルは SIGINT を無視しているが、子ではデフォルト動作へ戻し、
-    // Ctrl+C が実行中の外部コマンドだけに効くようにする。
+    // 子を独立プロセスグループに入れて端末ジョブ制御の対象にし、親シェルが無視している
+    // シグナルは既定動作へ戻す。これをしないと Ctrl+Z で停止できず、Ctrl+C も効かない。
     unsafe {
         command.pre_exec(|| {
-            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::setpgid(0, 0);
+            for sig in [
+                libc::SIGINT,
+                libc::SIGQUIT,
+                libc::SIGTSTP,
+                libc::SIGTTOU,
+                libc::SIGTTIN,
+            ] {
+                libc::signal(sig, libc::SIG_DFL);
+            }
             Ok(())
         });
     }
-    terminal::disable_raw_mode()?;
-    let status = command.status()?;
-    ctx.last_status = status.code().unwrap_or(1);
-    terminal::enable_raw_mode()
+    // フォアグラウンド実行＋ Ctrl+Z 停止の検知は job モジュールが担う。
+    // 表示用のコマンド名には abbr 展開済みの行を渡す。
+    crate::job::run_foreground(&mut command, abbr_line.trim(), ctx)
 }
 
 /// 先頭の単語と、それに続く残り (前後の空白を除く) に分割する。

@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
 
+# 同一ブランチ / PR への連続 push では進行中の旧ランをキャンセルし、最新の push だけを実行する。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ci:
     runs-on: ubuntu-latest

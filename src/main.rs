@@ -4,6 +4,7 @@ mod editor;
 mod events;
 mod exec;
 mod history;
+mod job;
 mod provider;
 mod selector;
 mod term;
@@ -25,7 +26,7 @@ use exec::execute_command;
 use history::History;
 use selector::Selection;
 use std::collections::HashMap;
-use term::{RawModeGuard, setup_sigint_handler};
+use term::{RawModeGuard, setup_signal_handlers};
 
 /// RC ファイルパス (起動時に読み込む設定ファイル)
 const RC_FILE: &str = "~/.my_shell_rc";
@@ -42,6 +43,8 @@ struct Shell {
     hist_idx: Option<usize>,
     /// ナビゲーション開始前の入力を保存する
     saved_input: String,
+    /// 停止ジョブがある状態で一度終了を試みたか (2 回目で実際に終了する)
+    jobs_warned: bool,
 }
 
 impl Shell {
@@ -54,6 +57,7 @@ impl Shell {
             ghost: None,
             hist_idx: None,
             saved_input: String::new(),
+            jobs_warned: false,
         }
     }
 
@@ -72,7 +76,23 @@ impl Shell {
     /// 後続処理 (主に再描画) は `pending` に積んで呼び出し側のキューに委ねる。
     fn handle_event(&mut self, ev: ShellEvent, pending: &mut Vec<ShellEvent>) -> io::Result<bool> {
         match ev {
-            ShellEvent::Exit => return Ok(true),
+            ShellEvent::Exit => {
+                // 停止ジョブがあれば 1 回目は警告して残す。2 回目で SIGHUP して終了。
+                if !self.ctx.jobs.is_empty() && !self.jobs_warned {
+                    self.jobs_warned = true;
+                    execute!(
+                        stdout(),
+                        Print("There are stopped jobs (press Ctrl+D again to exit)\r\n")
+                    )?;
+                    // 警告行を残したまま下に新しいプロンプトを描く (^C と同じ要領)。
+                    // reset しないと redraw の MoveUp+Clear で警告が消える。
+                    self.ed.reset_lines_above();
+                    pending.push(ShellEvent::RedrawPrompt);
+                    return Ok(false);
+                }
+                job::hangup_all(&self.ctx);
+                return Ok(true);
+            }
 
             ShellEvent::CancelInput => {
                 self.ed.take();
@@ -107,6 +127,9 @@ impl Shell {
                 self.ghost = None;
                 self.hist_idx = None;
                 self.saved_input.clear();
+                self.jobs_warned = false;
+                // 完了/停止したバックグラウンドジョブをプロンプト表示前に通知する。
+                job::reap_finished(&mut self.ctx)?;
                 pending.push(ShellEvent::RedrawPrompt);
             }
 
@@ -328,7 +351,7 @@ fn main() -> io::Result<()> {
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 1);
     }
-    setup_sigint_handler()?;
+    setup_signal_handlers()?;
     let _guard = RawModeGuard::new()?;
     let result = run();
     let _ = execute!(stdout(), Print("\r\n"));
