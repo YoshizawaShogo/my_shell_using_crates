@@ -178,8 +178,10 @@ fn classify(prefix: &str) -> CompletionKind {
             .any(|c: char| !c.is_whitespace());
 
     if !has_prev {
-        // 第1トークン: パス風でなければコマンド補完
-        if token.starts_with('/') || token.starts_with("./") || token.starts_with("~/") {
+        // 第1トークン: '/' を含む語はパス (実行ファイルをパス指定で起動)、それ以外は
+        // コマンド名補完。シェルと同じく、スラッシュを含む語は PATH 検索ではなくパスとして
+        // 扱う (`./x`, `../x`, `/abs/x`, `sub/x`, `~/x`)。
+        if token.contains('/') {
             return CompletionKind::Path { dirs_only: false };
         }
         return CompletionKind::Command;
@@ -253,6 +255,21 @@ mod tests {
     fn replace_last_token() {
         assert_eq!(replace_token("git comm", "commit"), "git commit");
         assert_eq!(replace_token("ls", "ls"), "ls");
+    }
+
+    #[test]
+    fn classify_first_token() {
+        // '/' を含む第1トークンはパス補完 (../ や sub/ も含む)
+        assert!(matches!(classify("../"), CompletionKind::Path { .. }));
+        assert!(matches!(classify("../sr"), CompletionKind::Path { .. }));
+        assert!(matches!(classify("./b"), CompletionKind::Path { .. }));
+        assert!(matches!(classify("sub/x"), CompletionKind::Path { .. }));
+        assert!(matches!(classify("/abs/x"), CompletionKind::Path { .. }));
+        // '/' を含まない語はコマンド名補完
+        assert!(matches!(classify("ls"), CompletionKind::Command));
+        assert!(matches!(classify(".."), CompletionKind::Command));
+        // $ は環境変数
+        assert!(matches!(classify("$HO"), CompletionKind::EnvVar));
     }
 
     #[test]
