@@ -145,11 +145,19 @@ impl Shell {
                 let prefix = self.ed.line()[..self.ed.cursor()].to_string();
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let lines_above = self.ed.lines_above_cursor();
+                // fg/bg 補完用にジョブのコマンド名 (先頭トークン) を渡す。
+                let job_names: Vec<String> = self
+                    .ctx
+                    .jobs
+                    .iter()
+                    .filter_map(|j| j.cmd.split_whitespace().next().map(str::to_string))
+                    .collect();
                 let tab_ctx = TabContext {
                     prefix: &prefix,
                     cwd: &cwd,
                     history: &self.history,
                     lines_above_cursor: lines_above,
+                    jobs: &job_names,
                 };
                 match completion::tab_complete(tab_ctx)? {
                     Selection::Chosen(choice) => self.ed.set(choice),

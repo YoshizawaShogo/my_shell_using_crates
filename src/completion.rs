@@ -19,6 +19,8 @@ pub struct TabContext<'a> {
     pub cwd: &'a Path,
     pub history: &'a History,
     pub lines_above_cursor: u16,
+    /// fg/bg 補完用のジョブ名 (各ジョブのコマンド先頭トークン)
+    pub jobs: &'a [String],
 }
 
 /// Tab 補完を実行する。
@@ -44,6 +46,18 @@ pub fn tab_complete(ctx: TabContext<'_>) -> std::io::Result<Selection> {
         }
         .candidates(&pctx),
         CompletionKind::EnvVar => EnvVarProvider.candidates(&pctx),
+        CompletionKind::Job => {
+            // ジョブ名を前方一致で絞り、重複を除く (fg vim / bg top など)。
+            let mut v: Vec<String> = ctx
+                .jobs
+                .iter()
+                .filter(|name| name.starts_with(token))
+                .cloned()
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        }
     };
 
     if cands.is_empty() {
@@ -160,6 +174,8 @@ enum CompletionKind {
     Path { dirs_only: bool },
     /// 環境変数 ($VAR)
     EnvVar,
+    /// ジョブ名 (fg/bg の引数)
+    Job,
 }
 
 /// カーソル直前の入力状態から補完種別を判定する。
@@ -187,13 +203,15 @@ fn classify(prefix: &str) -> CompletionKind {
         return CompletionKind::Command;
     }
 
-    // 第2トークン以降: コマンド名によってファイル/ディレクトリを切り替え
+    // 第2トークン以降: コマンド名によって補完種別を切り替える
     let cmd = prefix[..token_start]
         .split_whitespace()
         .next()
         .unwrap_or("");
-    CompletionKind::Path {
-        dirs_only: cmd == "cd",
+    match cmd {
+        "fg" | "bg" => CompletionKind::Job,
+        "cd" => CompletionKind::Path { dirs_only: true },
+        _ => CompletionKind::Path { dirs_only: false },
     }
 }
 
