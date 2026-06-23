@@ -7,7 +7,7 @@ use std::io;
 ///
 /// 正常終了・パニックいずれでも `Drop` で raw mode を戻す。
 /// (`exit()` やシグナルで殺された場合は `Drop` が走らないため、
-///  そのケースは [`setup_sigint_handler`] 側で別途救済する)
+///  そのケースは [`setup_signal_handlers`] 側で別途救済する)
 pub struct RawModeGuard;
 
 impl RawModeGuard {
