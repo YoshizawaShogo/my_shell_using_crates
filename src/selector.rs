@@ -139,10 +139,19 @@ fn draw_grid(
             let pad = col_width.saturating_sub(text.width());
 
             if idx == selected {
+                // 選択中は白背景＋黒文字 (iceberg トーンの淡色で目に優しく)
                 queue!(
                     stdout(),
-                    SetBackgroundColor(Color::Blue),
-                    SetForegroundColor(Color::White),
+                    SetBackgroundColor(Color::Rgb {
+                        r: 0xc6,
+                        g: 0xc8,
+                        b: 0xd1
+                    }),
+                    SetForegroundColor(Color::Rgb {
+                        r: 0x16,
+                        g: 0x18,
+                        b: 0x21
+                    }),
                     Print(format!("{}{:pad$}", text, "", pad = pad)),
                     ResetColor,
                 )?;

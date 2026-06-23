@@ -264,11 +264,22 @@ impl Shell {
             }
 
             ShellEvent::ShowRecentPathFzf => {
-                // 入力が空のときは選択結果を `cd <path>` として挿入する。
+                // 入力が空のときは cd 先選択モード: 候補をディレクトリのみに絞り、
+                // 選択結果を `cd <path>` として挿入する。
                 let prepend_cd = self.ed.is_empty();
+                let candidates: Vec<std::path::PathBuf> = if prepend_cd {
+                    self.ctx
+                        .recent_paths
+                        .iter()
+                        .filter(|p| p.is_dir())
+                        .cloned()
+                        .collect()
+                } else {
+                    self.ctx.recent_paths.clone()
+                };
                 execute!(stdout(), Print("\r\n"))?;
                 self.ed.note_newline();
-                match completion::fzf_recent_paths(&self.ctx.recent_paths) {
+                match completion::fzf_recent_paths(&candidates) {
                     Ok(Some(s)) if prepend_cd => self.ed.insert_str(&format!("cd {}", s)),
                     Ok(Some(s)) => self.ed.insert_str(&s),
                     Ok(None) => {}
