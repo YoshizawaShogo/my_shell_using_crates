@@ -85,7 +85,8 @@ fn is_executable(_: &std::fs::DirEntry) -> bool {
 
 /// ファイル/ディレクトリを候補にする。`dirs_only = true` のとき `cd` 向けにディレクトリのみ。
 ///
-/// `ctx.prefix` はパスつき現在トークン (例: `/tmp/fo`, `~/pro`, `fo`)。
+/// `ctx.prefix` はパスつき現在トークン (例: `/tmp/fo`, `~/pro`, `fo`)。ファイル名部分は
+/// 部分一致 (大小無視) で照合する。
 pub struct PathProvider {
     pub dirs_only: bool,
 }
@@ -98,12 +99,15 @@ impl CandidateProvider for PathProvider {
             return vec![];
         };
 
+        // 入力トークンを「部分一致 (大小無視)」で照合する。例: `init` は `my_init.bash` に
+        // マッチする。単一なら確定、複数なら共通接頭辞まで補完するのは呼び出し側 (completion)。
+        let needle = file_prefix.to_lowercase();
         let mut results: Vec<String> = entries
             .flatten()
             .filter_map(|e| {
                 let name = e.file_name();
                 let name_str = name.to_string_lossy();
-                if !name_str.starts_with(file_prefix) {
+                if !name_str.to_lowercase().contains(&needle) {
                     return None;
                 }
                 let is_dir = e.path().is_dir();

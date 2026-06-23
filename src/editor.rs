@@ -12,11 +12,39 @@ use unicode_width::UnicodeWidthStr;
 
 const PROMPT_PREFIX: &str = "$ ";
 const PROMPT_PREFIX_WIDTH: u16 = 2; // "$ " は常に 2 列
-const COLOR_USER_HOST: Color = Color::Green;
-const COLOR_CWD: Color = Color::Cyan;
-const COLOR_BRANCH: Color = Color::Blue;
-const COLOR_PROMPT: Color = Color::White;
-const COLOR_GHOST: Color = Color::DarkGrey;
+
+// 配色は iceberg (dark) パレットに合わせた落ち着いたトーン。
+const COLOR_USER_HOST: Color = Color::Rgb {
+    r: 0x84,
+    g: 0xa0,
+    b: 0xc6,
+}; // blue
+const COLOR_CWD: Color = Color::Rgb {
+    r: 0x89,
+    g: 0xb8,
+    b: 0xc2,
+}; // cyan
+const COLOR_BRANCH: Color = Color::Rgb {
+    r: 0xa0,
+    g: 0x93,
+    b: 0xc7,
+}; // purple
+const COLOR_GHOST: Color = Color::Rgb {
+    r: 0x6b,
+    g: 0x70,
+    b: 0x89,
+}; // muted
+// `$` プロンプトは直前コマンドの終了ステータスで色を変える (成功=緑 / 失敗=赤)。
+const COLOR_PROMPT_OK: Color = Color::Rgb {
+    r: 0xb4,
+    g: 0xbe,
+    b: 0x82,
+}; // green
+const COLOR_PROMPT_ERR: Color = Color::Rgb {
+    r: 0xe2,
+    g: 0x78,
+    b: 0x78,
+}; // red
 
 #[derive(Default)]
 pub struct LineEditor {
@@ -166,6 +194,7 @@ pub fn redraw_prompt(
     ed: &mut LineEditor,
     git_branch: Option<&str>,
     ghost: Option<&str>,
+    last_status: i32,
 ) -> io::Result<()> {
     let (term_cols, _) = terminal::size()?;
 
@@ -209,9 +238,14 @@ pub fn redraw_prompt(
     // wrap-pending 対策: cursor_display が term_cols の倍数のとき端末は行末待機状態
     // になる。この状態で SavePosition すると位置がずれるため \r\n で折り返しを確定。
     let cursor_display = PROMPT_PREFIX_WIDTH + ed.buf[..ed.cursor].width() as u16;
+    let prompt_color = if last_status == 0 {
+        COLOR_PROMPT_OK
+    } else {
+        COLOR_PROMPT_ERR
+    };
     queue!(
         stdout(),
-        SetForegroundColor(COLOR_PROMPT),
+        SetForegroundColor(prompt_color),
         Print(PROMPT_PREFIX),
         ResetColor,
         Print(&ed.buf[..ed.cursor]),

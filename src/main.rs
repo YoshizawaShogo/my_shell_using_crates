@@ -62,6 +62,7 @@ impl Shell {
             &mut self.ed,
             self.git_branch.as_deref(),
             self.ghost.as_deref(),
+            self.ctx.last_status,
         )
     }
 
