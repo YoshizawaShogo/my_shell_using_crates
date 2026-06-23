@@ -9,8 +9,6 @@ use crossterm::{
     style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
 };
-use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
-use nucleo_matcher::{Config, Matcher};
 use std::io::{self, Write, stdout};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
@@ -185,8 +183,8 @@ fn truncate_to_cols(s: &str, max_cols: usize) -> &str {
 
 /// 候補を fuzzy 絞り込みでインタラクティブに選択させる。
 ///
-/// `initial_query` は初期クエリ。マッチングは nucleo-matcher、UI は crossterm で
-/// 自前実装する (外部バイナリ不要・本体プロセスで完結)。
+/// `initial_query` は初期クエリ。マッチングも UI も crossterm で自前実装する
+/// (外部バイナリ不要・本体プロセスで完結)。絞り込み規則は `filter_candidates` を参照。
 pub fn run_fzf(candidates: &[String], initial_query: Option<&str>) -> io::Result<Selection> {
     if candidates.is_empty() {
         return Ok(Selection::Dismissed);
@@ -224,7 +222,6 @@ fn run_picker(
     rx: Option<Receiver<String>>,
     initial_query: Option<&str>,
 ) -> io::Result<Selection> {
-    let mut matcher = Matcher::new(Config::DEFAULT);
     let mut query = initial_query.unwrap_or("").to_string();
     let mut selected = 0usize;
     let mut offset = 0usize;
@@ -254,7 +251,7 @@ fn run_picker(
 
         // 2. 絞り込み (クエリ空なら入力順を維持)
         if dirty {
-            filtered = filter_candidates(&master, &query, &mut matcher);
+            filtered = filter_candidates(&master, &query);
             if selected >= filtered.len() {
                 selected = filtered.len().saturating_sub(1);
             }
@@ -324,18 +321,46 @@ fn run_picker(
     Ok(outcome)
 }
 
-/// `master` を `query` で fuzzy 絞り込みする。空クエリなら入力順をそのまま返す。
-fn filter_candidates(master: &[String], query: &str, matcher: &mut Matcher) -> Vec<String> {
-    if query.is_empty() {
+/// `master` を `query` で絞り込む。空クエリなら入力順 (= MRU 順) をそのまま返す。
+///
+/// クエリは空白区切りのワード列として扱い、各ワードを「連続部分一致・左→右の順序」で
+/// 探す (大文字小文字は無視)。例: `/work/AAAAA/BBBB/CCCC` は `"AAA CCC"` に一致するが
+/// `"CCC AAA"` には一致しない。マッチした候補は `score_match` のスコア降順、同点は
+/// 入力順 (MRU) で並べる。
+fn filter_candidates(master: &[String], query: &str) -> Vec<String> {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    if words.is_empty() {
         return master.to_vec();
     }
-    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
-    // match_list はスコア降順 (最良が先頭) で返す。
-    pattern
-        .match_list(master.iter(), matcher)
-        .into_iter()
-        .map(|(s, _)| s.clone())
-        .collect()
+    let mut scored: Vec<(i64, usize, &String)> = master
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, cand)| score_match(cand, &words).map(|s| (s, idx, cand)))
+        .collect();
+    // スコア降順、同点は idx 昇順 (master は MRU 順なので直近が先)
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, _, c)| c.clone()).collect()
+}
+
+/// `cand` が全ワードに「連続部分一致・順序保持」でマッチすればスコアを返す。
+///
+/// スコアは「短いパスほど高い (= パス長ペナルティ)」を基本に、最後のワードが
+/// basename (末尾 `/` 以降) 内でマッチしたらボーナスを加える。
+fn score_match(cand: &str, words: &[String]) -> Option<i64> {
+    let hay = cand.to_lowercase();
+    let mut pos = 0; // ここから後ろを探す (順序を保証)
+    let mut last_match_end = 0;
+    for w in words {
+        let rel = hay[pos..].find(w.as_str())?;
+        last_match_end = pos + rel + w.len();
+        pos = last_match_end;
+    }
+    let mut score = -(hay.chars().count() as i64); // 短いほど高い
+    let basename_start = hay.rfind('/').map(|i| i + 1).unwrap_or(0);
+    if last_match_end > basename_start {
+        score += 50; // 最後のワードが basename にかかっていれば加点
+    }
+    Some(score)
 }
 
 /// ピッカーを 1 フレーム描画する。
@@ -410,5 +435,47 @@ mod tests {
         assert_eq!(truncate_to_cols("hi", 10), "hi");
         assert_eq!(truncate_to_cols("", 5), "");
         assert_eq!(truncate_to_cols("abc", 0), "");
+    }
+
+    fn words(q: &str) -> Vec<String> {
+        q.split_whitespace().map(str::to_lowercase).collect()
+    }
+
+    #[test]
+    fn match_respects_word_order() {
+        let path = "/work/AAAAA/BBBB/CCCC";
+        assert!(score_match(path, &words("AAA CCC")).is_some());
+        assert!(score_match(path, &words("CCC AAA")).is_none());
+    }
+
+    #[test]
+    fn match_is_case_insensitive() {
+        assert!(score_match("/Work/Projects", &words("work pro")).is_some());
+    }
+
+    #[test]
+    fn missing_word_does_not_match() {
+        assert!(score_match("/a/b/c", &words("a z")).is_none());
+    }
+
+    #[test]
+    fn shorter_path_scores_higher() {
+        let short = score_match("/a/foo", &words("foo")).unwrap();
+        let long = score_match("/a/very/long/path/foo", &words("foo")).unwrap();
+        assert!(short > long);
+    }
+
+    #[test]
+    fn basename_match_gets_bonus() {
+        // 同じパスでも basename にかかる方が高スコア
+        let in_basename = score_match("/src/main", &words("main")).unwrap();
+        let in_dir = score_match("/main/src", &words("main")).unwrap();
+        assert!(in_basename > in_dir);
+    }
+
+    #[test]
+    fn empty_query_keeps_input_order() {
+        let master = vec!["b".to_string(), "a".to_string()];
+        assert_eq!(filter_candidates(&master, ""), master);
     }
 }

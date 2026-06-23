@@ -31,6 +31,18 @@ pub fn execute_command(cmd: &str, ctx: &mut ShellContext, interactive: bool) -> 
         None => trimmed.to_string(),
     };
 
+    // 引数で指定された実在パスを自動記録する (Ctrl+G / Ctrl+T のピッカー用)。
+    // インタラクティブ実行のみを対象にし (RC 実行のノイズを避ける)、相対パスは
+    // 実行前の cwd を基準に解決するので `cd foo` の foo も正しく記録できる。
+    if interactive && let Ok(tokens) = shell_words::split(&abbr_line) {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let paths: Vec<String> = tokens
+            .iter()
+            .map(|t| expand_arg(t, ctx.last_status))
+            .collect();
+        crate::builtin::record_arg_paths(ctx, &paths, &cwd);
+    }
+
     // ビルトイン判定用に alias も 1 段展開してコマンド名を求める
     // (alias → ビルトインのケースを sh へ流さず本体で実行するため)。
     let (name0, rest0) = split_first_word(&abbr_line);

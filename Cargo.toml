@@ -7,6 +7,5 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 crossterm = "0.29"
 libc = "0.2"
-nucleo-matcher = "0.3"
 shell-words = "1.1.1"
 unicode-width = "0.2.2"

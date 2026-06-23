@@ -201,6 +201,8 @@ impl Shell {
 
             ShellEvent::ShowFileFzf => {
                 let cwd = std::env::current_dir().unwrap_or_default();
+                // 入力が空のときは cd モード: ディレクトリのみ列挙し `cd <path>` で挿入する。
+                let empty = self.ed.is_empty();
                 // カーソル前のトークンを取得（owned にして借用を切る）
                 let token: String = {
                     let before = &self.ed.line()[..self.ed.cursor()];
@@ -229,13 +231,14 @@ impl Shell {
                 } else {
                     (cwd.clone(), None, None)
                 };
-                // 行頭のコマンドが cd のときはディレクトリのみに絞る
-                let dirs_only = self
-                    .ed
-                    .line()
-                    .split_whitespace()
-                    .next()
-                    .is_some_and(|cmd| cmd == "cd");
+                // 行頭のコマンドが cd のとき、または入力が空のときはディレクトリのみに絞る
+                let dirs_only = empty
+                    || self
+                        .ed
+                        .line()
+                        .split_whitespace()
+                        .next()
+                        .is_some_and(|cmd| cmd == "cd");
                 execute!(stdout(), Print("\r\n"))?;
                 self.ed.note_newline();
                 match completion::fzf_files(&root, initial_query.as_deref(), dirs_only) {
@@ -244,6 +247,9 @@ impl Shell {
                             self.ed.delete_before_cursor(token.len());
                             let filename = s.strip_prefix("./").unwrap_or(&s);
                             self.ed.insert_str(&format!("{}{}", dir, filename));
+                        } else if empty {
+                            let dir = s.strip_prefix("./").unwrap_or(&s);
+                            self.ed.insert_str(&format!("cd {}", dir));
                         } else {
                             self.ed.insert_str(&s);
                         }
@@ -256,10 +262,13 @@ impl Shell {
                 pending.push(ShellEvent::RedrawPrompt);
             }
 
-            ShellEvent::ShowRegPathFzf => {
+            ShellEvent::ShowRecentPathFzf => {
+                // 入力が空のときは選択結果を `cd <path>` として挿入する。
+                let prepend_cd = self.ed.is_empty();
                 execute!(stdout(), Print("\r\n"))?;
                 self.ed.note_newline();
-                match completion::fzf_reg_paths(&self.ctx.reg_paths) {
+                match completion::fzf_recent_paths(&self.ctx.recent_paths) {
+                    Ok(Some(s)) if prepend_cd => self.ed.insert_str(&format!("cd {}", s)),
                     Ok(Some(s)) => self.ed.insert_str(&s),
                     Ok(None) => {}
                     Err(e) => {

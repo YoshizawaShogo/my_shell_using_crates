@@ -49,9 +49,14 @@ cargo run --release
 | `Ctrl+P` / `↑` | 履歴を 1 つ前へ |
 | `Ctrl+N` / `↓` | 履歴を 1 つ後へ |
 | `Ctrl+R` | 全履歴をインクリメンタル検索 |
-| `Ctrl+T` | カレント以下のファイルを検索して挿入 |
-| `Ctrl+G` | 登録済みパス（reg_path）から選択して挿入 |
+| `Ctrl+T` | カレント以下のファイルを検索して挿入（入力が空なら `cd` モード: ディレクトリのみを検索し `cd <PATH>` を補完） |
+| `Ctrl+G` | 自動記録したパス（MRU 順）から選択して挿入（入力が空なら `cd <PATH>` を補完） |
 | `→`（行末） | ゴースト補完（履歴ベースのインライン候補）を受け入れる |
+
+ピッカー（`Ctrl+R`/`Ctrl+T`/`Ctrl+G`）の絞り込みはクエリを空白区切りのワード列として扱い、
+各ワードを「連続部分一致・左→右の順序」で探す（大小無視）。例: `AAA CCC` は
+`/work/AAAAA/BBBB/CCCC` に一致するが `CCC AAA` には一致しない。短いパスほど上位、
+末尾（basename）にかかるマッチを加点し、同点は MRU（直近）順で並べる。
 
 # ビルトインコマンド
 
@@ -59,9 +64,6 @@ cargo run --release
 | --- | --- |
 | `cd [DIR]` | ディレクトリ移動。引数なしで `$HOME`、`cd -` で `$OLDPWD`。移動前のディレクトリはスタックに積む（pushd 相当） |
 | `popd` | ディレクトリスタックを 1 つ戻る |
-| `reg_path add [PATH]` | パスを登録（既定はカレント）。`~/.my_shell_paths` に永続化 |
-| `reg_path rm [PATH]` | 登録済みパスを削除（既定はカレント） |
-| `reg_path list` | 登録済みパスを一覧表示 |
 | `abbr FROM TO` | 略語を定義（Space／実行時に展開、fish 風の視覚展開） |
 | `alias FROM TO` | エイリアスを定義（実行時に先頭トークンを展開） |
 | `set VAR VAL` / `setenv VAR VAL` | 環境変数を設定 |
@@ -75,7 +77,7 @@ abbr と alias の違い: `abbr` は入力した略語を Space や実行時に�
 | --- | --- |
 | `~/.my_shell_rc` | 起動時に 1 行ずつ実行する設定ファイル（`#` 始まりはコメント） |
 | `~/.my_shell_history` | コマンド履歴（タブ区切り `時刻\tcwd\tコマンド`、最大 10,000 件） |
-| `~/.my_shell_paths` | `reg_path` で登録したパス一覧 |
+| `~/.my_shell_paths` | コマンド引数から自動記録したパス一覧（MRU 順、`Ctrl+G` で参照） |
 
 `~/.my_shell_rc` の例は [`example/.my_shell_rc`](example/.my_shell_rc) を参照。
 

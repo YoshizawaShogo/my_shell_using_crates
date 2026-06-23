@@ -16,7 +16,7 @@ pub enum ShellEvent {
     AcceptGhost,
     ShowHistoryFzf,
     ShowFileFzf,
-    ShowRegPathFzf,
+    ShowRecentPathFzf,
     HistoryPrev,
     HistoryNext,
     /// Space キー押下。main.rs で abbr 展開を試みてからスペースを挿入する。
@@ -82,7 +82,7 @@ pub fn handle_key(ed: &mut LineEditor, key: KeyEvent) -> Vec<ShellEvent> {
         KeyCode::Char('l') if ctrl => vec![ShellEvent::ClearScreen],
         KeyCode::Char('p') if ctrl => vec![ShellEvent::HistoryPrev],
         KeyCode::Char('n') if ctrl => vec![ShellEvent::HistoryNext],
-        KeyCode::Char('g') if ctrl => vec![ShellEvent::ShowRegPathFzf],
+        KeyCode::Char('g') if ctrl => vec![ShellEvent::ShowRecentPathFzf],
         KeyCode::Char('r') if ctrl => vec![ShellEvent::ShowHistoryFzf],
         KeyCode::Char('t') if ctrl => vec![ShellEvent::ShowFileFzf],
 

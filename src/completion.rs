@@ -118,9 +118,9 @@ pub fn fzf_files(
 
 // ─── Ctrl+G ──────────────────────────────────────────────────────────────────
 
-/// 登録済みパスを skim で選択する。
-pub fn fzf_reg_paths(reg_paths: &[std::path::PathBuf]) -> std::io::Result<Option<String>> {
-    let cands: Vec<String> = reg_paths
+/// 自動記録したパス (MRU 順) をピッカーで選択する。
+pub fn fzf_recent_paths(recent_paths: &[std::path::PathBuf]) -> std::io::Result<Option<String>> {
+    let cands: Vec<String> = recent_paths
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();

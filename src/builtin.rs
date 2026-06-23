@@ -1,14 +1,17 @@
 //! シェル組み込みコマンド。
 
 use crate::history::expand_tilde;
-use crossterm::{execute, style::Print};
 use std::collections::HashMap;
-use std::io::{self, stdout};
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
 // ─── 定数 ─────────────────────────────────────────────────────────────────────
 
-pub const REG_PATHS_FILE: &str = "~/.my_shell_paths";
+/// 自動記録したパスの永続化先。
+pub const PATHS_FILE: &str = "~/.my_shell_paths";
+
+/// 記録するパスの上限件数 (これを超えた古い (MRU 末尾) エントリを捨てる)。
+const MAX_RECENT_PATHS: usize = 500;
 
 // ─── シェル状態 ───────────────────────────────────────────────────────────────
 
@@ -16,8 +19,9 @@ pub const REG_PATHS_FILE: &str = "~/.my_shell_paths";
 pub struct ShellContext {
     /// cd が積み上げるディレクトリスタック (pushd 相当)
     pub dir_stack: Vec<PathBuf>,
-    /// reg_path add で登録したパス一覧 (永続化: ~/.my_shell_paths)
-    pub reg_paths: Vec<PathBuf>,
+    /// コマンド引数から自動記録したパス一覧。MRU 順 (先頭が直近)。
+    /// 永続化: ~/.my_shell_paths。Ctrl+G / Ctrl+T のピッカーが参照する。
+    pub recent_paths: Vec<PathBuf>,
     /// abbr で定義した略語 (FROM → TO)
     pub abbrs: HashMap<String, String>,
     /// alias で定義したエイリアス (FROM → TO)
@@ -30,7 +34,7 @@ impl Default for ShellContext {
     fn default() -> Self {
         Self {
             dir_stack: Vec::new(),
-            reg_paths: load_reg_paths(),
+            recent_paths: load_recent_paths(),
             abbrs: HashMap::new(),
             aliases: HashMap::new(),
             last_status: 0,
@@ -38,24 +42,56 @@ impl Default for ShellContext {
     }
 }
 
-fn load_reg_paths() -> Vec<PathBuf> {
-    let path = expand_tilde(REG_PATHS_FILE);
+/// 永続化ファイルを読み込む。MRU 順 (ファイルの並び順) を保ったまま、
+/// 既に存在しないパスは捨てる (自動掃除)。
+fn load_recent_paths() -> Vec<PathBuf> {
+    let path = expand_tilde(PATHS_FILE);
     std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
         .filter(|l| !l.is_empty())
         .map(PathBuf::from)
+        .filter(|p| p.exists())
         .collect()
 }
 
-fn save_reg_paths(paths: &[PathBuf]) -> io::Result<()> {
-    let path = expand_tilde(REG_PATHS_FILE);
+fn save_recent_paths(paths: &[PathBuf]) -> io::Result<()> {
+    let path = expand_tilde(PATHS_FILE);
     let content = paths
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("\n");
     std::fs::write(path, format!("{}\n", content))
+}
+
+/// コマンドの引数群から実在するパスを `recent_paths` に MRU 記録する。
+///
+/// `args` は abbr/エイリアス展開・`~`/`$VAR` 展開を済ませた引数文字列で、`cwd` は
+/// コマンド実行**前**の作業ディレクトリ (相対パスの解決基準。`cd foo` でも正しく
+/// 解決できる)。`-` で始まるフラグや実在しないパスは無視する。ファイルはファイルの
+/// まま、ディレクトリはディレクトリのまま記録する。
+pub fn record_arg_paths(ctx: &mut ShellContext, args: &[String], cwd: &Path) {
+    let mut changed = false;
+    for a in args {
+        if a.is_empty() || a.starts_with('-') {
+            continue;
+        }
+        let p = PathBuf::from(a);
+        let abs = if p.is_absolute() { p } else { cwd.join(p) };
+        // canonicalize は実在しなければ Err。これで存在チェックと正規化を兼ねる。
+        let Ok(canon) = abs.canonicalize() else {
+            continue;
+        };
+        // MRU: 既存を取り除いて先頭へ。
+        ctx.recent_paths.retain(|x| x != &canon);
+        ctx.recent_paths.insert(0, canon);
+        changed = true;
+    }
+    if changed {
+        ctx.recent_paths.truncate(MAX_RECENT_PATHS);
+        let _ = save_recent_paths(&ctx.recent_paths);
+    }
 }
 
 // ─── 登録テーブル ─────────────────────────────────────────────────────────────
@@ -70,7 +106,6 @@ type BuiltinFn = fn(&[&str], &mut ShellContext) -> io::Result<()>;
 const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("cd", cd),
     ("popd", popd),
-    ("reg_path", reg_path),
     ("abbr", abbr),
     ("alias", alias),
     ("set", set),
@@ -123,51 +158,6 @@ fn popd(_args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
     match ctx.dir_stack.pop() {
         Some(prev) => std::env::set_current_dir(&prev),
         None => Err(io::Error::other("ディレクトリスタックが空です")),
-    }
-}
-
-// ─── reg_path ─────────────────────────────────────────────────────────────────
-
-fn reg_path(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
-    match args.first().copied() {
-        Some("add") => {
-            let path = match args.get(1) {
-                Some(&p) => expand_tilde(p),
-                None => std::env::current_dir()?,
-            };
-            let path = path.canonicalize().unwrap_or(path);
-            if !ctx.reg_paths.contains(&path) {
-                ctx.reg_paths.push(path);
-                save_reg_paths(&ctx.reg_paths)?;
-            }
-            Ok(())
-        }
-        Some("rm") => {
-            // add と同じ正規化で対象を求め、一致する登録を消す。
-            let path = match args.get(1) {
-                Some(&p) => expand_tilde(p),
-                None => std::env::current_dir()?,
-            };
-            let path = path.canonicalize().unwrap_or(path);
-            let before = ctx.reg_paths.len();
-            ctx.reg_paths.retain(|p| p != &path);
-            if ctx.reg_paths.len() == before {
-                return Err(io::Error::other(format!(
-                    "登録されていません: {}",
-                    path.display()
-                )));
-            }
-            save_reg_paths(&ctx.reg_paths)
-        }
-        Some("list") => {
-            for p in &ctx.reg_paths {
-                execute!(stdout(), Print(format!("{}\r\n", p.display())))?;
-            }
-            Ok(())
-        }
-        _ => Err(io::Error::other(
-            "使い方: reg_path add [path] | rm [path] | list",
-        )),
     }
 }
 
