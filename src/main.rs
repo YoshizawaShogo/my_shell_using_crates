@@ -117,11 +117,9 @@ impl Shell {
                 self.redraw()?;
                 // 3. バッファを取得してエディタをクリア
                 let cmd = self.ed.take();
-                // 4. 実行 (cwd は cd 前に記録)
-                let cwd = std::env::current_dir().unwrap_or_default();
                 execute_command(&cmd, &mut self.ctx, true)?;
                 if !cmd.trim().is_empty() {
-                    self.history.add(&cmd, &cwd);
+                    self.history.add(&cmd);
                 }
                 self.git_branch = fetch_git_branch();
                 self.ghost = None;
@@ -161,10 +159,7 @@ impl Shell {
                 };
                 match completion::tab_complete(tab_ctx)? {
                     Selection::Chosen(choice) => self.ed.set(choice),
-                    Selection::Aborted => {
-                        self.ed.take();
-                    }
-                    Selection::Dismissed => {}
+                    Selection::Aborted | Selection::Dismissed => {}
                     Selection::InsertChar(c) => self.ed.insert(c),
                     Selection::Backspace => self.ed.backspace(),
                 }
@@ -180,17 +175,24 @@ impl Shell {
                 if n == 0 {
                     return Ok(false);
                 }
-                let new_idx = match self.hist_idx {
-                    None => {
-                        self.saved_input = self.ed.line().to_string();
-                        n - 1
+                // 最初の押下時: 現在のバッファをプレフィックスとして保存
+                if self.hist_idx.is_none() {
+                    self.saved_input = self.ed.line().to_string();
+                }
+                let prefix = self.saved_input.clone();
+                let start = self.hist_idx.unwrap_or(n);
+                // start より前でプレフィックスに一致する最新エントリを探す
+                let found = (0..start).rev().find(|&i| {
+                    self.history
+                        .get_cmd(i)
+                        .map(|cmd| cmd.starts_with(&prefix))
+                        .unwrap_or(false)
+                });
+                if let Some(idx) = found {
+                    self.hist_idx = Some(idx);
+                    if let Some(cmd) = self.history.get_cmd(idx) {
+                        self.ed.set(cmd.to_string());
                     }
-                    Some(0) => 0, // 最古のエントリ、それ以上戻れない
-                    Some(i) => i - 1,
-                };
-                self.hist_idx = Some(new_idx);
-                if let Some(cmd) = self.history.get_cmd(new_idx) {
-                    self.ed.set(cmd.to_string());
                 }
                 pending.push(ShellEvent::RedrawPrompt);
             }
@@ -200,16 +202,24 @@ impl Shell {
                     None => {} // ナビゲーション外では無視
                     Some(i) => {
                         let n = self.history.len();
-                        if i + 1 >= n {
-                            // 最新エントリを超えたら保存済み入力を復元
+                        let prefix = self.saved_input.clone();
+                        // i より後でプレフィックスに一致するエントリを探す
+                        let found = (i + 1..n).find(|&j| {
+                            self.history
+                                .get_cmd(j)
+                                .map(|cmd| cmd.starts_with(&prefix))
+                                .unwrap_or(false)
+                        });
+                        if let Some(idx) = found {
+                            self.hist_idx = Some(idx);
+                            if let Some(cmd) = self.history.get_cmd(idx) {
+                                self.ed.set(cmd.to_string());
+                            }
+                        } else {
+                            // 一致なし: 保存済み入力を復元
                             self.hist_idx = None;
                             let saved = std::mem::take(&mut self.saved_input);
                             self.ed.set(saved);
-                        } else {
-                            self.hist_idx = Some(i + 1);
-                            if let Some(cmd) = self.history.get_cmd(i + 1) {
-                                self.ed.set(cmd.to_string());
-                            }
                         }
                     }
                 }
@@ -218,10 +228,9 @@ impl Shell {
 
             ShellEvent::ShowHistoryFzf => {
                 let query = self.ed.line().to_string();
-                let cwd = std::env::current_dir().unwrap_or_default();
                 execute!(stdout(), Print("\r\n"))?;
                 self.ed.note_newline();
-                match completion::fzf_history(&query, &cwd, &self.history) {
+                match completion::fzf_history(&query, &self.history) {
                     Ok(Some(s)) => self.ed.set(s),
                     Ok(None) => {}
                     Err(e) => {

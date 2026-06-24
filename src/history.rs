@@ -3,7 +3,7 @@
 //! セッション中はメモリ上に保持し、シェル終了時に HISTORY_FILE へ書き出す。
 //!
 //! # ファイル形式
-//! タブ区切り 1 行 1 エントリ: `<unix_sec>\t<cwd>\t<cmd>`
+//! タブ区切り 1 行 1 エントリ: `<unix_sec>\t<cmd>`
 //! `\`, `\t`, `\n` はそれぞれ `\\`, `\t`, `\n` にエスケープする。
 
 use std::io::{self, BufRead, Write};
@@ -18,7 +18,6 @@ const MAX_ENTRIES: usize = 10_000;
 
 pub struct HistoryEntry {
     pub timestamp: u64,
-    pub cwd: PathBuf,
     pub cmd: String,
 }
 
@@ -37,7 +36,7 @@ impl History {
     }
 
     /// コマンドをメモリ上の履歴に追加する。空行・空白のみは無視する。
-    pub fn add(&mut self, cmd: &str, cwd: &Path) {
+    pub fn add(&mut self, cmd: &str) {
         let cmd = cmd.trim().to_string();
         if cmd.is_empty() {
             return;
@@ -46,11 +45,7 @@ impl History {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        self.entries.push(HistoryEntry {
-            timestamp,
-            cwd: cwd.to_path_buf(),
-            cmd,
-        });
+        self.entries.push(HistoryEntry { timestamp, cmd });
         // 上限を超えたら古いエントリを削除
         if self.entries.len() > MAX_ENTRIES {
             let excess = self.entries.len() - MAX_ENTRIES;
@@ -77,45 +72,26 @@ impl History {
         let path = expand_tilde(HISTORY_FILE);
         let mut file = std::fs::File::create(&path)?;
         for e in &self.entries {
-            writeln!(
-                file,
-                "{}\t{}\t{}",
-                e.timestamp,
-                escape(e.cwd.to_string_lossy().as_ref()),
-                escape(&e.cmd),
-            )?;
+            writeln!(file, "{}\t{}", e.timestamp, escape(&e.cmd))?;
         }
         Ok(())
     }
 
-    /// `prefix` で始まる候補を返す。
-    ///
-    /// 優先順位:
-    ///   1. `current_cwd` で実行されたエントリ (新しい順)
-    ///   2. 他ディレクトリで実行されたエントリ (新しい順)
-    ///
-    /// 同じコマンド文字列は最新のもののみ残す (重複排除)。
-    pub fn search_completions(&self, prefix: &str, current_cwd: &Path) -> Vec<String> {
+    /// `prefix` で始まる候補を新しい順で返す。同じコマンドは最新のみ残す。
+    pub fn search_completions(&self, prefix: &str) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
-        let mut same_cwd: Vec<String> = Vec::new();
-        let mut other: Vec<String> = Vec::new();
+        let mut result: Vec<String> = Vec::new();
 
         for entry in self.entries.iter().rev() {
             if !entry.cmd.starts_with(prefix) {
                 continue;
             }
-            if !seen.insert(entry.cmd.clone()) {
-                continue;
-            }
-            if entry.cwd == current_cwd {
-                same_cwd.push(entry.cmd.clone());
-            } else {
-                other.push(entry.cmd.clone());
+            if seen.insert(entry.cmd.clone()) {
+                result.push(entry.cmd.clone());
             }
         }
 
-        same_cwd.extend(other);
-        same_cwd
+        result
     }
 }
 
@@ -146,13 +122,10 @@ fn load_entries(path: &Path) -> io::Result<Vec<HistoryEntry>> {
 fn parse_line(line: &str) -> Option<HistoryEntry> {
     let mut parts = line.splitn(3, '\t');
     let timestamp: u64 = parts.next()?.parse().ok()?;
-    let cwd = PathBuf::from(unescape(parts.next()?));
-    let cmd = unescape(parts.next()?);
-    Some(HistoryEntry {
-        timestamp,
-        cwd,
-        cmd,
-    })
+    let second = parts.next()?;
+    // 旧フォーマット <unix_sec>\t<cwd>\t<cmd> との互換: 3フィールドあれば3番目がコマンド
+    let cmd = unescape(parts.next().unwrap_or(second));
+    Some(HistoryEntry { timestamp, cmd })
 }
 
 // ─── パス展開 ─────────────────────────────────────────────────────────────────
@@ -210,21 +183,27 @@ mod tests {
 
     #[test]
     fn parse_line_ok() {
-        let e = parse_line("123\t/tmp\tls -la").unwrap();
+        let e = parse_line("123\tls -la").unwrap();
         assert_eq!(e.timestamp, 123);
-        assert_eq!(e.cwd, PathBuf::from("/tmp"));
         assert_eq!(e.cmd, "ls -la");
     }
 
     #[test]
     fn parse_line_unescapes() {
-        let e = parse_line("1\t/a\\tb\tcmd\\nnext").unwrap();
-        assert_eq!(e.cwd, PathBuf::from("/a\tb"));
+        let e = parse_line("1\tcmd\\nnext").unwrap();
         assert_eq!(e.cmd, "cmd\nnext");
     }
 
     #[test]
     fn parse_line_rejects_bad_timestamp() {
-        assert!(parse_line("notanum\t/tmp\tls").is_none());
+        assert!(parse_line("notanum\tls").is_none());
+    }
+
+    #[test]
+    fn parse_line_old_format() {
+        // 旧フォーマット: <unix_sec>\t<cwd>\t<cmd>
+        let e = parse_line("123\t/home/user/projects\techo hello").unwrap();
+        assert_eq!(e.timestamp, 123);
+        assert_eq!(e.cmd, "echo hello");
     }
 }

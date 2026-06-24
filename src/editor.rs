@@ -208,10 +208,11 @@ pub fn redraw_prompt(
         Clear(ClearType::FromCursorDown)
     )?;
 
-    // 2. ヘッダ行を描画
+    // 2. ヘッダ行を描画 (表示幅を記録して lines_above_cursor の計算に使う)
     let user = std::env::var("USER").unwrap_or_else(|_| "?".to_string());
     let host = hostname();
-    let cwd = abbreviated_cwd();
+    let cwd = full_cwd();
+    let mut header_display_width = format!("{}@{} {}", user, host, cwd).width();
     queue!(
         stdout(),
         SetForegroundColor(COLOR_USER_HOST),
@@ -219,19 +220,22 @@ pub fn redraw_prompt(
         ResetColor,
         Print(" "),
         SetForegroundColor(COLOR_CWD),
-        Print(cwd),
+        Print(&cwd),
         ResetColor,
     )?;
     if let Some(branch) = git_branch {
+        let branch_text = format!(" ({})", branch);
+        header_display_width += branch_text.width();
         queue!(
             stdout(),
-            Print(" "),
             SetForegroundColor(COLOR_BRANCH),
-            Print(format!("({})", branch)),
+            Print(branch_text),
             ResetColor,
         )?;
     }
     queue!(stdout(), Print("\r\n"))?;
+    // ヘッダが端末幅を超えて折り返す場合の物理行数
+    let header_lines = header_physical_lines(header_display_width, term_cols);
 
     // 3. 入力行: "$ " プレフィックス → カーソル手前 → 位置保存 → 残りを印字 → 位置復元
     //
@@ -254,44 +258,32 @@ pub fn redraw_prompt(
         queue!(stdout(), Print("\r\n"))?;
     }
     queue!(stdout(), cursor::SavePosition, Print(&ed.buf[ed.cursor..]))?;
-    if let Some(g) = ghost {
-        // ghost はカーソル行末でのみ表示されるため、カーソル以降のバッファは空。
-        // 現在行の残り幅で打ち切り、ghost の折り返し (= 末尾スクロール時に
-        // SavePosition がずれる描画崩れ) を防ぐ。受理時は呼び出し側が全文を使う。
-        let col = (cursor_display % term_cols) as usize;
-        let avail = term_cols as usize - col;
-        let g = truncate_to_width(g, avail);
-        if !g.is_empty() {
-            queue!(
-                stdout(),
-                SetForegroundColor(COLOR_GHOST),
-                Print(g),
-                ResetColor,
-            )?;
-        }
+    if let Some(g) = ghost
+        && !g.is_empty()
+    {
+        queue!(
+            stdout(),
+            SetForegroundColor(COLOR_GHOST),
+            Print(g),
+            ResetColor,
+        )?;
     }
     queue!(stdout(), cursor::RestorePosition)?;
 
-    // 4. +1 はヘッダ行の分
-    ed.lines_above_cursor = 1 + cursor_display / term_cols;
+    // 4. ヘッダの物理行数 + 入力行の折り返し数
+    ed.lines_above_cursor = header_lines + cursor_display / term_cols;
 
     stdout().flush()
 }
 
 /// 表示幅が `max_cols` を超えない最長の先頭部分文字列を返す (char 境界を保つ)。
-fn truncate_to_width(s: &str, max_cols: usize) -> &str {
-    use unicode_width::UnicodeWidthChar;
-    let mut width = 0;
-    let mut end = 0;
-    for (i, c) in s.char_indices() {
-        let w = c.width().unwrap_or(0);
-        if width + w > max_cols {
-            break;
-        }
-        width += w;
-        end = i + c.len_utf8();
+/// ヘッダテキストが端末幅 `cols` で何物理行を占めるか (最小1)。
+fn header_physical_lines(display_width: usize, cols: u16) -> u16 {
+    let cols = cols as usize;
+    if cols == 0 || display_width == 0 {
+        return 1;
     }
-    &s[..end]
+    display_width.div_ceil(cols) as u16
 }
 
 fn is_word_sep(c: char) -> bool {
@@ -334,55 +326,22 @@ fn hostname() -> String {
         .unwrap_or_else(|_| std::env::var("HOSTNAME").unwrap_or_else(|_| "?".to_string()))
 }
 
-fn abbreviated_cwd() -> String {
+fn full_cwd() -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "?".to_string());
 
     // ホームディレクトリを ~ に置換
-    let path = if !home.is_empty() && cwd.starts_with(&home) {
+    if !home.is_empty() && cwd.starts_with(&home) {
         format!("~{}", &cwd[home.len()..])
     } else {
         cwd
-    };
-
-    // 最終コンポーネント以外を先頭 1 文字に短縮 (fish 方式)
-    let parts: Vec<&str> = path.split('/').collect();
-    if parts.len() <= 2 {
-        return path;
     }
-    let last = parts.len() - 1;
-    parts
-        .iter()
-        .enumerate()
-        .map(|(i, part)| {
-            if i == last || part.is_empty() {
-                part.to_string()
-            } else {
-                shorten_component(part)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 /// パスの 1 コンポーネントを先頭 1 文字に短縮する。
 /// 隠しディレクトリ (`.foo`) は `.f` のように先頭 2 文字を残す。
-fn shorten_component(part: &str) -> String {
-    let mut chars = part.chars();
-    let mut out = String::new();
-    if let Some(c) = chars.next() {
-        out.push(c);
-        if c == '.'
-            && let Some(c2) = chars.next()
-        {
-            out.push(c2);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,13 +360,6 @@ mod tests {
         assert_eq!(word_right_pos("foo bar", 0), 3);
         assert_eq!(word_right_pos("foo bar", 3), 7);
         assert_eq!(word_right_pos("a/b", 0), 1);
-    }
-
-    #[test]
-    fn shorten_handles_hidden() {
-        assert_eq!(shorten_component("usr"), "u");
-        assert_eq!(shorten_component(".config"), ".c");
-        assert_eq!(shorten_component(""), "");
     }
 
     #[test]

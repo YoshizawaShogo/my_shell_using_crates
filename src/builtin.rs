@@ -137,7 +137,15 @@ fn cd(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
         Some("-") => std::env::var("OLDPWD")
             .map(PathBuf::from)
             .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "OLDPWD not set"))?,
-        Some(path) => expand_tilde(path),
+        Some(path) => {
+            let p = expand_tilde(path);
+            // ファイルが渡されたとき、その親ディレクトリへ移動する
+            if p.is_file() {
+                p.parent().map(PathBuf::from).unwrap_or(p)
+            } else {
+                p
+            }
+        }
         None => std::env::var("HOME")
             .map(PathBuf::from)
             .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?,

@@ -76,26 +76,38 @@ pub fn tab_complete(ctx: TabContext<'_>) -> std::io::Result<Selection> {
     }
 
     // グリッドメニュー
-    match selector::run_grid_menu(&cands, ctx.lines_above_cursor)? {
-        Selection::Chosen(s) => Ok(Selection::Chosen(replace_token(ctx.prefix, &s))),
+    // token が "/" で終わる場合、候補の共通ディレクトリ部分を除いて表示する。
+    // 例: token="AAA/" のとき "AAA/XXX" → "XXX" と表示し、選択後に "AAA/" を補って確定。
+    let strip_len = if token.ends_with('/') { token.len() } else { 0 };
+    let display_cands: Vec<String> = cands
+        .iter()
+        .map(|c| {
+            if strip_len > 0 && c.len() > strip_len {
+                c[strip_len..].to_string()
+            } else {
+                c.clone()
+            }
+        })
+        .collect();
+
+    match selector::run_grid_menu(&display_cands, ctx.lines_above_cursor)? {
+        Selection::Chosen(display) => {
+            let full = if strip_len > 0 {
+                format!("{}{}", token, display)
+            } else {
+                display
+            };
+            Ok(Selection::Chosen(replace_token(ctx.prefix, &full)))
+        }
         other => Ok(other),
     }
 }
 
 // ─── Ctrl+R ──────────────────────────────────────────────────────────────────
 
-/// 全履歴を skim で検索する。`initial_query` は skim の初期絞り込み文字列。
-pub fn fzf_history(
-    initial_query: &str,
-    cwd: &Path,
-    history: &History,
-) -> std::io::Result<Option<String>> {
-    let pctx = CompletionContext {
-        prefix: "",
-        cwd,
-        history,
-    };
-    let cands = HistoryProvider.candidates(&pctx);
+/// 全履歴を fzf で検索する。`initial_query` は初期絞り込み文字列。
+pub fn fzf_history(initial_query: &str, history: &History) -> std::io::Result<Option<String>> {
+    let cands = history.search_completions("");
     match selector::run_fzf(&cands, Some(initial_query))? {
         Selection::Chosen(s) => Ok(Some(s)),
         _ => Ok(None),

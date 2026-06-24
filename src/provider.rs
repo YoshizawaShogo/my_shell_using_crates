@@ -29,7 +29,7 @@ pub struct HistoryProvider;
 
 impl CandidateProvider for HistoryProvider {
     fn candidates(&self, ctx: &CompletionContext<'_>) -> Vec<String> {
-        ctx.history.search_completions(ctx.prefix, ctx.cwd)
+        ctx.history.search_completions(ctx.prefix)
     }
 }
 

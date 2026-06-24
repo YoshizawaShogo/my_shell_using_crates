@@ -12,7 +12,7 @@ use crossterm::{
 use std::io::{self, Write, stdout};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 // ─── 選択結果 ─────────────────────────────────────────────────────────────────
 
@@ -56,8 +56,19 @@ pub fn run_grid_menu(candidates: &[String], _lines_above_cursor: u16) -> io::Res
 
     execute!(stdout(), Print("\r\n"))?;
 
+    // 初回はフル描画。以降は選択移動時に旧・新セルだけ上書きする。
+    let mut need_full = true;
+    let mut prev_selected = 0usize;
+
     loop {
-        draw_grid(items, selected, n_cols, col_width, n_rows)?;
+        if need_full {
+            draw_grid(items, selected, n_cols, col_width, n_rows)?;
+            need_full = false;
+        } else if prev_selected != selected {
+            redraw_grid_cell(items, prev_selected, false, n_cols, col_width)?;
+            redraw_grid_cell(items, selected, true, n_cols, col_width)?;
+        }
+        prev_selected = selected;
 
         let Event::Key(key) = event::read()? else {
             continue;
@@ -173,6 +184,51 @@ fn draw_grid(
     stdout().flush()
 }
 
+/// グリッドの 1 セルだけを上書き再描画する。カーソルはグリッド先頭行・列0を基準とする。
+fn redraw_grid_cell(
+    items: &[String],
+    idx: usize,
+    is_selected: bool,
+    n_cols: usize,
+    col_width: usize,
+) -> io::Result<()> {
+    let row = (idx / n_cols) as u16;
+    let col = ((idx % n_cols) * col_width) as u16;
+    let text = truncate_to_cols(&items[idx], col_width.saturating_sub(1));
+    let pad = col_width.saturating_sub(text.width());
+
+    if row > 0 {
+        queue!(stdout(), cursor::MoveDown(row))?;
+    }
+    queue!(stdout(), cursor::MoveToColumn(col))?;
+
+    if is_selected {
+        queue!(
+            stdout(),
+            SetBackgroundColor(Color::Rgb {
+                r: 0xc6,
+                g: 0xc8,
+                b: 0xd1
+            }),
+            SetForegroundColor(Color::Rgb {
+                r: 0x16,
+                g: 0x18,
+                b: 0x21
+            }),
+            Print(format!("{}{:pad$}", text, "", pad = pad)),
+            ResetColor,
+        )?;
+    } else {
+        queue!(stdout(), Print(format!("{}{:pad$}", text, "", pad = pad)))?;
+    }
+
+    if row > 0 {
+        queue!(stdout(), cursor::MoveUp(row))?;
+    }
+    queue!(stdout(), cursor::MoveToColumn(0))?;
+    stdout().flush()
+}
+
 fn truncate_to_cols(s: &str, max_cols: usize) -> &str {
     use unicode_width::UnicodeWidthChar;
     let mut width = 0;
@@ -226,6 +282,16 @@ where
 /// `master` は初期候補、`rx` があれば候補がストリーミング流入する。
 /// raw mode は呼び出し側で有効なまま使う (skim と違い端末を明け渡さない)。
 /// レイアウトは reverse: 最上段にクエリ行、その下にスコア順の候補を並べる。
+/// ピッカーの差分描画用レイアウト情報。フル再描画後に計算して保持する。
+struct PickerLayout {
+    /// 可視候補それぞれのクエリ行からの行オフセット (クエリ行 = 行0)
+    cand_rows: Vec<u16>,
+    /// 可視候補それぞれの物理行数
+    cand_heights: Vec<u16>,
+    /// このレイアウトが計算された時点の offset
+    offset: usize,
+}
+
 fn run_picker(
     mut master: Vec<String>,
     rx: Option<Receiver<String>>,
@@ -235,9 +301,14 @@ fn run_picker(
     let mut selected = 0usize;
     let mut offset = 0usize;
     let mut filtered: Vec<String> = Vec::new();
-    let mut dirty = true; // 候補かクエリが変化したら再絞り込み
+    let mut dirty = true;
     let mut outcome = Selection::Dismissed;
 
+    // 差分描画用: None のとき次ループでフル再描画
+    let mut layout: Option<PickerLayout> = None;
+    let mut prev_selected: Option<usize> = None;
+
+    execute!(stdout(), cursor::Hide)?;
     loop {
         // 1. ストリーミング候補を取り込む
         let mut streaming = false;
@@ -251,7 +322,7 @@ fn run_picker(
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        streaming = false; // 生成完了 → 以降はブロッキング待機
+                        streaming = false;
                         break;
                     }
                 }
@@ -265,12 +336,79 @@ fn run_picker(
                 selected = filtered.len().saturating_sub(1);
             }
             dirty = false;
+            layout = None; // 内容変化 → フル再描画
         }
 
-        // 3. 描画
-        draw_picker(&query, &filtered, selected, &mut offset)?;
+        let (term_cols, term_rows) = terminal::size()?;
+        let cols = term_cols as usize;
+        let view = ((term_rows as usize) * 2 / 5).max(3);
+        let content_width = cols.saturating_sub(2);
 
-        // 4. キー入力 (ストリーミング中はタイムアウト付きで流入を取りこぼさない)
+        // 3. スクロール判定 (offset が変わるならフル再描画)
+        let old_offset = offset;
+        if selected < offset {
+            offset = selected;
+        } else if !filtered.is_empty() && selected >= offset + view {
+            offset = selected + 1 - view;
+        }
+        if offset != old_offset {
+            layout = None;
+        }
+
+        // 4. 描画: 選択移動のみなら差分、それ以外はフル
+        let moved_only = layout.as_ref().map(|l| l.offset == offset).unwrap_or(false)
+            && prev_selected.map(|p| p != selected).unwrap_or(false);
+
+        if moved_only {
+            let lo = layout.as_ref().unwrap();
+            let prev = prev_selected.unwrap();
+            let old_vis = prev.wrapping_sub(offset);
+            let new_vis = selected.wrapping_sub(offset);
+            if old_vis < lo.cand_rows.len() && new_vis < lo.cand_rows.len() {
+                // 旧選択行を非選択色で上書き
+                redraw_picker_candidate(
+                    &filtered[prev],
+                    false,
+                    lo.cand_rows[old_vis],
+                    lo.cand_heights[old_vis],
+                    content_width,
+                )?;
+                // 新選択行を選択色で上書き
+                redraw_picker_candidate(
+                    &filtered[selected],
+                    true,
+                    lo.cand_rows[new_vis],
+                    lo.cand_heights[new_vis],
+                    content_width,
+                )?;
+            } else {
+                layout = None; // 範囲外: フォールバック
+            }
+        }
+
+        if layout.is_none() {
+            draw_picker(&query, &filtered, selected, &mut offset)?;
+            // フル再描画後にレイアウトを計算
+            let visible = filtered.len().saturating_sub(offset).min(view);
+            let mut cand_rows = Vec::with_capacity(visible);
+            let mut cand_heights = Vec::with_capacity(visible);
+            let mut row: u16 = 1;
+            for i in 0..visible {
+                let h = split_display(&filtered[offset + i], content_width).len() as u16;
+                cand_rows.push(row);
+                cand_heights.push(h);
+                row += h;
+            }
+            layout = Some(PickerLayout {
+                cand_rows,
+                cand_heights,
+                offset,
+            });
+        }
+
+        prev_selected = Some(selected);
+
+        // 5. キー入力 (ストリーミング中はタイムアウト付き)
         if streaming && !event::poll(Duration::from_millis(50))? {
             continue;
         }
@@ -321,13 +459,56 @@ fn run_picker(
         }
     }
 
-    // 後始末: 描画領域を消してカーソルを開始行に戻す (redraw_prompt が続きを描く)
     execute!(
         stdout(),
+        cursor::Show,
         cursor::MoveToColumn(0),
         Clear(ClearType::FromCursorDown)
     )?;
     Ok(outcome)
+}
+
+/// カーソルがクエリ行 (行0) にある状態で、指定候補を上書き再描画してクエリ行へ戻る。
+fn redraw_picker_candidate(
+    text: &str,
+    is_selected: bool,
+    start_row: u16,
+    _height: u16,
+    content_width: usize,
+) -> io::Result<()> {
+    let chunks = split_display(text, content_width);
+    let height = chunks.len() as u16;
+
+    if start_row > 0 {
+        queue!(stdout(), cursor::MoveDown(start_row))?;
+    }
+    for (j, chunk) in chunks.iter().enumerate() {
+        if is_selected {
+            let prefix = if j == 0 { "> " } else { "  " };
+            queue!(
+                stdout(),
+                SetBackgroundColor(COLOR_SEL_BG),
+                SetForegroundColor(COLOR_SELECTED),
+                Print(prefix),
+                Print(chunk),
+                ResetColor,
+                Print("\r\n"),
+            )?;
+        } else {
+            let prefix = if j == 0 { "# " } else { "  " };
+            queue!(
+                stdout(),
+                SetForegroundColor(COLOR_NORMAL),
+                Print(prefix),
+                Print(chunk),
+                ResetColor,
+                Print("\r\n"),
+            )?;
+        }
+    }
+    // クエリ行へ戻る
+    queue!(stdout(), cursor::MoveUp(start_row + height))?;
+    stdout().flush()
 }
 
 /// ピッカーと同じ規則で `candidates` を `query` 絞り込みした結果を返す (件数判定などに使う)。
@@ -356,32 +537,63 @@ fn filter_candidates(master: &[String], query: &str) -> Vec<String> {
     scored.into_iter().map(|(_, _, c)| c.clone()).collect()
 }
 
-/// `cand` が全ワードに「連続部分一致・順序保持」でマッチすればスコアを返す。
+/// `cand` が全ワードに部分一致すればスコアを返す。ワードの順序は問わない。
 ///
-/// スコアは「短いパスほど高い (= パス長ペナルティ)」を基本に、最後のワードが
-/// basename (末尾 `/` 以降) 内でマッチしたらボーナスを加える。
+/// スコア基準:
+/// - いずれかのワードが basename にかかれば +50
+/// - 全ワードが入力順に出現すれば +20 (順序一致ボーナス)
+/// - 同点は呼び出し側の MRU 順 (idx) で決まる
 fn score_match(cand: &str, words: &[String]) -> Option<i64> {
     let hay = cand.to_lowercase();
-    let mut pos = 0; // ここから後ろを探す (順序を保証)
-    let mut last_match_end = 0;
+
+    // 各ワードが独立して存在するか確認 (順序不問)
     for w in words {
-        let rel = hay[pos..].find(w.as_str())?;
-        last_match_end = pos + rel + w.len();
-        pos = last_match_end;
+        if !hay.contains(w.as_str()) {
+            return None;
+        }
     }
-    let mut score = -(hay.chars().count() as i64); // 短いほど高い
+
+    let mut score = 0i64;
+
+    // basename ボーナス: いずれかのワードが basename 部分に含まれる
     let basename_start = hay.rfind('/').map(|i| i + 1).unwrap_or(0);
-    if last_match_end > basename_start {
-        score += 50; // 最後のワードが basename にかかっていれば加点
+    let basename = &hay[basename_start..];
+    if words.iter().any(|w| basename.contains(w.as_str())) {
+        score += 50;
     }
+
+    // 順序ボーナス: ワードが入力順に出現する場合
+    let mut pos = 0;
+    let in_order = words.iter().all(|w| {
+        hay[pos..]
+            .find(w.as_str())
+            .map(|rel| {
+                pos += rel + w.len();
+                true
+            })
+            .unwrap_or(false)
+    });
+    if in_order {
+        score += 20;
+    }
+
     Some(score)
 }
+
+// ─── ピッカー配色定数 ────────────────────────────────────────────────────────
+const COLOR_QUERY: Color = Color::AnsiValue(117); // 淡青 (iceberg)
+const COLOR_SELECTED: Color = Color::AnsiValue(253); // 薄白
+const COLOR_SEL_BG: Color = Color::AnsiValue(237); // 暗灰背景
+const COLOR_NORMAL: Color = Color::AnsiValue(146); // 灰色寄り淡青
 
 /// ピッカーを 1 フレーム描画する。
 ///
 /// カーソルは開始行の桁0にある前提で、クエリ行＋候補を下方向に描き、
 /// 最後に開始行へ戻す。`offset` は選択がウィンドウ内に収まるよう更新する。
-/// 行折り返しによる `MoveUp` のずれを避けるため各行は端末幅で切り詰める。
+///
+/// - クエリ行: 🔍 + テキスト
+/// - 選択行:   >  + テキスト (bg=237, fg=253)、折り返しは "  "
+/// - 非選択行: #  + テキスト (fg=146)、折り返しは "  "
 fn draw_picker(
     query: &str,
     filtered: &[String],
@@ -392,8 +604,6 @@ fn draw_picker(
     let cols = term_cols as usize;
 
     // 候補表示の高さ: 端末の約40% (最小3行)。
-    // grid menu と同様、現在のカーソル行は問い合わせず (cursor::position は端末への
-    // DSR 往復が必要で本コードベースは避けている)、画面の一部に収まる範囲に留める。
     let view = ((term_rows as usize) * 2 / 5).max(3);
 
     // 選択がウィンドウ内に収まるよう offset を調整
@@ -404,39 +614,79 @@ fn draw_picker(
     }
     let visible = filtered.len().saturating_sub(*offset).min(view);
 
-    // クエリ行
+    // クエリ行: 🔍 は表示幅2なのでプレフィックス幅=3 ("🔍 ")、折り返し防止で切り詰め
     queue!(
         stdout(),
         cursor::MoveToColumn(0),
         Clear(ClearType::FromCursorDown),
-        SetForegroundColor(Color::Cyan),
-        Print(truncate_to_cols(&format!("> {}", query), cols)),
+        SetForegroundColor(COLOR_QUERY),
+        Print(truncate_to_cols(&format!("🔍 {}", query), cols)),
         ResetColor,
         Print("\r\n"),
     )?;
 
-    // 候補行 (選択行を反転表示)
+    // 候補行。テキストを (cols - 2) 幅のチャンクに分割する。
+    // 選択行の先頭: "> " / 非選択行の先頭: "# " / 継続行: "  "
+    let content_width = cols.saturating_sub(2);
+    let mut cand_lines: u16 = 0;
     for i in 0..visible {
         let idx = *offset + i;
-        let text = truncate_to_cols(&filtered[idx], cols);
-        if idx == selected {
-            queue!(
-                stdout(),
-                SetBackgroundColor(Color::Blue),
-                SetForegroundColor(Color::White),
-                Print(text),
-                ResetColor,
-            )?;
-        } else {
-            queue!(stdout(), Print(text))?;
+        let text = &filtered[idx];
+        let chunks = split_display(text, content_width);
+        cand_lines += chunks.len() as u16;
+        for (j, chunk) in chunks.iter().enumerate() {
+            if idx == selected {
+                let prefix = if j == 0 { "> " } else { "  " };
+                queue!(
+                    stdout(),
+                    SetBackgroundColor(COLOR_SEL_BG),
+                    SetForegroundColor(COLOR_SELECTED),
+                    Print(prefix),
+                    Print(chunk),
+                    ResetColor,
+                    Print("\r\n"),
+                )?;
+            } else {
+                let prefix = if j == 0 { "# " } else { "  " };
+                queue!(
+                    stdout(),
+                    SetForegroundColor(COLOR_NORMAL),
+                    Print(prefix),
+                    Print(chunk),
+                    ResetColor,
+                    Print("\r\n"),
+                )?;
+            }
         }
-        queue!(stdout(), Print("\r\n"))?;
     }
 
-    // 開始行へカーソルを戻す (printした行数 = クエリ1 + visible)
-    let drawn = (1 + visible) as u16;
+    // 開始行へカーソルを戻す (クエリ1行 + 候補の物理行数)
+    let drawn = 1 + cand_lines;
     queue!(stdout(), cursor::MoveUp(drawn), cursor::MoveToColumn(0))?;
     stdout().flush()
+}
+
+/// テキストを表示幅 `max_width` ごとのチャンクに分割する。
+/// 空文字列・max_width=0 は `[""]` を返す。
+fn split_display(s: &str, max_width: usize) -> Vec<&str> {
+    if max_width == 0 || s.is_empty() {
+        return vec![s];
+    }
+    let mut chunks = Vec::new();
+    let mut chunk_start = 0;
+    let mut width = 0usize;
+    for (i, c) in s.char_indices() {
+        let w = c.width().unwrap_or(0);
+        if width + w > max_width {
+            chunks.push(&s[chunk_start..i]);
+            chunk_start = i;
+            width = w;
+        } else {
+            width += w;
+        }
+    }
+    chunks.push(&s[chunk_start..]);
+    chunks
 }
 
 #[cfg(test)]
@@ -456,10 +706,16 @@ mod tests {
     }
 
     #[test]
-    fn match_respects_word_order() {
+    fn match_any_order() {
         let path = "/work/AAAAA/BBBB/CCCC";
+        // 順序通りでもマッチ
         assert!(score_match(path, &words("AAA CCC")).is_some());
-        assert!(score_match(path, &words("CCC AAA")).is_none());
+        // 逆順でもマッチ
+        assert!(score_match(path, &words("CCC AAA")).is_some());
+        // 順序通りの方がスコアが高い
+        let in_order = score_match(path, &words("AAA CCC")).unwrap();
+        let reversed = score_match(path, &words("CCC AAA")).unwrap();
+        assert!(in_order > reversed);
     }
 
     #[test]
@@ -474,9 +730,10 @@ mod tests {
 
     #[test]
     fn shorter_path_scores_higher() {
+        // 長短に関わらず basename マッチなら同スコア → MRU 順で決まる
         let short = score_match("/a/foo", &words("foo")).unwrap();
         let long = score_match("/a/very/long/path/foo", &words("foo")).unwrap();
-        assert!(short > long);
+        assert_eq!(short, long);
     }
 
     #[test]
