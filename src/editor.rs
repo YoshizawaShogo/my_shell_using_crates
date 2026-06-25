@@ -237,10 +237,10 @@ pub fn redraw_prompt(
     // ヘッダが端末幅を超えて折り返す場合の物理行数
     let header_lines = header_physical_lines(header_display_width, term_cols);
 
-    // 3. 入力行: "$ " プレフィックス → カーソル手前 → 位置保存 → 残りを印字 → 位置復元
+    // 3. 入力行: "$ " プレフィックス → カーソル手前 → 残りを印字 → カーソル復元
     //
     // wrap-pending 対策: cursor_display が term_cols の倍数のとき端末は行末待機状態
-    // になる。この状態で SavePosition すると位置がずれるため \r\n で折り返しを確定。
+    // になる。\r\n で折り返しを確定してからカーソル物理列を 0 にリセット。
     let cursor_display = PROMPT_PREFIX_WIDTH + ed.buf[..ed.cursor].width() as u16;
     let prompt_color = if last_status == 0 {
         COLOR_PROMPT_OK
@@ -254,21 +254,34 @@ pub fn redraw_prompt(
         ResetColor,
         Print(&ed.buf[..ed.cursor]),
     )?;
-    if cursor_display > 0 && cursor_display.is_multiple_of(term_cols) {
+    let cursor_physical_col = if cursor_display > 0 && cursor_display.is_multiple_of(term_cols) {
         queue!(stdout(), Print("\r\n"))?;
-    }
-    queue!(stdout(), cursor::SavePosition, Print(&ed.buf[ed.cursor..]))?;
-    if let Some(g) = ghost
-        && !g.is_empty()
-    {
+        0u16
+    } else {
+        cursor_display % term_cols
+    };
+
+    // ゴーストを含む「カーソル以降」の表示幅を求め、何行下へ進むかを計算する。
+    // SavePosition/RestorePosition はスクロール時に座標がズレるため使わない。
+    // MoveUp + MoveToColumn は相対移動なのでスクロール後も正しく戻れる。
+    let after_width = ed.buf[ed.cursor..].width() as u16;
+    let ghost_str = ghost.unwrap_or("");
+    let ghost_width = ghost_str.width() as u16;
+    let lines_down = (cursor_physical_col + after_width + ghost_width) / term_cols;
+
+    queue!(stdout(), Print(&ed.buf[ed.cursor..]))?;
+    if !ghost_str.is_empty() {
         queue!(
             stdout(),
             SetForegroundColor(COLOR_GHOST),
-            Print(g),
+            Print(ghost_str),
             ResetColor,
         )?;
     }
-    queue!(stdout(), cursor::RestorePosition)?;
+    if lines_down > 0 {
+        queue!(stdout(), cursor::MoveUp(lines_down))?;
+    }
+    queue!(stdout(), cursor::MoveToColumn(cursor_physical_col))?;
 
     // 4. ヘッダの物理行数 + 入力行の折り返し数
     ed.lines_above_cursor = header_lines + cursor_display / term_cols;

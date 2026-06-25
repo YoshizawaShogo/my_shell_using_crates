@@ -193,59 +193,77 @@ impl CandidateProvider for FileProvider {
     }
 }
 
-/// `root` 以下のファイル/ディレクトリを再帰列挙し、各エントリ
+/// `root` 以下のファイル/ディレクトリを並列列挙し、各エントリ
 /// (例: `./src/`, `./src/main.rs`) を `emit` へ逐次渡す。
 ///
-/// `emit` が false を返したら (消費側が中断したら) 走査を即座に打ち切る。
-/// 巨大なツリーをストリーミング表示しつつ Ctrl+C/Esc で中断できるようにするため、
-/// 全件を Vec に溜めず逐次コールバックする設計にしている。
+/// `emit` が false を返したら走査スレッドへ中断を伝える。
+/// `ignore` クレートにより .gitignore / 隠しファイルを自動除外し、
+/// 複数スレッドで同時走査するため素の readdir より大幅に速い。
 pub fn walk_files(root: &Path, max_depth: usize, emit: &mut dyn FnMut(String) -> bool) {
-    walk_visit(root, root, 0, max_depth, false, emit);
+    walk_parallel(root, max_depth, false, emit);
 }
 
 /// `walk_files` のディレクトリのみ版 (cd の Ctrl+T 補完用)。
 pub fn walk_dirs(root: &Path, max_depth: usize, emit: &mut dyn FnMut(String) -> bool) {
-    walk_visit(root, root, 0, max_depth, true, emit);
+    walk_parallel(root, max_depth, true, emit);
 }
 
-/// 戻り値: 走査を続けてよいなら true、消費側が中断したら false。
-fn walk_visit(
+fn walk_parallel(
     root: &Path,
-    dir: &Path,
-    depth: usize,
     max_depth: usize,
     dirs_only: bool,
     emit: &mut dyn FnMut(String) -> bool,
-) -> bool {
-    if depth > max_depth {
-        return true;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return true;
-    };
-    for entry in entries.flatten() {
-        if entry.file_name().to_string_lossy().starts_with('.') {
-            continue;
+) {
+    use ignore::{WalkBuilder, WalkState};
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel::<String>();
+    let walker = WalkBuilder::new(root)
+        .max_depth(Some(max_depth))
+        .build_parallel();
+
+    let root = root.to_path_buf();
+    std::thread::spawn(move || {
+        walker.run(|| {
+            let tx = tx.clone();
+            let root = root.clone();
+            Box::new(move |result| {
+                let Ok(entry) = result else {
+                    return WalkState::Continue;
+                };
+                if entry.depth() == 0 {
+                    return WalkState::Continue;
+                }
+                let Some(ft) = entry.file_type() else {
+                    return WalkState::Continue;
+                };
+                if dirs_only && !ft.is_dir() {
+                    return WalkState::Continue;
+                }
+                if !ft.is_file() && !ft.is_dir() {
+                    return WalkState::Continue;
+                }
+                let path = entry.path();
+                let rel = path.strip_prefix(&root).unwrap_or(path).to_string_lossy();
+                let s = if ft.is_dir() {
+                    format!("./{}/", rel)
+                } else {
+                    format!("./{}", rel)
+                };
+                if tx.send(s).is_err() {
+                    WalkState::Quit
+                } else {
+                    WalkState::Continue
+                }
+            })
+        });
+    });
+
+    for s in rx {
+        if !emit(s) {
+            break;
         }
-        let path = entry.path();
-        let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
-        if path.is_file() {
-            if dirs_only {
-                continue;
-            }
-            if !emit(format!("./{}", rel)) {
-                return false;
-            }
-        } else if path.is_dir() {
-            if !emit(format!("./{}/", rel)) {
-                return false;
-            }
-            if !walk_visit(root, &path, depth + 1, max_depth, dirs_only, emit) {
-                return false;
-            }
-        }
     }
-    true
 }
 
 #[cfg(test)]

@@ -387,7 +387,14 @@ fn run_picker(
         }
 
         if layout.is_none() {
-            draw_picker(&query, &filtered, selected, &mut offset)?;
+            draw_picker(
+                &query,
+                &filtered,
+                selected,
+                &mut offset,
+                master.len(),
+                streaming,
+            )?;
             // フル再描画後にレイアウトを計算
             let visible = filtered.len().saturating_sub(offset).min(view);
             let mut cand_rows = Vec::with_capacity(visible);
@@ -585,6 +592,7 @@ const COLOR_QUERY: Color = Color::AnsiValue(117); // 淡青 (iceberg)
 const COLOR_SELECTED: Color = Color::AnsiValue(253); // 薄白
 const COLOR_SEL_BG: Color = Color::AnsiValue(237); // 暗灰背景
 const COLOR_NORMAL: Color = Color::AnsiValue(146); // 灰色寄り淡青
+const COLOR_COUNT: Color = Color::AnsiValue(243); // 灰 (件数表示)
 
 /// ピッカーを 1 フレーム描画する。
 ///
@@ -599,6 +607,8 @@ fn draw_picker(
     filtered: &[String],
     selected: usize,
     offset: &mut usize,
+    total: usize,
+    streaming: bool,
 ) -> io::Result<()> {
     let (term_cols, term_rows) = terminal::size()?;
     let cols = term_cols as usize;
@@ -614,13 +624,28 @@ fn draw_picker(
     }
     let visible = filtered.len().saturating_sub(*offset).min(view);
 
-    // クエリ行: 🔍 は表示幅2なのでプレフィックス幅=3 ("🔍 ")、折り返し防止で切り詰め
+    // 右端に「マッチ数/総数」を表示。走査途中は総数の後ろに … を付ける。
+    let count_str = format!(
+        "{}/{}{}",
+        filtered.len(),
+        total,
+        if streaming { "…" } else { "" }
+    );
+    let count_width = count_str.width() as u16;
+
+    // クエリ行: 🔍 は表示幅2なのでプレフィックス幅=3 ("🔍 ")
+    // カウントと被らないようクエリを切り詰め、右端に右寄せで配置する。
+    let query_max = cols.saturating_sub(count_str.width() + 1);
     queue!(
         stdout(),
         cursor::MoveToColumn(0),
         Clear(ClearType::FromCursorDown),
         SetForegroundColor(COLOR_QUERY),
-        Print(truncate_to_cols(&format!("🔍 {}", query), cols)),
+        Print(truncate_to_cols(&format!("🔍 {}", query), query_max)),
+        ResetColor,
+        cursor::MoveToColumn(term_cols - count_width),
+        SetForegroundColor(COLOR_COUNT),
+        Print(&count_str),
         ResetColor,
         Print("\r\n"),
     )?;
