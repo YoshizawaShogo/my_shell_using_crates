@@ -453,12 +453,31 @@ fn compute_ghost(ed: &LineEditor, history: &History) -> Option<String> {
 }
 
 fn fetch_git_branch() -> Option<String> {
-    std::process::Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s != "HEAD")
+    let cwd = std::env::current_dir().ok()?;
+    let mut dir = cwd.as_path();
+    loop {
+        let dot_git = dir.join(".git");
+        if dot_git.is_dir() {
+            let head = std::fs::read_to_string(dot_git.join("HEAD")).ok()?;
+            return head
+                .trim()
+                .strip_prefix("ref: refs/heads/")
+                .map(str::to_string);
+        } else if dot_git.is_file() {
+            // git worktree: ".git" ファイルに "gitdir: <path>" が入っている
+            let content = std::fs::read_to_string(&dot_git).ok()?;
+            let gitdir = content.trim().strip_prefix("gitdir: ")?;
+            let gitdir_path = if gitdir.starts_with('/') {
+                std::path::PathBuf::from(gitdir)
+            } else {
+                dir.join(gitdir)
+            };
+            let head = std::fs::read_to_string(gitdir_path.join("HEAD")).ok()?;
+            return head
+                .trim()
+                .strip_prefix("ref: refs/heads/")
+                .map(str::to_string);
+        }
+        dir = dir.parent()?;
+    }
 }
