@@ -187,8 +187,7 @@ pub fn get_ghost(prefix: &str, cwd: &Path, history: &History) -> Option<String> 
     HistoryProvider
         .candidates(&pctx)
         .into_iter()
-        .filter(|full| ghost_paths_exist(full, cwd))
-        .next()
+        .find(|full| ghost_paths_exist(full, cwd))
         .map(|full| full[prefix.len()..].to_string())
         .filter(|s| !s.is_empty())
 }
