@@ -21,6 +21,9 @@ pub struct TabContext<'a> {
     pub lines_above_cursor: u16,
     /// fg/bg 補完用のジョブ名 (各ジョブのコマンド先頭トークン)
     pub jobs: &'a [String],
+    /// 前回の Tab 補完が完了した位置 (prefix 内バイトオフセット)。
+    /// Some(n) のとき prefix[..n] が補完済み、prefix[n..] がユーザーの追加フィルタ。
+    pub tab_end: Option<usize>,
 }
 
 /// Tab 補完を実行する。
@@ -32,11 +35,23 @@ pub struct TabContext<'a> {
 pub fn tab_complete(ctx: TabContext<'_>) -> std::io::Result<Selection> {
     let kind = classify(ctx.prefix);
     let token = current_token(ctx.prefix);
+    let token_start = token_start_pos(ctx.prefix);
+
+    // tab_end をトークン内オフセットに変換する。
+    // tab_end がトークン範囲 [token_start, token_start+token.len()] 内にあれば有効。
+    let tab_end_in_token = ctx.tab_end.and_then(|te| {
+        if te >= token_start && te <= token_start + token.len() {
+            Some(te - token_start)
+        } else {
+            None
+        }
+    });
 
     let pctx = CompletionContext {
         prefix: token,
         cwd: ctx.cwd,
         history: ctx.history,
+        tab_end_in_token,
     };
 
     let cands = match &kind {
@@ -167,13 +182,36 @@ pub fn get_ghost(prefix: &str, cwd: &Path, history: &History) -> Option<String> 
         prefix,
         cwd,
         history,
+        tab_end_in_token: None,
     };
     HistoryProvider
         .candidates(&pctx)
         .into_iter()
+        .filter(|full| ghost_paths_exist(full, cwd))
         .next()
         .map(|full| full[prefix.len()..].to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// コマンド中のパス風トークン (`/`・`./`・`../`・`~/` 始まり) がすべて実在するか確認する。
+/// パス以外のトークンは無視する。
+fn ghost_paths_exist(cmd: &str, cwd: &Path) -> bool {
+    let Ok(tokens) = shell_words::split(cmd) else {
+        return true;
+    };
+    tokens.iter().all(|t| {
+        let path = if let Some(rest) = t.strip_prefix("~/") {
+            let home = std::env::var("HOME").unwrap_or_default();
+            std::path::PathBuf::from(home).join(rest)
+        } else if t.starts_with('/') {
+            std::path::PathBuf::from(t)
+        } else if t.starts_with("./") || t.starts_with("../") {
+            cwd.join(t)
+        } else {
+            return true; // パス風でないトークンはスキップ
+        };
+        path.exists()
+    })
 }
 
 // ─── 補完種別の分類 ───────────────────────────────────────────────────────────

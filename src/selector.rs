@@ -562,6 +562,11 @@ fn score_match(cand: &str, words: &[String]) -> Option<i64> {
 
     let mut score = 0i64;
 
+    // 浅さボーナス: depth 1 = +15、depth 2 = +12、…、depth 5 = +3、depth 6以上 = 0
+    // Phase 1 (浅い) の結果が Phase 2 (深い) より自然に上位になる。
+    let depth = cand[2..].trim_end_matches('/').split('/').count();
+    score += (6usize.saturating_sub(depth)) as i64 * 3;
+
     // basename ボーナス: いずれかのワードが basename 部分に含まれる
     let basename_start = hay.rfind('/').map(|i| i + 1).unwrap_or(0);
     let basename = &hay[basename_start..];

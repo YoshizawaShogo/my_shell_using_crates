@@ -169,10 +169,16 @@ fn cd(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
 // ─── popd ─────────────────────────────────────────────────────────────────────
 
 fn popd(_args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
-    match ctx.dir_stack.pop() {
-        Some(prev) => std::env::set_current_dir(&prev),
-        None => Err(io::Error::other("directory stack is empty")),
+    let dest = ctx
+        .dir_stack
+        .pop()
+        .ok_or_else(|| io::Error::other("directory stack is empty"))?;
+    let before = std::env::current_dir();
+    std::env::set_current_dir(&dest)?;
+    if let Ok(cwd) = before {
+        unsafe { std::env::set_var("OLDPWD", &cwd) };
     }
+    Ok(())
 }
 
 // ─── abbr ─────────────────────────────────────────────────────────────────────

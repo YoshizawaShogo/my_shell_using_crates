@@ -54,10 +54,20 @@ pub struct LineEditor {
     /// ヘッダ行を含む先頭行からカーソル行までの行数
     /// `redraw_prompt` が管理する。次回の `MoveUp` に使う。
     lines_above_cursor: u16,
+    /// Tab 補完で挿入されたテキストの終端位置 (buf 内バイトオフセット)。
+    /// これより後ろに手入力された文字がフィルタとして機能する。
+    /// 単語境界 (空白) や逆方向の編集でリセットされる。
+    tab_end: Option<usize>,
 }
 
 impl LineEditor {
     pub fn insert(&mut self, c: char) {
+        if let Some(te) = self.tab_end {
+            // 空白 → 単語確定、またはカーソルが補完終端より前 → リセット
+            if c.is_whitespace() || self.cursor < te {
+                self.tab_end = None;
+            }
+        }
         self.buf.insert(self.cursor, c);
         self.cursor += c.len_utf8();
     }
@@ -66,6 +76,9 @@ impl LineEditor {
         if let Some(prev) = self.prev_boundary() {
             self.buf.remove(prev);
             self.cursor = prev;
+            if self.tab_end.is_some_and(|te| self.cursor < te) {
+                self.tab_end = None;
+            }
         }
     }
 
@@ -79,30 +92,36 @@ impl LineEditor {
         if let Some(prev) = self.prev_boundary() {
             self.cursor = prev;
         }
+        self.tab_end = None;
     }
 
     pub fn move_right(&mut self) {
         if let Some(c) = self.buf[self.cursor..].chars().next() {
             self.cursor += c.len_utf8();
         }
+        self.tab_end = None;
     }
 
     pub fn move_home(&mut self) {
         self.cursor = 0;
+        self.tab_end = None;
     }
 
     pub fn move_end(&mut self) {
         self.cursor = self.buf.len();
+        self.tab_end = None;
     }
 
     /// Ctrl+Left: 単語または '/' 単位でカーソルを左へ移動する
     pub fn move_word_left(&mut self) {
         self.cursor = word_left_pos(&self.buf[..self.cursor]);
+        self.tab_end = None;
     }
 
     /// Ctrl+Right: 単語または '/' 単位でカーソルを右へ移動する
     pub fn move_word_right(&mut self) {
         self.cursor = word_right_pos(&self.buf, self.cursor);
+        self.tab_end = None;
     }
 
     /// Ctrl+W: 単語または '/' 単位でカーソル直前を削除する
@@ -110,17 +129,20 @@ impl LineEditor {
         let new_pos = word_left_pos(&self.buf[..self.cursor]);
         self.buf.drain(new_pos..self.cursor);
         self.cursor = new_pos;
+        self.tab_end = None;
     }
 
     /// Ctrl+U: カーソルより前をすべて削除する。
     pub fn kill_to_start(&mut self) {
         self.buf.drain(..self.cursor);
         self.cursor = 0;
+        self.tab_end = None;
     }
 
     /// Ctrl+K: カーソル以降をすべて削除する。
     pub fn kill_to_end(&mut self) {
         self.buf.truncate(self.cursor);
+        self.tab_end = None;
     }
 
     /// カーソル前の `n` バイトを削除する。
@@ -129,17 +151,30 @@ impl LineEditor {
         let start = end.saturating_sub(n);
         self.buf.drain(start..end);
         self.cursor = start;
+        self.tab_end = None;
     }
 
     pub fn take(&mut self) -> String {
         self.cursor = 0;
         self.lines_above_cursor = 0;
+        self.tab_end = None;
         std::mem::take(&mut self.buf)
     }
 
     pub fn set(&mut self, s: String) {
         self.buf = s;
         self.cursor = self.buf.len();
+        self.tab_end = None;
+    }
+
+    /// Tab 補完後に呼ぶ: 現在のカーソル位置を補完終端として記録する。
+    pub fn set_tab_end(&mut self) {
+        self.tab_end = Some(self.cursor);
+    }
+
+    /// Tab 補完終端位置を返す (buf 内バイトオフセット)。
+    pub fn tab_end(&self) -> Option<usize> {
+        self.tab_end
     }
 
     pub fn insert_str(&mut self, s: &str) {

@@ -14,6 +14,9 @@ pub struct CompletionContext<'a> {
     pub prefix: &'a str,
     pub cwd: &'a Path,
     pub history: &'a History,
+    /// 前回の Tab 補完で挿入されたテキストがトークン内のどこで終わるか (バイトオフセット)。
+    /// Some(n) のとき prefix[..n] が補完済み部分、prefix[n..] がユーザー手入力のフィルタ。
+    pub tab_end_in_token: Option<usize>,
 }
 
 // ─── トレイト ─────────────────────────────────────────────────────────────────
@@ -99,28 +102,84 @@ impl CandidateProvider for PathProvider {
             return vec![];
         };
 
-        // 入力トークンを「部分一致 (大小無視)」で照合する。例: `init` は `my_init.bash` に
-        // マッチする。単一なら確定、複数なら共通接頭辞まで補完するのは呼び出し側 (completion)。
+        // tab_end がある場合: file_prefix を [completed_base][user_filter] に分割する。
+        // ディレクトリ部分 (display_prefix) は tab_end の計算に含まれているので引く。
+        let dir_prefix_len = display_prefix.len();
+        let (base_lower, filter_lower) = match ctx.tab_end_in_token {
+            Some(te) if te > dir_prefix_len && te <= dir_prefix_len + file_prefix.len() => {
+                let split = te - dir_prefix_len;
+                (
+                    file_prefix[..split].to_lowercase(),
+                    file_prefix[split..].to_lowercase(),
+                )
+            }
+            _ => (file_prefix.to_lowercase(), String::new()),
+        };
+        let has_filter = !filter_lower.is_empty();
         let needle = file_prefix.to_lowercase();
-        let mut results: Vec<String> = entries
-            .flatten()
-            .filter_map(|e| {
+
+        if has_filter {
+            // tab_end あり: base がプレフィックス一致 AND user_filter が部分一致
+            let mut results: Vec<String> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name();
+                    let name_lower = name.to_string_lossy().to_lowercase();
+                    if !name_lower.starts_with(&base_lower) || !name_lower.contains(&filter_lower) {
+                        return None;
+                    }
+                    let is_dir = e.path().is_dir();
+                    if self.dirs_only && !is_dir {
+                        return None;
+                    }
+                    let slash = if is_dir { "/" } else { "" };
+                    Some(format!(
+                        "{}{}{}",
+                        display_prefix,
+                        name.to_string_lossy(),
+                        slash
+                    ))
+                })
+                .collect();
+            results.sort_unstable();
+            results
+        } else {
+            // tab_end なし: prefix 一致優先。prefix 一致があれば contains は除外。
+            let mut prefix_matches: Vec<String> = Vec::new();
+            let mut contains_matches: Vec<String> = Vec::new();
+
+            for e in entries.flatten() {
                 let name = e.file_name();
                 let name_str = name.to_string_lossy();
-                if !name_str.to_lowercase().contains(&needle) {
-                    return None;
+                let name_lower = name_str.to_lowercase();
+
+                let is_prefix = name_lower.starts_with(&needle);
+                let is_contains = !is_prefix && name_lower.contains(&needle);
+                if !is_prefix && !is_contains {
+                    continue;
                 }
+
                 let is_dir = e.path().is_dir();
                 if self.dirs_only && !is_dir {
-                    return None;
+                    continue;
                 }
                 let slash = if is_dir { "/" } else { "" };
-                Some(format!("{}{}{}", display_prefix, name_str, slash))
-            })
-            .collect();
+                let candidate = format!("{}{}{}", display_prefix, name_str, slash);
+                if is_prefix {
+                    prefix_matches.push(candidate);
+                } else {
+                    contains_matches.push(candidate);
+                }
+            }
 
-        results.sort_unstable();
-        results
+            prefix_matches.sort_unstable();
+            if prefix_matches.is_empty() {
+                contains_matches.sort_unstable();
+                contains_matches
+            } else {
+                prefix_matches
+            }
+        }
     }
 }
 
@@ -215,48 +274,71 @@ fn walk_parallel(
     emit: &mut dyn FnMut(String) -> bool,
 ) {
     use ignore::{WalkBuilder, WalkState};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
 
     let (tx, rx) = mpsc::channel::<String>();
-    let walker = WalkBuilder::new(root)
-        .max_depth(Some(max_depth))
-        .build_parallel();
-
     let root = root.to_path_buf();
+
     std::thread::spawn(move || {
-        walker.run(|| {
-            let tx = tx.clone();
-            let root = root.clone();
-            Box::new(move |result| {
-                let Ok(entry) = result else {
-                    return WalkState::Continue;
-                };
-                if entry.depth() == 0 {
-                    return WalkState::Continue;
-                }
-                let Some(ft) = entry.file_type() else {
-                    return WalkState::Continue;
-                };
-                if dirs_only && !ft.is_dir() {
-                    return WalkState::Continue;
-                }
-                if !ft.is_file() && !ft.is_dir() {
-                    return WalkState::Continue;
-                }
-                let path = entry.path();
-                let rel = path.strip_prefix(&root).unwrap_or(path).to_string_lossy();
-                let s = if ft.is_dir() {
-                    format!("./{}/", rel)
-                } else {
-                    format!("./{}", rel)
-                };
-                if tx.send(s).is_err() {
-                    WalkState::Quit
-                } else {
-                    WalkState::Continue
-                }
-            })
-        });
+        let sent = Arc::new(AtomicUsize::new(0));
+
+        // walker を走らせる共通クロージャ。walker はスレッド内で同期的に完了する。
+        let run_walker =
+            |walker: ignore::WalkParallel, tx: &mpsc::Sender<String>, sent: &Arc<AtomicUsize>| {
+                walker.run(|| {
+                    let tx = tx.clone();
+                    let root = root.clone();
+                    let sent = sent.clone();
+                    Box::new(move |result| {
+                        let Ok(entry) = result else {
+                            return WalkState::Continue;
+                        };
+                        if entry.depth() == 0 {
+                            return WalkState::Continue;
+                        }
+                        let Some(ft) = entry.file_type() else {
+                            return WalkState::Continue;
+                        };
+                        if dirs_only && !ft.is_dir() {
+                            return WalkState::Continue;
+                        }
+                        if !ft.is_file() && !ft.is_dir() {
+                            return WalkState::Continue;
+                        }
+                        let path = entry.path();
+                        let rel = path.strip_prefix(&root).unwrap_or(path).to_string_lossy();
+                        let s = if ft.is_dir() {
+                            format!("./{}/", rel)
+                        } else {
+                            format!("./{}", rel)
+                        };
+                        if tx.send(s).is_err() {
+                            WalkState::Quit
+                        } else {
+                            sent.fetch_add(1, Ordering::Relaxed);
+                            WalkState::Continue
+                        }
+                    })
+                });
+            };
+
+        // Phase 1: 通常深さ (max_depth) で走査
+        let w1 = WalkBuilder::new(&root)
+            .max_depth(Some(max_depth))
+            .build_parallel();
+        run_walker(w1, &tx, &sent);
+
+        // Phase 2: 常により深く (max_depth+1 〜 max_depth*2) を追加走査する。
+        // スコアリング側で浅い結果が上位になるよう調整してあるので、
+        // Phase 2 の結果が Phase 1 結果を押しのけることはない。
+        let w2 = WalkBuilder::new(&root)
+            .min_depth(Some(max_depth + 1))
+            .max_depth(Some(max_depth * 2))
+            .build_parallel();
+        run_walker(w2, &tx, &sent);
+        // tx がここで drop → rx 側のチャネルが閉じる
     });
 
     for s in rx {

@@ -23,6 +23,21 @@ pub fn execute_command(cmd: &str, ctx: &mut ShellContext, interactive: bool) -> 
         return Ok(());
     }
 
+    // ドットのみで構成され 2 個以上のトークンを相対パスに展開する。
+    // コマンド位置 (行全体がドット) → `cd <path>`
+    // 引数位置 (ls .... 等)          → トークンをパスに置換して渡す
+    let dot_expanded: String;
+    let trimmed = if trimmed.len() >= 2 && trimmed.chars().all(|c| c == '.') {
+        let levels = trimmed.len() - 1;
+        dot_expanded = format!("cd {}", vec![".."; levels].join("/"));
+        dot_expanded.as_str()
+    } else if let Some(s) = expand_dot_args(trimmed) {
+        dot_expanded = s;
+        dot_expanded.as_str()
+    } else {
+        trimmed
+    };
+
     // 先頭トークンの abbr を 1 段だけ展開する (abbr は先頭のみ。alias は sh に委ねる)。
     let (first, rest) = split_first_word(trimmed);
     let abbr_line: String = match ctx.abbrs.get(first) {
@@ -105,6 +120,28 @@ pub fn execute_command(cmd: &str, ctx: &mut ShellContext, interactive: bool) -> 
 }
 
 /// 先頭の単語と、それに続く残り (前後の空白を除く) に分割する。
+/// 行中の引数位置にあるドット列 (`..` 以上) を相対パスに展開する。
+/// 変換が不要なら `None` を返す。
+fn expand_dot_args(line: &str) -> Option<String> {
+    let mut changed = false;
+    let result: Vec<String> = line
+        .split_whitespace()
+        .map(|t| {
+            if t.len() >= 2 && t.chars().all(|c| c == '.') {
+                changed = true;
+                vec![".."; t.len() - 1].join("/")
+            } else {
+                t.to_string()
+            }
+        })
+        .collect();
+    if changed {
+        Some(result.join(" "))
+    } else {
+        None
+    }
+}
+
 fn split_first_word(s: &str) -> (&str, &str) {
     let s = s.trim_start();
     match s.find(char::is_whitespace) {

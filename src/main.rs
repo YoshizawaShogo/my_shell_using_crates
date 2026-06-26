@@ -156,9 +156,13 @@ impl Shell {
                     history: &self.history,
                     lines_above_cursor: lines_above,
                     jobs: &job_names,
+                    tab_end: self.ed.tab_end(),
                 };
                 match completion::tab_complete(tab_ctx)? {
-                    Selection::Chosen(choice) => self.ed.set(choice),
+                    Selection::Chosen(choice) => {
+                        self.ed.set(choice);
+                        self.ed.set_tab_end();
+                    }
                     Selection::Aborted | Selection::Dismissed => {}
                     Selection::InsertChar(c) => self.ed.insert(c),
                     Selection::Backspace => self.ed.backspace(),
