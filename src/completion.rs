@@ -81,7 +81,13 @@ pub fn tab_complete(ctx: TabContext<'_>) -> std::io::Result<Selection> {
 
     // 候補が 1 つなら即確定
     if cands.len() == 1 {
-        return Ok(Selection::Chosen(replace_token(ctx.prefix, &cands[0])));
+        let base = replace_token(ctx.prefix, &cands[0]);
+        let result = if cands[0].ends_with('/') {
+            base
+        } else {
+            base + " "
+        };
+        return Ok(Selection::Chosen(result));
     }
 
     // 共通プレフィックスが現在トークンより長ければ延長して返す (次の Tab でメニュー)
@@ -112,7 +118,13 @@ pub fn tab_complete(ctx: TabContext<'_>) -> std::io::Result<Selection> {
             } else {
                 display
             };
-            Ok(Selection::Chosen(replace_token(ctx.prefix, &full)))
+            let base = replace_token(ctx.prefix, &full);
+            let result = if full.ends_with('/') {
+                base
+            } else {
+                base + " "
+            };
+            Ok(Selection::Chosen(result))
         }
         other => Ok(other),
     }
