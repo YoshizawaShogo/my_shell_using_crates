@@ -141,6 +141,8 @@ impl Shell {
 
             ShellEvent::ShowCompletion => {
                 let prefix = self.ed.line()[..self.ed.cursor()].to_string();
+                // カーソル後ろのテキストは補完で消さずに残す。
+                let suffix = self.ed.line()[self.ed.cursor()..].to_string();
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let lines_above = self.ed.lines_above_cursor();
                 // fg/bg 補完用にジョブのコマンド名 (先頭トークン) を渡す。
@@ -160,8 +162,7 @@ impl Shell {
                 };
                 match completion::tab_complete(tab_ctx)? {
                     Selection::Chosen(choice) => {
-                        self.ed.set(choice);
-                        self.ed.set_tab_end();
+                        self.ed.apply_completion(choice, &suffix);
                     }
                     Selection::Aborted | Selection::Dismissed => {}
                     Selection::InsertChar(c) => self.ed.insert(c),

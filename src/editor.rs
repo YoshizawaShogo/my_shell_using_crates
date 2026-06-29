@@ -124,9 +124,11 @@ impl LineEditor {
         self.tab_end = None;
     }
 
-    /// Ctrl+W: 単語または '/' 単位でカーソル直前を削除する
+    /// Ctrl+W: 単語単位でカーソル直前を削除する。
+    /// 区切りは空白だが、クォート (`'…'` / `"…"`) やエスケープ (`\ `) 内の
+    /// 空白は区切りとみなさず、シェルのトークン同様にまとめて削除する。
     pub fn delete_word_backward(&mut self) {
-        let new_pos = word_left_pos(&self.buf[..self.cursor]);
+        let new_pos = shell_word_left_pos(&self.buf[..self.cursor]);
         self.buf.drain(new_pos..self.cursor);
         self.cursor = new_pos;
         self.tab_end = None;
@@ -167,8 +169,13 @@ impl LineEditor {
         self.tab_end = None;
     }
 
-    /// Tab 補完後に呼ぶ: 現在のカーソル位置を補完終端として記録する。
-    pub fn set_tab_end(&mut self) {
+    /// Tab 補完結果を適用する。
+    /// カーソル前を `before` に置き換え、カーソル後ろの `suffix` はそのまま残す。
+    /// カーソルは補完境界 (`before` の末尾) に置き、そこを補完終端として記録する。
+    pub fn apply_completion(&mut self, before: String, suffix: &str) {
+        self.cursor = before.len();
+        self.buf = before;
+        self.buf.push_str(suffix);
         self.tab_end = Some(self.cursor);
     }
 
@@ -354,6 +361,61 @@ fn word_left_pos(s: &str) -> usize {
     if i == 0 { 0 } else { chars[i].0 }
 }
 
+/// Ctrl+W 用: クォート/エスケープを尊重した最後の単語の開始位置を返す。
+/// クォート外の空白だけを区切りとし、最後の単語＋直後の末尾空白をまとめて
+/// 消せるよう、その単語の開始バイト位置を返す。
+fn shell_word_left_pos(s: &str) -> usize {
+    #[derive(PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut quote = Quote::None;
+    let mut escaped = false;
+    let mut in_word = false;
+    let mut last_start = 0usize;
+    for (i, c) in s.char_indices() {
+        if escaped {
+            // 直前の `\` がこの文字をエスケープ。単語の一部として継続。
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Quote::Single => {
+                if c == '\'' {
+                    quote = Quote::None;
+                }
+                continue;
+            }
+            Quote::Double => {
+                if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    quote = Quote::None;
+                }
+                continue;
+            }
+            Quote::None => {}
+        }
+        if c.is_whitespace() {
+            in_word = false;
+            continue;
+        }
+        if !in_word {
+            in_word = true;
+            last_start = i;
+        }
+        match c {
+            '\\' => escaped = true,
+            '\'' => quote = Quote::Single,
+            '"' => quote = Quote::Double,
+            _ => {}
+        }
+    }
+    last_start
+}
+
 fn word_right_pos(s: &str, cursor: usize) -> usize {
     let rest = &s[cursor..];
     let chars: Vec<(usize, char)> = rest.char_indices().collect();
@@ -401,6 +463,24 @@ mod tests {
         assert_eq!(word_left_pos("foo"), 0);
         assert_eq!(word_left_pos("a/b/c"), 4);
         assert_eq!(word_left_pos(""), 0);
+    }
+
+    #[test]
+    fn shell_word_left_ignores_slash_and_respects_quotes() {
+        // '/' は区切りにしない（パスはまとめて1単語）
+        assert_eq!(shell_word_left_pos("cd /foo/bar"), 3);
+        // 通常の空白区切り
+        assert_eq!(shell_word_left_pos("foo bar"), 4);
+        // 末尾の空白ごと最後の単語を削除対象にする
+        assert_eq!(shell_word_left_pos("foo bar  "), 4);
+        // クォート内の空白は区切りにしない
+        assert_eq!(shell_word_left_pos("a 'b c'"), 2);
+        assert_eq!(shell_word_left_pos("a \"b c\""), 2);
+        // エスケープした空白も区切りにしない
+        assert_eq!(shell_word_left_pos("a b\\ c"), 2);
+        // 空・単一単語
+        assert_eq!(shell_word_left_pos(""), 0);
+        assert_eq!(shell_word_left_pos("foo"), 0);
     }
 
     #[test]
