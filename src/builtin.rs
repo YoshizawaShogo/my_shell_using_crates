@@ -45,27 +45,39 @@ impl Default for ShellContext {
     }
 }
 
-/// 永続化ファイルを読み込む。MRU 順 (ファイルの並び順) を保ったまま、
-/// 既に存在しないパスは捨てる (自動掃除)。
+/// 永続化ファイルを読み込む。末尾 (新しい方) を優先して dedup し、
+/// 存在しないパスを除去したうえで MRU 順 (先頭が直近) で返す。
 fn load_recent_paths() -> Vec<PathBuf> {
     let path = expand_tilde(PATHS_FILE);
-    std::fs::read_to_string(path)
+    let lines: Vec<PathBuf> = std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
         .filter(|l| !l.is_empty())
         .map(PathBuf::from)
-        .filter(|p| p.exists())
-        .collect()
+        .collect();
+
+    // 末尾 (新しい方) を優先して dedup → 結果は新しい順 (MRU)
+    let mut seen = std::collections::HashSet::new();
+    let mut deduped: Vec<PathBuf> = lines
+        .into_iter()
+        .rev()
+        .filter(|p| seen.insert(p.clone()))
+        .collect();
+
+    deduped.retain(|p| p.exists());
+    deduped.truncate(MAX_RECENT_PATHS);
+    deduped
 }
 
-fn save_recent_paths(paths: &[PathBuf]) -> io::Result<()> {
-    let path = expand_tilde(PATHS_FILE);
-    let content = paths
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("\n");
-    std::fs::write(path, format!("{}\n", content))
+/// パスをファイル末尾に 1 行追記する。
+fn append_recent_path(p: &Path) -> io::Result<()> {
+    use std::io::Write;
+    let file_path = expand_tilde(PATHS_FILE);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file_path)?;
+    writeln!(file, "{}", p.to_string_lossy())
 }
 
 /// コマンドの引数群から実在するパスを `recent_paths` に MRU 記録する。
@@ -88,12 +100,12 @@ pub fn record_arg_paths(ctx: &mut ShellContext, args: &[String], cwd: &Path) {
         };
         // MRU: 既存を取り除いて先頭へ。
         ctx.recent_paths.retain(|x| x != &canon);
-        ctx.recent_paths.insert(0, canon);
+        ctx.recent_paths.insert(0, canon.clone());
+        let _ = append_recent_path(&canon);
         changed = true;
     }
     if changed {
         ctx.recent_paths.truncate(MAX_RECENT_PATHS);
-        let _ = save_recent_paths(&ctx.recent_paths);
     }
 }
 

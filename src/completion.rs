@@ -90,9 +90,11 @@ pub fn tab_complete(ctx: TabContext<'_>) -> std::io::Result<Selection> {
         return Ok(Selection::Chosen(result));
     }
 
-    // 共通プレフィックスが現在トークンより長ければ延長して返す (次の Tab でメニュー)
+    // 共通プレフィックスが現在トークンより長く、かつ入力が共通プレフィックスの
+    // 前方一致である場合のみ延長する (次の Tab でメニュー)。
+    // 部分一致(contains)候補だと common_prefix が入力と無関係になるため除外する。
     let cp = common_prefix(&cands);
-    if cp.len() > token.len() {
+    if cp.len() > token.len() && cp.to_lowercase().starts_with(&token.to_lowercase()) {
         return Ok(Selection::Chosen(replace_token(ctx.prefix, cp)));
     }
 
@@ -111,7 +113,9 @@ pub fn tab_complete(ctx: TabContext<'_>) -> std::io::Result<Selection> {
         })
         .collect();
 
-    match selector::run_grid_menu(&display_cands, ctx.lines_above_cursor)? {
+    // ユーザーが実際に入力した部分 (ディレクトリ部を除く) をハイライト用に渡す。
+    let highlight = &token[strip_len..];
+    match selector::run_grid_menu(&display_cands, ctx.lines_above_cursor, highlight)? {
         Selection::Chosen(display) => {
             let full = if strip_len > 0 {
                 format!("{}{}", token, display)

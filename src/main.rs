@@ -13,7 +13,7 @@ use crossterm::{
     cursor,
     event::{self, Event},
     execute,
-    style::Print,
+    style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{Clear, ClearType},
 };
 use std::io::{self, stdout};
@@ -66,7 +66,6 @@ impl Shell {
             &mut self.ed,
             self.git_branch.as_deref(),
             self.ghost.as_deref(),
-            self.ctx.last_status,
         )
     }
 
@@ -120,6 +119,18 @@ impl Shell {
                 execute_command(&cmd, &mut self.ctx, true)?;
                 if !cmd.trim().is_empty() {
                     self.history.add(&cmd);
+                }
+                if self.ctx.last_status != 0 {
+                    execute!(
+                        stdout(),
+                        SetForegroundColor(Color::Rgb {
+                            r: 0xe2,
+                            g: 0x78,
+                            b: 0x78
+                        }),
+                        Print(format!("↳ exit {}\r\n", self.ctx.last_status)),
+                        ResetColor,
+                    )?;
                 }
                 self.git_branch = fetch_git_branch();
                 self.ghost = None;

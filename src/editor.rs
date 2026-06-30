@@ -34,17 +34,6 @@ const COLOR_GHOST: Color = Color::Rgb {
     g: 0x70,
     b: 0x89,
 }; // muted
-// `$` プロンプトは直前コマンドの終了ステータスで色を変える (成功=緑 / 失敗=赤)。
-const COLOR_PROMPT_OK: Color = Color::Rgb {
-    r: 0xb4,
-    g: 0xbe,
-    b: 0x82,
-}; // green
-const COLOR_PROMPT_ERR: Color = Color::Rgb {
-    r: 0xe2,
-    g: 0x78,
-    b: 0x78,
-}; // red
 
 #[derive(Default)]
 pub struct LineEditor {
@@ -112,15 +101,15 @@ impl LineEditor {
         self.tab_end = None;
     }
 
-    /// Ctrl+Left: 単語または '/' 単位でカーソルを左へ移動する
+    /// Ctrl+Left: 単語単位でカーソルを左へ移動する (Ctrl+W と同じ単語定義)。
     pub fn move_word_left(&mut self) {
-        self.cursor = word_left_pos(&self.buf[..self.cursor]);
+        self.cursor = shell_word_left_pos(&self.buf[..self.cursor]);
         self.tab_end = None;
     }
 
-    /// Ctrl+Right: 単語または '/' 単位でカーソルを右へ移動する
+    /// Ctrl+Right: 単語単位でカーソルを右へ移動する (Ctrl+W と同じ単語定義)。
     pub fn move_word_right(&mut self) {
-        self.cursor = word_right_pos(&self.buf, self.cursor);
+        self.cursor = shell_word_right_pos(&self.buf, self.cursor);
         self.tab_end = None;
     }
 
@@ -236,7 +225,6 @@ pub fn redraw_prompt(
     ed: &mut LineEditor,
     git_branch: Option<&str>,
     ghost: Option<&str>,
-    last_status: i32,
 ) -> io::Result<()> {
     let (term_cols, _) = terminal::size()?;
 
@@ -284,18 +272,7 @@ pub fn redraw_prompt(
     // wrap-pending 対策: cursor_display が term_cols の倍数のとき端末は行末待機状態
     // になる。\r\n で折り返しを確定してからカーソル物理列を 0 にリセット。
     let cursor_display = PROMPT_PREFIX_WIDTH + ed.buf[..ed.cursor].width() as u16;
-    let prompt_color = if last_status == 0 {
-        COLOR_PROMPT_OK
-    } else {
-        COLOR_PROMPT_ERR
-    };
-    queue!(
-        stdout(),
-        SetForegroundColor(prompt_color),
-        Print(PROMPT_PREFIX),
-        ResetColor,
-        Print(&ed.buf[..ed.cursor]),
-    )?;
+    queue!(stdout(), Print(PROMPT_PREFIX), Print(&ed.buf[..ed.cursor]),)?;
     let cursor_physical_col = if cursor_display > 0 && cursor_display.is_multiple_of(term_cols) {
         queue!(stdout(), Print("\r\n"))?;
         0u16
@@ -341,27 +318,7 @@ fn header_physical_lines(display_width: usize, cols: u16) -> u16 {
     display_width.div_ceil(cols) as u16
 }
 
-fn is_word_sep(c: char) -> bool {
-    c.is_whitespace() || c == '/'
-}
-
-fn word_left_pos(s: &str) -> usize {
-    let chars: Vec<(usize, char)> = s.char_indices().collect();
-    let n = chars.len();
-    let mut i = n;
-    while i > 0 && is_word_sep(chars[i - 1].1) {
-        i -= 1;
-    }
-    if i == 0 {
-        return 0;
-    }
-    while i > 0 && !is_word_sep(chars[i - 1].1) {
-        i -= 1;
-    }
-    if i == 0 { 0 } else { chars[i].0 }
-}
-
-/// Ctrl+W 用: クォート/エスケープを尊重した最後の単語の開始位置を返す。
+/// Ctrl+W / Ctrl+Left 用: クォート/エスケープを尊重した最後の単語の開始位置を返す。
 /// クォート外の空白だけを区切りとし、最後の単語＋直後の末尾空白をまとめて
 /// 消せるよう、その単語の開始バイト位置を返す。
 fn shell_word_left_pos(s: &str) -> usize {
@@ -416,18 +373,58 @@ fn shell_word_left_pos(s: &str) -> usize {
     last_start
 }
 
-fn word_right_pos(s: &str, cursor: usize) -> usize {
-    let rest = &s[cursor..];
-    let chars: Vec<(usize, char)> = rest.char_indices().collect();
-    let n = chars.len();
-    let mut i = 0;
-    while i < n && is_word_sep(chars[i].1) {
-        i += 1;
+/// Ctrl+Right 用: クォート/エスケープを尊重した次の単語の末尾位置を返す。
+/// クォート外の空白だけを区切りとする (shell_word_left_pos の対称版)。
+fn shell_word_right_pos(s: &str, cursor: usize) -> usize {
+    #[derive(PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
     }
-    while i < n && !is_word_sep(chars[i].1) {
-        i += 1;
+    let mut quote = Quote::None;
+    let mut escaped = false;
+    let mut in_word = false;
+    for (i, c) in s[cursor..].char_indices() {
+        if escaped {
+            escaped = false;
+            in_word = true;
+            continue;
+        }
+        match quote {
+            Quote::Single => {
+                if c == '\'' {
+                    quote = Quote::None;
+                }
+                in_word = true;
+                continue;
+            }
+            Quote::Double => {
+                if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    quote = Quote::None;
+                }
+                in_word = true;
+                continue;
+            }
+            Quote::None => {}
+        }
+        if c.is_whitespace() {
+            if in_word {
+                return cursor + i;
+            }
+            continue;
+        }
+        in_word = true;
+        match c {
+            '\\' => escaped = true,
+            '\'' => quote = Quote::Single,
+            '"' => quote = Quote::Double,
+            _ => {}
+        }
     }
-    if i == n { s.len() } else { cursor + chars[i].0 }
+    s.len()
 }
 
 fn hostname() -> String {
@@ -457,15 +454,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn word_left_skips_separators() {
-        assert_eq!(word_left_pos("foo bar"), 4);
-        assert_eq!(word_left_pos("foo bar "), 4);
-        assert_eq!(word_left_pos("foo"), 0);
-        assert_eq!(word_left_pos("a/b/c"), 4);
-        assert_eq!(word_left_pos(""), 0);
-    }
-
-    #[test]
     fn shell_word_left_ignores_slash_and_respects_quotes() {
         // '/' は区切りにしない（パスはまとめて1単語）
         assert_eq!(shell_word_left_pos("cd /foo/bar"), 3);
@@ -484,10 +472,16 @@ mod tests {
     }
 
     #[test]
-    fn word_right_advances() {
-        assert_eq!(word_right_pos("foo bar", 0), 3);
-        assert_eq!(word_right_pos("foo bar", 3), 7);
-        assert_eq!(word_right_pos("a/b", 0), 1);
+    fn shell_word_right_advances() {
+        // 通常の空白区切り
+        assert_eq!(shell_word_right_pos("foo bar", 0), 3);
+        assert_eq!(shell_word_right_pos("foo bar", 3), 7);
+        // '/' は区切りにしない（パスはまとめて1単語）
+        assert_eq!(shell_word_right_pos("cd /foo/bar baz", 3), 11);
+        // クォート内の空白は区切りにしない
+        assert_eq!(shell_word_right_pos("'foo bar' baz", 0), 9);
+        // エスケープした空白も区切りにしない
+        assert_eq!(shell_word_right_pos("foo\\ bar baz", 0), 8);
     }
 
     #[test]

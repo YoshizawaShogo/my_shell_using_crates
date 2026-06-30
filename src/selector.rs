@@ -33,7 +33,11 @@ pub enum Selection {
 /// - Shift+Tab / ← : 前の候補
 /// - ↓ / ↑ : 同列の次/前の行
 /// - Enter : 確定、Esc : キャンセル、Ctrl+C : 中断
-pub fn run_grid_menu(candidates: &[String], _lines_above_cursor: u16) -> io::Result<Selection> {
+pub fn run_grid_menu(
+    candidates: &[String],
+    _lines_above_cursor: u16,
+    highlight: &str,
+) -> io::Result<Selection> {
     if candidates.is_empty() {
         return Ok(Selection::Dismissed);
     }
@@ -54,7 +58,7 @@ pub fn run_grid_menu(candidates: &[String], _lines_above_cursor: u16) -> io::Res
     let mut selected = 0usize;
     let mut outcome = Selection::Dismissed;
 
-    execute!(stdout(), Print("\r\n"))?;
+    execute!(stdout(), Print("\r\n"), cursor::Hide)?;
 
     // 初回はフル描画。以降は選択移動時に旧・新セルだけ上書きする。
     let mut need_full = true;
@@ -62,11 +66,11 @@ pub fn run_grid_menu(candidates: &[String], _lines_above_cursor: u16) -> io::Res
 
     loop {
         if need_full {
-            draw_grid(items, selected, n_cols, col_width, n_rows)?;
+            draw_grid(items, selected, n_cols, col_width, n_rows, highlight)?;
             need_full = false;
         } else if prev_selected != selected {
-            redraw_grid_cell(items, prev_selected, false, n_cols, col_width)?;
-            redraw_grid_cell(items, selected, true, n_cols, col_width)?;
+            redraw_grid_cell(items, prev_selected, false, n_cols, col_width, highlight)?;
+            redraw_grid_cell(items, selected, true, n_cols, col_width, highlight)?;
         }
         prev_selected = selected;
 
@@ -119,6 +123,7 @@ pub fn run_grid_menu(candidates: &[String], _lines_above_cursor: u16) -> io::Res
     // その後 redraw_prompt が lines_above_cursor を使ってヘッダー行まで遡る。
     execute!(
         stdout(),
+        cursor::Show,
         Clear(ClearType::FromCursorDown),
         cursor::MoveUp(1),
         cursor::MoveToColumn(0),
@@ -133,6 +138,7 @@ fn draw_grid(
     n_cols: usize,
     col_width: usize,
     n_rows: usize,
+    highlight: &str,
 ) -> io::Result<()> {
     for row in 0..n_rows {
         queue!(
@@ -150,24 +156,25 @@ fn draw_grid(
             let pad = col_width.saturating_sub(text.width());
 
             if idx == selected {
-                // 選択中は白背景＋黒文字 (iceberg トーンの淡色で目に優しく)
                 queue!(
                     stdout(),
-                    SetBackgroundColor(Color::Rgb {
-                        r: 0xc6,
-                        g: 0xc8,
-                        b: 0xd1
-                    }),
-                    SetForegroundColor(Color::Rgb {
-                        r: 0x16,
-                        g: 0x18,
-                        b: 0x21
-                    }),
-                    Print(format!("{}{:pad$}", text, "", pad = pad)),
-                    ResetColor,
+                    SetBackgroundColor(COLOR_SEL_BG),
+                    SetForegroundColor(COLOR_SELECTED)
+                )?;
+                queue_highlighted(text, highlight, true)?;
+                queue!(
+                    stdout(),
+                    Print(format!("{:pad$}", "", pad = pad)),
+                    ResetColor
                 )?;
             } else {
-                queue!(stdout(), Print(format!("{}{:pad$}", text, "", pad = pad)))?;
+                queue!(stdout(), SetForegroundColor(COLOR_NORMAL))?;
+                queue_highlighted(text, highlight, false)?;
+                queue!(
+                    stdout(),
+                    Print(format!("{:pad$}", "", pad = pad)),
+                    ResetColor
+                )?;
             }
         }
 
@@ -191,6 +198,7 @@ fn redraw_grid_cell(
     is_selected: bool,
     n_cols: usize,
     col_width: usize,
+    highlight: &str,
 ) -> io::Result<()> {
     let row = (idx / n_cols) as u16;
     let col = ((idx % n_cols) * col_width) as u16;
@@ -205,21 +213,23 @@ fn redraw_grid_cell(
     if is_selected {
         queue!(
             stdout(),
-            SetBackgroundColor(Color::Rgb {
-                r: 0xc6,
-                g: 0xc8,
-                b: 0xd1
-            }),
-            SetForegroundColor(Color::Rgb {
-                r: 0x16,
-                g: 0x18,
-                b: 0x21
-            }),
-            Print(format!("{}{:pad$}", text, "", pad = pad)),
-            ResetColor,
+            SetBackgroundColor(COLOR_SEL_BG),
+            SetForegroundColor(COLOR_SELECTED)
+        )?;
+        queue_highlighted(text, highlight, true)?;
+        queue!(
+            stdout(),
+            Print(format!("{:pad$}", "", pad = pad)),
+            ResetColor
         )?;
     } else {
-        queue!(stdout(), Print(format!("{}{:pad$}", text, "", pad = pad)))?;
+        queue!(stdout(), SetForegroundColor(COLOR_NORMAL))?;
+        queue_highlighted(text, highlight, false)?;
+        queue!(
+            stdout(),
+            Print(format!("{:pad$}", "", pad = pad)),
+            ResetColor
+        )?;
     }
 
     if row > 0 {
@@ -227,6 +237,128 @@ fn redraw_grid_cell(
     }
     queue!(stdout(), cursor::MoveToColumn(0))?;
     stdout().flush()
+}
+
+// ─── ハイライトヘルパー ───────────────────────────────────────────────────────
+
+/// `query` の大小無視一致箇所を別色で出力する。
+/// `is_selected` が true のとき選択セル背景上でも見えるよう色を切り替える。
+/// 呼び出し前後の前景/背景色は呼び出し側が管理する。
+fn queue_highlighted(text: &str, query: &str, is_selected: bool) -> io::Result<()> {
+    let Some((start, end)) = find_match_range(text, query) else {
+        return queue!(stdout(), Print(text));
+    };
+    if start > 0 {
+        queue!(stdout(), Print(&text[..start]))?;
+    }
+    // ピッカーと同じ黄色でハイライト (選択・非選択とも同色)
+    queue!(
+        stdout(),
+        SetForegroundColor(Color::Rgb {
+            r: 0xe2,
+            g: 0xd9,
+            b: 0x80
+        }),
+        Print(&text[start..end])
+    )?;
+    // 呼び出し側が設定した前景色を復元する
+    let restore = if is_selected {
+        COLOR_SELECTED
+    } else {
+        COLOR_NORMAL
+    };
+    queue!(stdout(), SetForegroundColor(restore))?;
+    if end < text.len() {
+        queue!(stdout(), Print(&text[end..]))?;
+    }
+    Ok(())
+}
+
+/// `text` 内で `query` が（大小無視で）最初に出現するバイト範囲を返す。
+fn find_match_range(text: &str, query: &str) -> Option<(usize, usize)> {
+    if query.is_empty() {
+        return None;
+    }
+    let tl = text.to_lowercase();
+    let ql = query.to_lowercase();
+    let start = tl.find(&ql)?;
+    let end = start + ql.len();
+    if end <= text.len() && text.is_char_boundary(start) && text.is_char_boundary(end) {
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
+/// ピッカー用: 空白区切りの複数ワードを全て色付きで出力する。
+/// 各ワードの最初の出現をハイライトし、ソート・マージ後に前後の非一致部分と交互に表示。
+fn queue_picker_chunk_highlighted(chunk: &str, query: &str, is_selected: bool) -> io::Result<()> {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    if words.is_empty() {
+        return queue!(stdout(), Print(chunk));
+    }
+    let ranges = compute_highlight_ranges(chunk, &words);
+    if ranges.is_empty() {
+        return queue!(stdout(), Print(chunk));
+    }
+    // ピッカーの配色に合わせたハイライト色 (iceberg yellow)
+    let hl_color = Color::Rgb {
+        r: 0xe2,
+        g: 0xd9,
+        b: 0x80,
+    };
+    let restore_fg = if is_selected {
+        COLOR_SELECTED
+    } else {
+        COLOR_NORMAL
+    };
+    let mut pos = 0;
+    for (start, end) in ranges {
+        if start > pos {
+            queue!(stdout(), Print(&chunk[pos..start]))?;
+        }
+        queue!(
+            stdout(),
+            SetForegroundColor(hl_color),
+            Print(&chunk[start..end]),
+            SetForegroundColor(restore_fg),
+        )?;
+        pos = end;
+    }
+    if pos < chunk.len() {
+        queue!(stdout(), Print(&chunk[pos..]))?;
+    }
+    Ok(())
+}
+
+/// `words`（小文字化済み）が `text` 内に出現するバイト範囲をソート・マージして返す。
+fn compute_highlight_ranges(text: &str, words: &[String]) -> Vec<(usize, usize)> {
+    let tl = text.to_lowercase();
+    let mut ranges: Vec<(usize, usize)> = words
+        .iter()
+        .filter_map(|w| {
+            let start = tl.find(w.as_str())?;
+            let end = start + w.len();
+            if end <= text.len() && text.is_char_boundary(start) && text.is_char_boundary(end) {
+                Some((start, end))
+            } else {
+                None
+            }
+        })
+        .collect();
+    ranges.sort_by_key(|&(s, _)| s);
+    // 重複・隣接範囲をマージ
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in ranges {
+        if let Some(last) = merged.last_mut()
+            && s <= last.1
+        {
+            last.1 = last.1.max(e);
+            continue;
+        }
+        merged.push((s, e));
+    }
+    merged
 }
 
 fn truncate_to_cols(s: &str, max_cols: usize) -> &str {
@@ -372,6 +504,7 @@ fn run_picker(
                     lo.cand_rows[old_vis],
                     lo.cand_heights[old_vis],
                     content_width,
+                    &query,
                 )?;
                 // 新選択行を選択色で上書き
                 redraw_picker_candidate(
@@ -380,6 +513,7 @@ fn run_picker(
                     lo.cand_rows[new_vis],
                     lo.cand_heights[new_vis],
                     content_width,
+                    &query,
                 )?;
             } else {
                 layout = None; // 範囲外: フォールバック
@@ -482,6 +616,7 @@ fn redraw_picker_candidate(
     start_row: u16,
     _height: u16,
     content_width: usize,
+    query: &str,
 ) -> io::Result<()> {
     let chunks = split_display(text, content_width);
     let height = chunks.len() as u16;
@@ -497,20 +632,14 @@ fn redraw_picker_candidate(
                 SetBackgroundColor(COLOR_SEL_BG),
                 SetForegroundColor(COLOR_SELECTED),
                 Print(prefix),
-                Print(chunk),
-                ResetColor,
-                Print("\r\n"),
             )?;
+            queue_picker_chunk_highlighted(chunk, query, true)?;
+            queue!(stdout(), ResetColor, Print("\r\n"))?;
         } else {
             let prefix = if j == 0 { "# " } else { "  " };
-            queue!(
-                stdout(),
-                SetForegroundColor(COLOR_NORMAL),
-                Print(prefix),
-                Print(chunk),
-                ResetColor,
-                Print("\r\n"),
-            )?;
+            queue!(stdout(), SetForegroundColor(COLOR_NORMAL), Print(prefix),)?;
+            queue_picker_chunk_highlighted(chunk, query, false)?;
+            queue!(stdout(), ResetColor, Print("\r\n"))?;
         }
     }
     // クエリ行へ戻る
@@ -667,20 +796,14 @@ fn draw_picker(
                     SetBackgroundColor(COLOR_SEL_BG),
                     SetForegroundColor(COLOR_SELECTED),
                     Print(prefix),
-                    Print(chunk),
-                    ResetColor,
-                    Print("\r\n"),
                 )?;
+                queue_picker_chunk_highlighted(chunk, query, true)?;
+                queue!(stdout(), ResetColor, Print("\r\n"))?;
             } else {
                 let prefix = if j == 0 { "# " } else { "  " };
-                queue!(
-                    stdout(),
-                    SetForegroundColor(COLOR_NORMAL),
-                    Print(prefix),
-                    Print(chunk),
-                    ResetColor,
-                    Print("\r\n"),
-                )?;
+                queue!(stdout(), SetForegroundColor(COLOR_NORMAL), Print(prefix),)?;
+                queue_picker_chunk_highlighted(chunk, query, false)?;
+                queue!(stdout(), ResetColor, Print("\r\n"))?;
             }
         }
     }
