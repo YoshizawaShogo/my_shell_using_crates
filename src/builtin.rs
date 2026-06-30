@@ -193,7 +193,7 @@ fn source_env(args: &[&str], _ctx: &mut ShellContext) -> io::Result<()> {
         }
         1 => {
             let shell = detect_shell(args[0]).ok_or_else(|| {
-                io::Error::other("source-env: cannot detect shell; use: source-env <file> <shell>")
+                io::Error::other("cannot detect shell; use: source-env <file> <shell>")
             })?;
             (shell, args[0])
         }
@@ -210,12 +210,12 @@ fn source_env(args: &[&str], _ctx: &mut ShellContext) -> io::Result<()> {
     let output = std::process::Command::new(&shell)
         .args(["-c", &script])
         .output()
-        .map_err(|e| io::Error::other(format!("source-env: failed to run {}: {}", shell, e)))?;
+        .map_err(|e| io::Error::other(format!("failed to run {}: {}", shell, e)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(io::Error::other(format!(
-            "source-env: {} exited with error: {}",
+            "{} exited with error: {}",
             shell,
             stderr.trim()
         )));
@@ -235,33 +235,29 @@ fn source_env(args: &[&str], _ctx: &mut ShellContext) -> io::Result<()> {
     Ok(())
 }
 
-/// ファイル名・拡張子・shebang の順でシェルを推定する。
+/// ファイル名・shebang の順でシェルを推定する。
+/// ファイル名にシェル名が含まれるかをサブストリングで判定する (bash → zsh → fish → csh → sh の順)。
+/// sh は bash/zsh を誤検知しないよう最後に評価する。
 fn detect_shell(file: &str) -> Option<String> {
-    let path = Path::new(file);
-    let basename = path.file_name()?.to_string_lossy().to_lowercase();
+    let basename = Path::new(file)
+        .file_name()?
+        .to_string_lossy()
+        .to_lowercase();
 
-    // 既知のファイル名
+    for shell in ["bash", "zsh", "fish", "csh", "sh"] {
+        if basename.contains(shell) {
+            return Some(shell.to_string());
+        }
+    }
+
+    // サブストリングで拾えない既知ファイル名
     let by_name = match basename.as_str() {
-        ".bashrc" | ".bash_profile" | ".bash_login" | ".bash_aliases" => Some("bash"),
-        ".zshrc" | ".zprofile" | ".zshenv" | ".zlogin" => Some("zsh"),
-        "config.fish" => Some("fish"),
-        ".cshrc" | ".tcshrc" | ".login" => Some("csh"),
+        ".zlogin" | ".zprofile" | ".zlogout" => Some("zsh"),
+        ".login" => Some("csh"),
+        ".profile" => Some("sh"),
         _ => None,
     };
     if let Some(s) = by_name {
-        return Some(s.to_string());
-    }
-
-    // 拡張子
-    let by_ext = match path.extension()?.to_string_lossy().to_lowercase().as_str() {
-        "bash" => Some("bash"),
-        "zsh" => Some("zsh"),
-        "fish" => Some("fish"),
-        "csh" => Some("csh"),
-        "sh" => Some("sh"),
-        _ => None,
-    };
-    if let Some(s) = by_ext {
         return Some(s.to_string());
     }
 
