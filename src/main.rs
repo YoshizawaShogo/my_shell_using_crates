@@ -346,6 +346,24 @@ impl Shell {
                 pending.push(ShellEvent::RedrawPrompt);
             }
 
+            ShellEvent::ShowDirStackFzf => {
+                // dir_stack は古い順 (末尾が直近) なので逆順でピッカーへ渡す
+                let stack: Vec<std::path::PathBuf> =
+                    self.ctx.dir_stack.iter().rev().cloned().collect();
+                let prepend_cd = self.ed.is_empty();
+                execute!(stdout(), Print("\r\n"))?;
+                self.ed.note_newline();
+                match completion::fzf_recent_paths(&stack) {
+                    Ok(Some(s)) if prepend_cd => self.ed.insert_str(&format!("cd {}", s)),
+                    Ok(Some(s)) => self.ed.insert_str(&s),
+                    Ok(None) => {}
+                    Err(e) => {
+                        execute!(stdout(), Print(format!("fzf: {}\r\n", e)))?;
+                    }
+                }
+                pending.push(ShellEvent::RedrawPrompt);
+            }
+
             ShellEvent::InsertSpace => {
                 try_expand_abbr(&mut self.ed, &self.ctx.abbrs);
                 self.ed.insert(' ');

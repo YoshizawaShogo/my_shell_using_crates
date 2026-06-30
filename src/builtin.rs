@@ -120,7 +120,6 @@ type BuiltinFn = fn(&[&str], &mut ShellContext) -> io::Result<()>;
 /// ビルトインを増やすときはここに 1 行足せばよい。
 const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("cd", cd),
-    ("popd", popd),
     ("abbr", abbr),
     ("alias", alias),
     ("set", set),
@@ -174,21 +173,6 @@ fn cd(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
         // 並行アクセスは発生しない。
         unsafe { std::env::set_var("OLDPWD", &cwd) };
         ctx.dir_stack.push(cwd);
-    }
-    Ok(())
-}
-
-// ─── popd ─────────────────────────────────────────────────────────────────────
-
-fn popd(_args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
-    let dest = ctx
-        .dir_stack
-        .pop()
-        .ok_or_else(|| io::Error::other("directory stack is empty"))?;
-    let before = std::env::current_dir();
-    std::env::set_current_dir(&dest)?;
-    if let Ok(cwd) = before {
-        unsafe { std::env::set_var("OLDPWD", &cwd) };
     }
     Ok(())
 }
