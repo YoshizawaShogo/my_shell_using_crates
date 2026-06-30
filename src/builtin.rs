@@ -120,6 +120,7 @@ type BuiltinFn = fn(&[&str], &mut ShellContext) -> io::Result<()>;
 /// ビルトインを増やすときはここに 1 行足せばよい。
 const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("cd", cd),
+    ("source-env", source_env),
     ("abbr", abbr),
     ("alias", alias),
     ("set", set),
@@ -175,6 +176,105 @@ fn cd(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
         ctx.dir_stack.push(cwd);
     }
     Ok(())
+}
+
+// ─── source-env ───────────────────────────────────────────────────────────────
+
+/// 別シェルで設定ファイルを source し、環境変数をこのシェルへ取り込む。
+///
+/// 使い方:
+///   source-env <file>           ファイル名・拡張子・shebang からシェルを自動判別
+///   source-env <file> <shell>   シェルを明示
+fn source_env(args: &[&str], _ctx: &mut ShellContext) -> io::Result<()> {
+    let (shell, file) = match args.len() {
+        2 => {
+            let shell = args[1].to_string();
+            (shell, args[0])
+        }
+        1 => {
+            let shell = detect_shell(args[0]).ok_or_else(|| {
+                io::Error::other("source-env: cannot detect shell; use: source-env <file> <shell>")
+            })?;
+            (shell, args[0])
+        }
+        _ => return Err(io::Error::other("usage: source-env <file> [shell]")),
+    };
+
+    let file_path = expand_tilde(file);
+    let file_str = file_path.to_string_lossy();
+    let script = match shell.as_str() {
+        "fish" => format!("source '{}' && env -0", file_str),
+        _ => format!(". '{}' && env -0", file_str),
+    };
+
+    let output = std::process::Command::new(&shell)
+        .args(["-c", &script])
+        .output()
+        .map_err(|e| io::Error::other(format!("source-env: failed to run {}: {}", shell, e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::other(format!(
+            "source-env: {} exited with error: {}",
+            shell,
+            stderr.trim()
+        )));
+    }
+
+    for record in output.stdout.split(|&b| b == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let s = String::from_utf8_lossy(record);
+        if let Some((k, v)) = s.split_once('=') {
+            // SAFETY: ビルトインはメインスレッドからのみ実行される。
+            unsafe { std::env::set_var(k, v) };
+        }
+    }
+
+    Ok(())
+}
+
+/// ファイル名・拡張子・shebang の順でシェルを推定する。
+fn detect_shell(file: &str) -> Option<String> {
+    let path = Path::new(file);
+    let basename = path.file_name()?.to_string_lossy().to_lowercase();
+
+    // 既知のファイル名
+    let by_name = match basename.as_str() {
+        ".bashrc" | ".bash_profile" | ".bash_login" | ".bash_aliases" => Some("bash"),
+        ".zshrc" | ".zprofile" | ".zshenv" | ".zlogin" => Some("zsh"),
+        "config.fish" => Some("fish"),
+        ".cshrc" | ".tcshrc" | ".login" => Some("csh"),
+        _ => None,
+    };
+    if let Some(s) = by_name {
+        return Some(s.to_string());
+    }
+
+    // 拡張子
+    let by_ext = match path.extension()?.to_string_lossy().to_lowercase().as_str() {
+        "bash" => Some("bash"),
+        "zsh" => Some("zsh"),
+        "fish" => Some("fish"),
+        "csh" => Some("csh"),
+        "sh" => Some("sh"),
+        _ => None,
+    };
+    if let Some(s) = by_ext {
+        return Some(s.to_string());
+    }
+
+    // shebang (#! /usr/bin/env bash や #!/bin/zsh など)
+    let first_line = std::fs::read_to_string(file)
+        .ok()
+        .and_then(|s| s.lines().next().map(str::to_string))?;
+    let shebang = first_line.strip_prefix("#!")?.trim().to_string();
+    let shell_name = Path::new(shebang.split_whitespace().last()?)
+        .file_name()?
+        .to_string_lossy()
+        .to_string();
+    Some(shell_name)
 }
 
 // ─── abbr ─────────────────────────────────────────────────────────────────────
