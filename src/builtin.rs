@@ -2,7 +2,7 @@
 
 use crate::history::expand_tilde;
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, BufRead, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 // ─── 定数 ─────────────────────────────────────────────────────────────────────
@@ -22,6 +22,8 @@ pub struct ShellContext {
     /// コマンド引数から自動記録したパス一覧。MRU 順 (先頭が直近)。
     /// 永続化: ~/.my_shell_paths。Ctrl+G / Ctrl+T のピッカーが参照する。
     pub recent_paths: Vec<PathBuf>,
+    /// ~/.my_shell_paths の既読バイト数 (差分読み込み用)
+    pub paths_file_offset: u64,
     /// abbr で定義した略語 (FROM → TO)
     pub abbrs: HashMap<String, String>,
     /// alias で定義したエイリアス (FROM → TO)
@@ -34,9 +36,11 @@ pub struct ShellContext {
 
 impl Default for ShellContext {
     fn default() -> Self {
+        let (recent_paths, paths_file_offset) = load_recent_paths();
         Self {
             dir_stack: Vec::new(),
-            recent_paths: load_recent_paths(),
+            recent_paths,
+            paths_file_offset,
             abbrs: HashMap::new(),
             aliases: HashMap::new(),
             last_status: 0,
@@ -47,10 +51,13 @@ impl Default for ShellContext {
 
 /// 永続化ファイルを読み込む。末尾 (新しい方) を優先して dedup し、
 /// 存在しないパスを除去したうえで MRU 順 (先頭が直近) で返す。
-fn load_recent_paths() -> Vec<PathBuf> {
+/// 戻り値: (パス一覧, ファイルサイズ)
+fn load_recent_paths() -> (Vec<PathBuf>, u64) {
     let path = expand_tilde(PATHS_FILE);
-    let lines: Vec<PathBuf> = std::fs::read_to_string(path)
-        .unwrap_or_default()
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+    let lines: Vec<PathBuf> = content
         .lines()
         .filter(|l| !l.is_empty())
         .map(PathBuf::from)
@@ -66,7 +73,36 @@ fn load_recent_paths() -> Vec<PathBuf> {
 
     deduped.retain(|p| p.exists());
     deduped.truncate(MAX_RECENT_PATHS);
-    deduped
+    (deduped, file_size)
+}
+
+/// ファイルの差分を読み込み、他端末が記録したパスをメモリへ取り込む。
+/// プロンプト再描画前に呼ぶ。ファイルが増えていなければ即時リターン。
+pub fn reload_recent_paths(ctx: &mut ShellContext) {
+    let path = expand_tilde(PATHS_FILE);
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return;
+    };
+    let Ok(meta) = file.metadata() else { return };
+    if meta.len() <= ctx.paths_file_offset {
+        return;
+    }
+    if file.seek(SeekFrom::Start(ctx.paths_file_offset)).is_err() {
+        return;
+    }
+    let new_paths: Vec<PathBuf> = io::BufReader::new(&file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+        .collect();
+    ctx.paths_file_offset = meta.len();
+    for p in new_paths {
+        ctx.recent_paths.retain(|x| x != &p);
+        ctx.recent_paths.insert(0, p);
+    }
+    ctx.recent_paths.truncate(MAX_RECENT_PATHS);
 }
 
 /// パスをファイル末尾に 1 行追記する。
@@ -173,6 +209,7 @@ fn cd(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
         // spawn されるワーカースレッドは getenv/setenv を一切呼ばないため、environ への
         // 並行アクセスは発生しない。
         unsafe { std::env::set_var("OLDPWD", &cwd) };
+        ctx.dir_stack.retain(|x| x != &cwd);
         ctx.dir_stack.push(cwd);
     }
     Ok(())
@@ -183,8 +220,8 @@ fn cd(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
 /// 別シェルで設定ファイルを source し、環境変数をこのシェルへ取り込む。
 ///
 /// 使い方:
-///   source-env <file>           ファイル名・拡張子・shebang からシェルを自動判別
-///   source-env <file> <shell>   シェルを明示
+///   `source-env <file>`           ファイル名・拡張子・shebang からシェルを自動判別
+///   `source-env <file> <shell>`   シェルを明示
 fn source_env(args: &[&str], _ctx: &mut ShellContext) -> io::Result<()> {
     let (shell, file) = match args.len() {
         2 => {

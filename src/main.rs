@@ -62,6 +62,8 @@ impl Shell {
     }
 
     fn redraw(&mut self) -> io::Result<()> {
+        self.history.reload();
+        builtin::reload_recent_paths(&mut self.ctx);
         redraw_prompt(
             &mut self.ed,
             self.git_branch.as_deref(),
