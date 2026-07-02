@@ -416,6 +416,13 @@ fn main() -> io::Result<()> {
 fn run() -> io::Result<()> {
     let mut shell = Shell::new();
 
+    // 起動時に PWD を実際のカレントへ同期しておく。親から継承した PWD が古い / 未設定
+    // でも `$PWD` が正しくなる (以降は cd が更新する)。
+    // SAFETY: 起動直後・シングルスレッドで、environ への並行アクセスはない。
+    if let Ok(cwd) = std::env::current_dir() {
+        unsafe { std::env::set_var("PWD", &cwd) };
+    }
+
     // RC ファイルを読み込んで各行を実行する
     load_rc(&mut shell.ctx);
 

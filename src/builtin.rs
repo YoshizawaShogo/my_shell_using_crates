@@ -204,10 +204,18 @@ fn cd(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
     let prev = std::env::current_dir();
     std::env::set_current_dir(&target)?;
 
+    // SAFETY: ビルトインはメインスレッドからのみ実行される。Ctrl+T 列挙で一時的に
+    // spawn されるワーカースレッドは getenv/setenv を一切呼ばないため、environ への
+    // 並行アクセスは発生しない。
+    //
+    // PWD を実際のカレントへ更新する。これで `$PWD` (ビルトインは env::var、外部
+    // コマンドは sh 経由で参照) が cd 後も正しい値になる。target は相対の場合が
+    // あるので current_dir() で絶対パスを取り直す。
+    if let Ok(now) = std::env::current_dir() {
+        unsafe { std::env::set_var("PWD", &now) };
+    }
+
     if let Ok(cwd) = prev {
-        // SAFETY: ビルトインはメインスレッドからのみ実行される。Ctrl+T 列挙で一時的に
-        // spawn されるワーカースレッドは getenv/setenv を一切呼ばないため、environ への
-        // 並行アクセスは発生しない。
         unsafe { std::env::set_var("OLDPWD", &cwd) };
         ctx.dir_stack.retain(|x| x != &cwd);
         ctx.dir_stack.push(cwd);
