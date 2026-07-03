@@ -35,7 +35,7 @@ pub enum Selection {
 /// - Enter : 確定、Esc : キャンセル、Ctrl+C : 中断
 pub fn run_grid_menu(
     candidates: &[String],
-    _lines_above_cursor: u16,
+    input_display: u16,
     highlight: &str,
 ) -> io::Result<Selection> {
     if candidates.is_empty() {
@@ -44,6 +44,14 @@ pub fn run_grid_menu(
 
     let (term_cols, term_rows) = terminal::size()?;
     let cols = term_cols as usize;
+
+    // 入力行のカーソル物理列 (補完点)。`input_display` は "$ " + prefix の表示幅。
+    // ちょうど端末幅の倍数のときは折り返し先頭 (列0) にいるとみなす。
+    let input_col = if input_display > 0 && input_display.is_multiple_of(term_cols) {
+        0
+    } else {
+        input_display % term_cols
+    };
 
     // 列幅 = 最長候補 + 2 スペース
     let max_item_w = candidates.iter().map(|s| s.width()).max().unwrap_or(1);
@@ -74,7 +82,27 @@ pub fn run_grid_menu(
         }
         prev_selected = selected;
 
-        let Event::Key(key) = event::read()? else {
+        // カーソルを入力補完位置に表示する。グリッドは常に入力行の 1 行下に描かれる
+        // ので、グリッド先頭行 (現在位置) から 1 行上が入力行。
+        queue!(
+            stdout(),
+            cursor::MoveUp(1),
+            cursor::MoveToColumn(input_col),
+            cursor::Show
+        )?;
+        stdout().flush()?;
+
+        let ev = event::read()?;
+
+        // 次の描画のためカーソルをグリッド先頭行・列0へ戻し、描画中は隠す。
+        queue!(
+            stdout(),
+            cursor::Hide,
+            cursor::MoveDown(1),
+            cursor::MoveToColumn(0)
+        )?;
+
+        let Event::Key(key) = ev else {
             continue;
         };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -487,6 +515,9 @@ fn run_picker(
             layout = None;
         }
 
+        // 描画前: カーソルを隠してクエリ行の先頭へ (差分描画は列0基準のため)。
+        queue!(stdout(), cursor::Hide, cursor::MoveToColumn(0))?;
+
         // 4. 描画: 選択移動のみなら差分、それ以外はフル
         let moved_only = layout.as_ref().map(|l| l.offset == offset).unwrap_or(false)
             && prev_selected.map(|p| p != selected).unwrap_or(false);
@@ -546,6 +577,10 @@ fn run_picker(
                 offset,
             });
         }
+
+        // カーソルをクエリ末尾に表示する ("🔍 " は表示幅 3)。検索入力欄として自然な位置。
+        let qcol = (3 + query.width()).min(cols.saturating_sub(1)) as u16;
+        execute!(stdout(), cursor::MoveToColumn(qcol), cursor::Show)?;
 
         prev_selected = Some(selected);
 

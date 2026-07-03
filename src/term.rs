@@ -1,7 +1,7 @@
 //! 端末モードの管理。
 
-use crossterm::terminal;
-use std::io;
+use crossterm::{cursor::SetCursorStyle, execute, terminal};
+use std::io::{self, stdout};
 
 /// 端末の raw mode を確実に後始末する RAII ガード。
 ///
@@ -13,12 +13,15 @@ pub struct RawModeGuard;
 impl RawModeGuard {
     pub fn new() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
+        // 入力カーソルを I 型 (縦棒) にする。Drop で端末既定の形へ戻す。
+        let _ = execute!(stdout(), SetCursorStyle::SteadyBar);
         Ok(Self)
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        let _ = execute!(stdout(), SetCursorStyle::DefaultUserShape);
         let _ = terminal::disable_raw_mode();
     }
 }

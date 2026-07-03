@@ -157,7 +157,6 @@ impl Shell {
                 // カーソル後ろのテキストは補完で消さずに残す。
                 let suffix = self.ed.line()[self.ed.cursor()..].to_string();
                 let cwd = std::env::current_dir().unwrap_or_default();
-                let lines_above = self.ed.lines_above_cursor();
                 // fg/bg 補完用にジョブのコマンド名 (先頭トークン) を渡す。
                 let job_names: Vec<String> = self
                     .ctx
@@ -169,7 +168,6 @@ impl Shell {
                     prefix: &prefix,
                     cwd: &cwd,
                     history: &self.history,
-                    lines_above_cursor: lines_above,
                     jobs: &job_names,
                     tab_end: self.ed.tab_end(),
                 };
@@ -329,16 +327,14 @@ impl Shell {
                 // 入力が空のときは cd 先選択モード: 候補をディレクトリのみに絞り、
                 // 選択結果を `cd <path>` として挿入する。
                 let prepend_cd = self.ed.is_empty();
-                let candidates: Vec<std::path::PathBuf> = if prepend_cd {
-                    self.ctx
-                        .recent_paths
-                        .iter()
-                        .filter(|p| p.is_dir())
-                        .cloned()
-                        .collect()
-                } else {
-                    self.ctx.recent_paths.clone()
-                };
+                // is_dir は記録/読込時に確定済みなので、ここで stat し直さない。
+                let candidates: Vec<std::path::PathBuf> = self
+                    .ctx
+                    .recent_paths
+                    .iter()
+                    .filter(|rp| !prepend_cd || rp.is_dir)
+                    .map(|rp| rp.path.clone())
+                    .collect();
                 execute!(stdout(), Print("\r\n"))?;
                 self.ed.note_newline();
                 match completion::fzf_recent_paths(&candidates) {

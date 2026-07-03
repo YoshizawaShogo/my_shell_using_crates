@@ -15,13 +15,24 @@ const MAX_RECENT_PATHS: usize = 500;
 
 // ─── シェル状態 ───────────────────────────────────────────────────────────────
 
+/// 記録済みパス 1 件。
+///
+/// `is_dir` は記録/読込時の 1 回の `metadata` で確定させて保持する。これにより
+/// Ctrl+G の cd 先フィルタ (ディレクトリのみ抽出) を、ピッカーを開くたびに全件
+/// `is_dir()` (= stat) し直さずに済ませる。stat は I/O で、特に WSL2 の /mnt などは
+/// 桁違いに遅いため、開くたびの stat がピッカーの体感遅延の主因だった。
+pub struct RecentPath {
+    pub path: PathBuf,
+    pub is_dir: bool,
+}
+
 /// ビルトインコマンドが読み書きするシェル状態
 pub struct ShellContext {
     /// cd が積み上げるディレクトリスタック (pushd 相当)
     pub dir_stack: Vec<PathBuf>,
     /// コマンド引数から自動記録したパス一覧。MRU 順 (先頭が直近)。
     /// 永続化: ~/.my_shell_paths。Ctrl+G / Ctrl+T のピッカーが参照する。
-    pub recent_paths: Vec<PathBuf>,
+    pub recent_paths: Vec<RecentPath>,
     /// ~/.my_shell_paths の既読バイト数 (差分読み込み用)
     pub paths_file_offset: u64,
     /// abbr で定義した略語 (FROM → TO)
@@ -52,7 +63,7 @@ impl Default for ShellContext {
 /// 永続化ファイルを読み込む。末尾 (新しい方) を優先して dedup し、
 /// 存在しないパスを除去したうえで MRU 順 (先頭が直近) で返す。
 /// 戻り値: (パス一覧, ファイルサイズ)
-fn load_recent_paths() -> (Vec<PathBuf>, u64) {
+fn load_recent_paths() -> (Vec<RecentPath>, u64) {
     let path = expand_tilde(PATHS_FILE);
     let content = std::fs::read_to_string(&path).unwrap_or_default();
     let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -65,15 +76,23 @@ fn load_recent_paths() -> (Vec<PathBuf>, u64) {
 
     // 末尾 (新しい方) を優先して dedup → 結果は新しい順 (MRU)
     let mut seen = std::collections::HashSet::new();
-    let mut deduped: Vec<PathBuf> = lines
+    let deduped: Vec<PathBuf> = lines
         .into_iter()
         .rev()
         .filter(|p| seen.insert(p.clone()))
         .collect();
 
-    deduped.retain(|p| p.exists());
-    deduped.truncate(MAX_RECENT_PATHS);
-    (deduped, file_size)
+    // 実在チェックと is_dir 判定を 1 回の metadata で兼ねる (存在しなければ除外)。
+    let mut result: Vec<RecentPath> = deduped.into_iter().filter_map(to_recent_path).collect();
+    result.truncate(MAX_RECENT_PATHS);
+    (result, file_size)
+}
+
+/// パスを 1 回 `metadata` して `RecentPath` にする。存在しなければ `None`。
+/// (`metadata` はシンボリックリンクを辿るので、実体が dir かで `is_dir` を決める。)
+fn to_recent_path(p: PathBuf) -> Option<RecentPath> {
+    let is_dir = std::fs::metadata(&p).ok()?.is_dir();
+    Some(RecentPath { path: p, is_dir })
 }
 
 /// ファイルの差分を読み込み、他端末が記録したパスをメモリへ取り込む。
@@ -90,17 +109,17 @@ pub fn reload_recent_paths(ctx: &mut ShellContext) {
     if file.seek(SeekFrom::Start(ctx.paths_file_offset)).is_err() {
         return;
     }
-    let new_paths: Vec<PathBuf> = io::BufReader::new(&file)
+    let new_paths: Vec<RecentPath> = io::BufReader::new(&file)
         .lines()
         .map_while(Result::ok)
         .filter(|l| !l.is_empty())
         .map(PathBuf::from)
-        .filter(|p| p.exists())
+        .filter_map(to_recent_path)
         .collect();
     ctx.paths_file_offset = meta.len();
-    for p in new_paths {
-        ctx.recent_paths.retain(|x| x != &p);
-        ctx.recent_paths.insert(0, p);
+    for rp in new_paths {
+        ctx.recent_paths.retain(|x| x.path != rp.path);
+        ctx.recent_paths.insert(0, rp);
     }
     ctx.recent_paths.truncate(MAX_RECENT_PATHS);
 }
@@ -134,9 +153,16 @@ pub fn record_arg_paths(ctx: &mut ShellContext, args: &[String], cwd: &Path) {
         let Ok(canon) = abs.canonicalize() else {
             continue;
         };
+        let is_dir = canon.is_dir();
         // MRU: 既存を取り除いて先頭へ。
-        ctx.recent_paths.retain(|x| x != &canon);
-        ctx.recent_paths.insert(0, canon.clone());
+        ctx.recent_paths.retain(|x| x.path != canon);
+        ctx.recent_paths.insert(
+            0,
+            RecentPath {
+                path: canon.clone(),
+                is_dir,
+            },
+        );
         let _ = append_recent_path(&canon);
         changed = true;
     }

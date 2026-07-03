@@ -190,10 +190,6 @@ impl LineEditor {
         self.buf.is_empty()
     }
 
-    pub fn lines_above_cursor(&self) -> u16 {
-        self.lines_above_cursor
-    }
-
     /// skim 起動前に \r\n を出力した分だけ lines_above_cursor を +1 する。
     /// これにより redraw_prompt が正しくヘッダ行まで遡れる。
     pub fn note_newline(&mut self) {
@@ -227,6 +223,10 @@ pub fn redraw_prompt(
     ghost: Option<&str>,
 ) -> io::Result<()> {
     let (term_cols, _) = terminal::size()?;
+
+    // 0. カーソルを I 型 (縦棒) に再指定する。外部コマンド (vim 等) が形を変えても
+    //    プロンプトへ戻ったときに I 型へ戻す。同じ ANSI の再送で冪等・数バイト。
+    queue!(stdout(), cursor::SetCursorStyle::SteadyBar)?;
 
     // 1. ヘッダ先頭行へ移動してから全消去
     if ed.lines_above_cursor > 0 {

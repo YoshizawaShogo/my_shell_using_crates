@@ -10,6 +10,7 @@ use crate::provider::{
 };
 use crate::selector::{self, Selection};
 use std::path::Path;
+use unicode_width::UnicodeWidthStr;
 
 // ─── Tab 補完 ─────────────────────────────────────────────────────────────────
 
@@ -18,7 +19,6 @@ pub struct TabContext<'a> {
     pub prefix: &'a str,
     pub cwd: &'a Path,
     pub history: &'a History,
-    pub lines_above_cursor: u16,
     /// fg/bg 補完用のジョブ名 (各ジョブのコマンド先頭トークン)
     pub jobs: &'a [String],
     /// 前回の Tab 補完が完了した位置 (prefix 内バイトオフセット)。
@@ -115,7 +115,9 @@ pub fn tab_complete(ctx: TabContext<'_>) -> std::io::Result<Selection> {
 
     // ユーザーが実際に入力した部分 (ディレクトリ部を除く) をハイライト用に渡す。
     let highlight = &token[strip_len..];
-    match selector::run_grid_menu(&display_cands, ctx.lines_above_cursor, highlight)? {
+    // 入力行のカーソル表示位置 = "$ " (幅2) + カーソルまでの入力表示幅。
+    let input_display = 2 + ctx.prefix.width() as u16;
+    match selector::run_grid_menu(&display_cands, input_display, highlight)? {
         Selection::Chosen(display) => {
             let full = if strip_len > 0 {
                 format!("{}{}", token, display)
