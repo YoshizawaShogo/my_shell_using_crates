@@ -245,6 +245,8 @@ impl Shell {
             }
 
             ShellEvent::ShowHistoryFzf => {
+                // 他端末が直前に追記した履歴を取り込んでから開く
+                self.history.reload();
                 let query = self.ed.line().to_string();
                 execute!(stdout(), Print("\r\n"))?;
                 self.ed.note_newline();
@@ -322,6 +324,8 @@ impl Shell {
             }
 
             ShellEvent::ShowRecentPathFzf => {
+                // 他端末が直前に記録したパスを取り込んでから開く
+                builtin::reload_recent_paths(&mut self.ctx);
                 // 入力が空のときは cd 先選択モード: 候補をディレクトリのみに絞り、
                 // 選択結果を `cd <path>` として挿入する。
                 let prepend_cd = self.ed.is_empty();
