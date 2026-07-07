@@ -1,8 +1,9 @@
 //! シェル組み込みコマンド。
 
 use crate::history::expand_tilde;
+use crossterm::{execute, style::Print};
 use std::collections::HashMap;
-use std::io::{self, BufRead, Seek, SeekFrom};
+use std::io::{self, BufRead, Seek, SeekFrom, stdout};
 use std::path::{Path, PathBuf};
 
 // ─── 定数 ─────────────────────────────────────────────────────────────────────
@@ -103,7 +104,15 @@ pub fn reload_recent_paths(ctx: &mut ShellContext) {
         return;
     };
     let Ok(meta) = file.metadata() else { return };
-    if meta.len() <= ctx.paths_file_offset {
+    // ファイルが縮んでいたら refresh (compact) で書き直された合図。オフセットが
+    // 行境界とズレて壊れた読み込みになるので、全体を読み直して再構築する。
+    if meta.len() < ctx.paths_file_offset {
+        let (recent_paths, offset) = load_recent_paths();
+        ctx.recent_paths = recent_paths;
+        ctx.paths_file_offset = offset;
+        return;
+    }
+    if meta.len() == ctx.paths_file_offset {
         return;
     }
     if file.seek(SeekFrom::Start(ctx.paths_file_offset)).is_err() {
@@ -190,6 +199,7 @@ const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("fg", fg),
     ("bg", bg),
     ("jobs", jobs),
+    ("refresh", refresh),
 ];
 
 /// 名前に対応するビルトイン実装を返す。
@@ -395,4 +405,56 @@ fn bg(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
 
 fn jobs(_args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
     crate::job::list(ctx)
+}
+
+// ─── refresh ──────────────────────────────────────────────────────────────────
+
+/// `~/.my_shell_paths` を compact する。追記専用ログなので実在しないパスや重複が
+/// 溜まり続けるのを掃除するためのビルトイン。
+///
+/// dedup + 実在チェック済みの `recent_paths` (MRU 順) を一時ファイルに書き、
+/// atomic rename で本体を差し替える。読み手は常に「旧の完全なファイル」か
+/// 「新の完全なファイル」だけを見るので torn read が起きない。他端末は次の再描画で
+/// [reload_recent_paths] がファイル縮小を検知し、全体を読み直して再同期する。
+fn refresh(_args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
+    use std::io::Write;
+
+    // 他端末の追記も取り込んだ最新状態にしてから書き出す。
+    reload_recent_paths(ctx);
+
+    // 実在チェックを全件やり直す。reload は追記分しか見ないので、起動後に削除された
+    // パスはメモリ (= 現在のシェルの Ctrl+G 候補) に残ったまま。ここで stat し直して
+    // 消えたエントリを落とし、is_dir も更新することで現在のシェルにも即反映する。
+    let before = ctx.recent_paths.len();
+    ctx.recent_paths = std::mem::take(&mut ctx.recent_paths)
+        .into_iter()
+        .filter_map(|rp| to_recent_path(rp.path))
+        .collect();
+    let removed = before - ctx.recent_paths.len();
+
+    let path = expand_tilde(PATHS_FILE);
+    let tmp = path.with_extension("tmp");
+
+    // recent_paths は MRU 順 (先頭が直近)。ファイルは「古い順・末尾が直近」で読むため
+    // (load_recent_paths が末尾優先で dedup する)、逆順に書いて直近を末尾へ置く。
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        for rp in ctx.recent_paths.iter().rev() {
+            writeln!(f, "{}", rp.path.to_string_lossy())?;
+        }
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
+
+    // 自端末のオフセットを新サイズへ合わせる (書き直した分を再読み込みしない)。
+    ctx.paths_file_offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+    execute!(
+        stdout(),
+        Print(format!(
+            "refreshed: {} paths ({} removed)\r\n",
+            ctx.recent_paths.len(),
+            removed
+        ))
+    )
 }

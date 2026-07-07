@@ -196,12 +196,18 @@ impl Shell {
                     self.saved_input = self.ed.line().to_string();
                 }
                 let prefix = self.saved_input.clone();
+                let cwd = std::env::current_dir().unwrap_or_default();
                 let start = self.hist_idx.unwrap_or(n);
-                // start より前でプレフィックスに一致する最新エントリを探す
+                // start より前でプレフィックスに一致する最新エントリを探す。
+                // ls/cd の引数パスが消えている候補はスキップするが、
+                // 直前の 1 コマンド (i == n-1) は常に候補に出す。
                 let found = (0..start).rev().find(|&i| {
                     self.history
                         .get_cmd(i)
-                        .map(|cmd| cmd.starts_with(&prefix))
+                        .map(|cmd| {
+                            cmd.starts_with(&prefix)
+                                && (i == n - 1 || completion::cmd_paths_exist(cmd, &cwd))
+                        })
                         .unwrap_or(false)
                 });
                 if let Some(idx) = found {
@@ -219,11 +225,17 @@ impl Shell {
                     Some(i) => {
                         let n = self.history.len();
                         let prefix = self.saved_input.clone();
-                        // i より後でプレフィックスに一致するエントリを探す
+                        let cwd = std::env::current_dir().unwrap_or_default();
+                        // i より後でプレフィックスに一致するエントリを探す。
+                        // ls/cd の引数パスが消えている候補はスキップするが、
+                        // 直前の 1 コマンド (j == n-1) は常に候補に出す。
                         let found = (i + 1..n).find(|&j| {
                             self.history
                                 .get_cmd(j)
-                                .map(|cmd| cmd.starts_with(&prefix))
+                                .map(|cmd| {
+                                    cmd.starts_with(&prefix)
+                                        && (j == n - 1 || completion::cmd_paths_exist(cmd, &cwd))
+                                })
                                 .unwrap_or(false)
                         });
                         if let Some(idx) = found {

@@ -45,11 +45,6 @@ impl History {
         if cmd.is_empty() {
             return;
         }
-        // 2 トークン以下かつ 20 文字未満の短い自明なコマンド (ls, cd .. 等) は
-        // 履歴の価値が薄いので記録しない (メモリにもファイルにも残さない)。
-        if is_trivial(&cmd) {
-            return;
-        }
         self.entries.retain(|e| e != &cmd);
         self.entries.push(cmd.clone());
         if self.entries.len() > MAX_ENTRIES {
@@ -173,18 +168,6 @@ fn parse_line(line: &str) -> Option<String> {
     if cmd.is_empty() { None } else { Some(cmd) }
 }
 
-/// 履歴に残さない「自明なコマンド」判定。
-/// - 先頭トークンが `ls` / `cd` なら長さに関わらず true (無条件で除外)。
-/// - それ以外は 2 トークン以下 (空白区切り) かつ 20 文字未満なら true。
-pub fn is_trivial(cmd: &str) -> bool {
-    let cmd = cmd.trim();
-    let first = cmd.split_whitespace().next().unwrap_or("");
-    if first == "ls" || first == "cd" {
-        return true;
-    }
-    cmd.split_whitespace().count() <= 2 && cmd.chars().count() < 20
-}
-
 // ─── パス展開 ─────────────────────────────────────────────────────────────────
 
 pub fn expand_tilde(path: &str) -> PathBuf {
@@ -256,22 +239,6 @@ mod tests {
             parse_line("123\t/home/user\techo hello").unwrap(),
             "echo hello"
         );
-    }
-
-    #[test]
-    fn is_trivial_filters_short_commands() {
-        // 2 token 以下かつ 20 文字未満 → 記録しない
-        assert!(is_trivial("ls"));
-        assert!(is_trivial("cd .."));
-        assert!(is_trivial("git status")); // 2 token, 10 文字
-        // 3 token 以上、または 20 文字以上 → 記録する
-        assert!(!is_trivial("git commit -m")); // 3 token
-        // ただし ls / cd は先頭トークンなら長さ・token 数に関わらず無条件で除外
-        assert!(is_trivial("cd /very/long/directory/path")); // 20 文字以上でも cd は除外
-        assert!(is_trivial("ls -la /some/longer/path")); // 3 token でも ls は除外
-        // ls/cd で始まらない別コマンドは影響しない
-        assert!(!is_trivial("cdr /very/long/directory/path"));
-        assert!(!is_trivial("lsof -i :8080"));
     }
 
     #[test]

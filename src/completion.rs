@@ -202,33 +202,55 @@ pub fn get_ghost(prefix: &str, cwd: &Path, history: &History) -> Option<String> 
         history,
         tab_end_in_token: None,
     };
+    // 直前の 1 コマンドはパスが消えていても常に候補に出す。
+    let last = history.last_cmd();
     HistoryProvider
         .candidates(&pctx)
         .into_iter()
-        .find(|full| ghost_paths_exist(full, cwd))
+        .find(|full| Some(full.as_str()) == last || cmd_paths_exist(full, cwd))
         .map(|full| full[prefix.len()..].to_string())
         .filter(|s| !s.is_empty())
 }
 
-/// コマンド中のパス風トークン (`/`・`./`・`../`・`~/` 始まり) がすべて実在するか確認する。
-/// パス以外のトークンは無視する。
-fn ghost_paths_exist(cmd: &str, cwd: &Path) -> bool {
+/// コマンド中のパス引数がすべて実在するか確認する。実在しないものがあれば false。
+///
+/// - `/`・`./`・`../`・`~/`・`~` 始まりのトークンは常に検査する。
+/// - 先頭トークンが `ls` / `cd` のときは、フラグ (`-` 始まり) 以外の引数
+///   (裸の相対パス含む) も検査する。頻出コマンドの古い候補を絞るため。
+/// - glob (`*?[`) や変数 (`$`) を含むトークンは検査できないのでスキップする。
+/// - それ以外のトークンは無視する。
+pub(crate) fn cmd_paths_exist(cmd: &str, cwd: &Path) -> bool {
     let Ok(tokens) = shell_words::split(cmd) else {
         return true;
     };
-    tokens.iter().all(|t| {
-        let path = if let Some(rest) = t.strip_prefix("~/") {
-            let home = std::env::var("HOME").unwrap_or_default();
-            std::path::PathBuf::from(home).join(rest)
+    let is_lscd = matches!(tokens.first().map(String::as_str), Some("ls") | Some("cd"));
+    for (i, t) in tokens.iter().enumerate() {
+        let pathlike = t == "~"
+            || t.starts_with('/')
+            || t.starts_with("./")
+            || t.starts_with("../")
+            || t.starts_with("~/");
+        let lscd_arg = is_lscd && i > 0 && !t.starts_with('-');
+        if !pathlike && !lscd_arg {
+            continue;
+        }
+        if t.contains(['*', '?', '[', '$']) {
+            continue; // glob/変数は展開できないので検査しない
+        }
+        let path = if t == "~" {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        } else if let Some(rest) = t.strip_prefix("~/") {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest)
         } else if t.starts_with('/') {
-            std::path::PathBuf::from(t)
-        } else if t.starts_with("./") || t.starts_with("../") {
-            cwd.join(t)
+            std::path::PathBuf::from(t.as_str())
         } else {
-            return true; // パス風でないトークンはスキップ
+            cwd.join(t.as_str())
         };
-        path.exists()
-    })
+        if !path.exists() {
+            return false;
+        }
+    }
+    true
 }
 
 // ─── 補完種別の分類 ───────────────────────────────────────────────────────────
@@ -365,5 +387,29 @@ mod tests {
         assert_eq!(common_prefix(&one), "abc");
         let none = vec!["x".to_string(), "y".to_string()];
         assert_eq!(common_prefix(&none), "");
+    }
+
+    #[test]
+    fn cmd_paths_exist_lscd_bare_arg() {
+        let base = std::env::temp_dir();
+        let sub = base.join(format!("cmd_paths_exist_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&sub);
+        let name = sub.file_name().unwrap().to_string_lossy().to_string();
+
+        // ls/cd の裸の相対引数を検査する
+        assert!(cmd_paths_exist("ls", &base)); // 引数なし
+        assert!(cmd_paths_exist("ls -la", &base)); // フラグのみ
+        assert!(cmd_paths_exist(&format!("cd {}", name), &base));
+        assert!(!cmd_paths_exist("cd no_such_dir_xyz", &base));
+        assert!(!cmd_paths_exist("ls -la no_such_dir_xyz", &base));
+
+        // glob / 変数はスキップ (検査せず true 扱い)
+        assert!(cmd_paths_exist("ls *.rs", &base));
+        assert!(cmd_paths_exist("ls $HOME", &base));
+
+        // ls/cd 以外の裸の引数は検査しない
+        assert!(cmd_paths_exist("cat no_such_dir_xyz", &base));
+
+        let _ = std::fs::remove_dir_all(&sub);
     }
 }
