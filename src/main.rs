@@ -442,11 +442,16 @@ fn run() -> io::Result<()> {
     shell.redraw()?;
 
     loop {
-        let Event::Key(key) = event::read()? else {
-            continue;
+        let mut pending = match event::read()? {
+            Event::Key(key) => handle_key(&mut shell.ed, key),
+            // ブラケットペースト: 改行入りでも 1 イベントで届くので、実行せず
+            // バッファへ挿入するだけ (改行は insert_paste が `; ` に変換して 1 行化)。
+            Event::Paste(data) => {
+                shell.ed.insert_paste(&data);
+                vec![ShellEvent::RedrawPrompt]
+            }
+            _ => continue,
         };
-
-        let mut pending = handle_key(&mut shell.ed, key);
 
         // イベント処理が新たなイベント (主に再描画) を生むため、空になるまで回す。
         while !pending.is_empty() {

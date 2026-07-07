@@ -178,6 +178,16 @@ impl LineEditor {
         self.cursor += s.len();
     }
 
+    /// ブラケットペーストで届いたテキストをカーソル位置へ挿入する。
+    /// 改行はコマンド区切り `; ` に変換して 1 行化する ([`sanitize_paste`] 参照)。
+    /// 実行はしない — ユーザーが Enter を押すまでバッファに留まる。
+    pub fn insert_paste(&mut self, data: &str) {
+        let text = sanitize_paste(data);
+        self.buf.insert_str(self.cursor, &text);
+        self.cursor += text.len();
+        self.tab_end = None;
+    }
+
     pub fn line(&self) -> &str {
         &self.buf
     }
@@ -207,6 +217,23 @@ impl LineEditor {
             .next_back()
             .map(|(i, _)| i)
     }
+}
+
+/// ペーストテキストを 1 行の入力に整える。
+///
+/// - 改行を含まなければそのまま返す (ペーストした空白などをそのまま尊重する)。
+/// - 改行を含む複数行ペーストは、各行を trim して空行を捨て、コマンド区切り `; `
+///   で連結する。外部コマンドは行全体が `sh -c` に渡るので `;` は逐次実行される。
+///   (先頭がビルトインのときだけ `;` 以降は引数扱いになり実行されない。)
+fn sanitize_paste(data: &str) -> String {
+    if !data.contains('\n') && !data.contains('\r') {
+        return data.to_string();
+    }
+    data.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// プロンプトを再描画する。
@@ -452,6 +479,22 @@ fn full_cwd() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_paste_converts_newlines() {
+        // 改行なしはそのまま (空白も尊重する)
+        assert_eq!(sanitize_paste("git status"), "git status");
+        assert_eq!(sanitize_paste("  spaced  "), "  spaced  ");
+        // 複数行は各行 trim + 空行除去して "; " で連結
+        assert_eq!(
+            sanitize_paste("ls -la\ncd src\ncargo build"),
+            "ls -la; cd src; cargo build"
+        );
+        // CRLF・先頭末尾/連続の空行は区切りを増やさない
+        assert_eq!(sanitize_paste("\n\na\r\n\r\nb\n\n"), "a; b");
+        // インデントは除去
+        assert_eq!(sanitize_paste("a\n    b"), "a; b");
+    }
 
     #[test]
     fn shell_word_left_ignores_slash_and_respects_quotes() {

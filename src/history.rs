@@ -45,6 +45,13 @@ impl History {
         if cmd.is_empty() {
             return;
         }
+        // 複数コマンド行 (主にペーストで `; ` 連結されたもの) は記録しない。
+        // ゴースト補完やピッカーで見づらく、頻度も低いため。ただしクォート内や
+        // エスケープされた `;` (例 `find ... -exec rm {} \;`) は正当な単一コマンド
+        // なので記録する。判定はコマンド区切りの `;` があるかどうかで行う。
+        if has_command_separator(&cmd) {
+            return;
+        }
         self.entries.retain(|e| e != &cmd);
         self.entries.push(cmd.clone());
         if self.entries.len() > MAX_ENTRIES {
@@ -168,6 +175,30 @@ fn parse_line(line: &str) -> Option<String> {
     if cmd.is_empty() { None } else { Some(cmd) }
 }
 
+/// コマンド区切りの `;` (トップレベル・クォート外・非エスケープ) を含むか判定する。
+///
+/// シングル/ダブルクォートとバックスラッシュエスケープを追跡するので、
+/// `find ... -exec rm {} \;` の `\;` や `awk '{print;}'`・`echo "a;b"` の
+/// クォート内 `;` は区切りとみなさない。ペースト連結の `; ` だけを弾くのに使う。
+fn has_command_separator(cmd: &str) -> bool {
+    let mut chars = cmd.chars();
+    let mut in_single = false;
+    let mut in_double = false;
+    while let Some(c) = chars.next() {
+        match c {
+            // シングルクォート内以外ではバックスラッシュが次の 1 文字をエスケープする。
+            '\\' if !in_single => {
+                chars.next();
+            }
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            ';' if !in_single && !in_double => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 // ─── パス展開 ─────────────────────────────────────────────────────────────────
 
 pub fn expand_tilde(path: &str) -> PathBuf {
@@ -239,6 +270,24 @@ mod tests {
             parse_line("123\t/home/user\techo hello").unwrap(),
             "echo hello"
         );
+    }
+
+    #[test]
+    fn command_separator_detection() {
+        // トップレベルの裸 `;` → 区切りとして検出 (記録しない)
+        assert!(has_command_separator("ls; cd src"));
+        assert!(has_command_separator("ls -la; cargo build"));
+        assert!(has_command_separator("a; b; c"));
+        // エスケープ・クォート内の `;` → 区切りではない (記録する)
+        assert!(!has_command_separator(
+            "find . -name '*.tmp' -exec rm {} \\;"
+        ));
+        assert!(!has_command_separator("awk '{print; next}' file"));
+        assert!(!has_command_separator("echo \"a; b\""));
+        // `;` を含まない通常コマンド
+        assert!(!has_command_separator("git status"));
+        // エスケープしたバックスラッシュの後の `;` は区切り
+        assert!(has_command_separator("printf 'x\\\\'; ls"));
     }
 
     #[test]

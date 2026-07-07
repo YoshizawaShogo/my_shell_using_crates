@@ -1,5 +1,6 @@
 //! 端末モードの管理。
 
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::{cursor::SetCursorStyle, execute, terminal};
 use std::io::{self, stdout};
 
@@ -13,15 +14,21 @@ pub struct RawModeGuard;
 impl RawModeGuard {
     pub fn new() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
-        // 入力カーソルを I 型 (縦棒) にする。Drop で端末既定の形へ戻す。
-        let _ = execute!(stdout(), SetCursorStyle::SteadyBar);
+        // ブラケットペーストを有効化する。これで貼り付けは 1 つの Event::Paste として
+        // 届き、中の改行が Enter (= 即実行) にならず、レビュー前の誤爆を防げる。
+        // 入力カーソルを I 型 (縦棒) にする。いずれも Drop で元へ戻す。
+        let _ = execute!(stdout(), EnableBracketedPaste, SetCursorStyle::SteadyBar);
         Ok(Self)
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        let _ = execute!(stdout(), SetCursorStyle::DefaultUserShape);
+        let _ = execute!(
+            stdout(),
+            SetCursorStyle::DefaultUserShape,
+            DisableBracketedPaste
+        );
         let _ = terminal::disable_raw_mode();
     }
 }
