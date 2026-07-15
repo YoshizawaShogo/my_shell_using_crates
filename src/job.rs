@@ -9,6 +9,7 @@
 
 use crate::builtin::ShellContext;
 use crate::selector::{self, Selection};
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::{execute, style::Print, terminal};
 use std::io::{self, stdout};
 use std::process::Command;
@@ -122,6 +123,10 @@ fn print_line(id: u32, state: &str, cmd: &str) -> io::Result<()> {
 pub fn run_foreground(command: &mut Command, cmd: &str, ctx: &mut ShellContext) -> io::Result<()> {
     let shell = shell_pgid();
     terminal::disable_raw_mode()?;
+    // 子には bracketed paste を解除した端末を渡す。非対応の子への貼り付けが
+    // マーカー文字列で汚れるのを防ぎ、対応する子 (bash/vim 等) が終了時に残した
+    // 状態も復帰後の再有効化で自己修復する (raw mode の toggle をミラー)。
+    let _ = execute!(stdout(), DisableBracketedPaste);
     let child = command.spawn()?;
     let pid = child.id() as i32;
     // 親側でも setpgid して競合を避ける (子が既に exec 済みでもエラーは無害)。
@@ -132,6 +137,7 @@ pub fn run_foreground(command: &mut Command, cmd: &str, ctx: &mut ShellContext) 
     let outcome = wait_job(pid);
     give_terminal(shell);
     terminal::enable_raw_mode()?;
+    let _ = execute!(stdout(), EnableBracketedPaste);
     // child は waitpid で回収済み。std Child は Drop で wait しないのでそのまま落とす。
     settle(outcome, pid, cmd, None, ctx);
     Ok(())
@@ -161,6 +167,8 @@ pub fn fg(arg: Option<&str>, ctx: &mut ShellContext) -> io::Result<()> {
 
     let shell = shell_pgid();
     terminal::disable_raw_mode()?;
+    // run_foreground と同じく bracketed paste をミラーで toggle する。
+    let _ = execute!(stdout(), DisableBracketedPaste);
     give_terminal(job.pgid);
     unsafe {
         libc::kill(-job.pgid, libc::SIGCONT);
@@ -168,6 +176,7 @@ pub fn fg(arg: Option<&str>, ctx: &mut ShellContext) -> io::Result<()> {
     let outcome = wait_job(job.pgid);
     give_terminal(shell);
     terminal::enable_raw_mode()?;
+    let _ = execute!(stdout(), EnableBracketedPaste);
     settle(outcome, job.pgid, &job.cmd, Some(job.id), ctx);
     Ok(())
 }
