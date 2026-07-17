@@ -99,9 +99,9 @@ pub fn tab_complete(ctx: TabContext<'_>) -> std::io::Result<Selection> {
     }
 
     // グリッドメニュー
-    // token が "/" で終わる場合、候補の共通ディレクトリ部分を除いて表示する。
-    // 例: token="AAA/" のとき "AAA/XXX" → "XXX" と表示し、選択後に "AAA/" を補って確定。
-    let strip_len = if token.ends_with('/') { token.len() } else { 0 };
+    // パス補完では候補のディレクトリ部分を除いて表示する。
+    // 例: token="AAA/x" のとき "AAA/XXX" → "XXX" と表示し、選択後に "AAA/" を補って確定。
+    let strip_len = display_strip_len(&kind, token);
     let display_cands: Vec<String> = cands
         .iter()
         .map(|c| {
@@ -119,11 +119,7 @@ pub fn tab_complete(ctx: TabContext<'_>) -> std::io::Result<Selection> {
     let input_display = 2 + ctx.prefix.width() as u16;
     match selector::run_grid_menu(&display_cands, input_display, highlight)? {
         Selection::Chosen(display) => {
-            let full = if strip_len > 0 {
-                format!("{}{}", token, display)
-            } else {
-                display
-            };
+            let full = restore_display_choice(token, strip_len, display);
             let base = replace_token(ctx.prefix, &full);
             let result = if full.ends_with('/') {
                 base
@@ -325,6 +321,24 @@ fn replace_token(prefix: &str, new_token: &str) -> String {
     format!("{}{}", &prefix[..start], new_token)
 }
 
+/// グリッド表示で候補から隠す現在トークン内のディレクトリ prefix 長。
+fn display_strip_len(kind: &CompletionKind, token: &str) -> usize {
+    if matches!(kind, CompletionKind::Path { .. }) {
+        token.rfind('/').map(|i| i + 1).unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+/// グリッドで短縮表示された候補を、入力行へ挿入するフル候補に戻す。
+fn restore_display_choice(token: &str, strip_len: usize, display: String) -> String {
+    if strip_len > 0 {
+        format!("{}{}", &token[..strip_len], display)
+    } else {
+        display
+    }
+}
+
 /// 候補列の最長共通プレフィックスを返す。
 fn common_prefix(candidates: &[String]) -> &str {
     let Some(first) = candidates.first() else {
@@ -362,6 +376,38 @@ mod tests {
     fn replace_last_token() {
         assert_eq!(replace_token("git comm", "commit"), "git commit");
         assert_eq!(replace_token("ls", "ls"), "ls");
+    }
+
+    #[test]
+    fn display_strip_len_path_uses_last_slash() {
+        let kind = CompletionKind::Path { dirs_only: false };
+        assert_eq!(display_strip_len(&kind, "src/"), 4);
+        assert_eq!(display_strip_len(&kind, "src/ma"), 4);
+        assert_eq!(display_strip_len(&kind, "src/nested/ma"), 11);
+        assert_eq!(display_strip_len(&kind, "main"), 0);
+    }
+
+    #[test]
+    fn display_strip_len_non_path_is_zero() {
+        assert_eq!(display_strip_len(&CompletionKind::EnvVar, "$FOO/ba"), 0);
+        assert_eq!(display_strip_len(&CompletionKind::Command, "bin/ba"), 0);
+        assert_eq!(display_strip_len(&CompletionKind::Job, "job/name"), 0);
+    }
+
+    #[test]
+    fn restore_display_choice_uses_directory_prefix_once() {
+        assert_eq!(
+            restore_display_choice("src/ma", 4, "main.rs".to_string()),
+            "src/main.rs"
+        );
+        assert_eq!(
+            restore_display_choice("src/", 4, "main.rs".to_string()),
+            "src/main.rs"
+        );
+        assert_eq!(
+            restore_display_choice("ma", 0, "main.rs".to_string()),
+            "main.rs"
+        );
     }
 
     #[test]
