@@ -44,6 +44,9 @@ pub struct ShellContext {
     pub last_status: i32,
     /// ジョブ制御の表 (Ctrl+Z で停止したジョブと bg で再開したもの)
     pub jobs: Vec<crate::job::Job>,
+    /// exit ビルトインが要求した終了ステータス (None = 終了要求なし)。
+    /// main.rs のイベントループが拾ってシェルを終了させる。
+    pub exit_status: Option<i32>,
 }
 
 impl Default for ShellContext {
@@ -57,6 +60,7 @@ impl Default for ShellContext {
             aliases: HashMap::new(),
             last_status: 0,
             jobs: Vec::new(),
+            exit_status: None,
         }
     }
 }
@@ -200,6 +204,7 @@ const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("bg", bg),
     ("jobs", jobs),
     ("refresh", refresh),
+    ("exit", exit),
 ];
 
 /// 名前に対応するビルトイン実装を返す。
@@ -256,6 +261,10 @@ fn cd(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
         ctx.dir_stack.retain(|x| x != &cwd);
         ctx.dir_stack.push(cwd);
     }
+
+    // 移動先を端末へ知らせる (OSC 7 / タイトル)。cwd を変えるのは cd だけなので
+    // ここと起動時の 1 回で足りる (毎回の再描画で送るとキー入力ごとに出てしまう)。
+    crate::term::notify_cwd();
     Ok(())
 }
 
@@ -457,4 +466,33 @@ fn refresh(_args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
             removed
         ))
     )
+}
+
+// ─── exit ─────────────────────────────────────────────────────────────────────
+
+/// シェルを終了する。`exit [status]`、引数なしは直前コマンドのステータスを引き継ぐ。
+///
+/// ここでは要求を [`ShellContext::exit_status`] に置くだけで、実際の終了は
+/// main.rs のイベントループが行う。停止ジョブの警告や履歴保存・raw mode 解除を
+/// Ctrl+D の終了経路と共通化するため (`std::process::exit` は Drop を飛ばすので使わない)。
+fn exit(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
+    if args.len() > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many arguments",
+        ));
+    }
+    let status = match args.first() {
+        // last_status はこの後 execute_command が上書きするが、ここで読む時点では
+        // まだ直前コマンドの値。POSIX シェルと同じく引数なしはそれを引き継ぐ。
+        None => ctx.last_status,
+        Some(s) => s.parse::<i32>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("numeric argument required: {}", s),
+            )
+        })?,
+    };
+    ctx.exit_status = Some(status);
+    Ok(())
 }

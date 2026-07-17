@@ -588,8 +588,20 @@ fn run_picker(
         if streaming && !event::poll(Duration::from_millis(50))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
+        let key = match event::read()? {
+            Event::Key(key) => key,
+            // ブラケットペーストは改行入りでも 1 イベントで届く。クエリは 1 行なので
+            // 制御文字を空白へ潰して流し込む (空白区切りの AND 検索なので支障はない)。
+            Event::Paste(data) => {
+                let text = sanitize_query_paste(&data);
+                if !text.is_empty() {
+                    query.push_str(&text);
+                    selected = 0;
+                    dirty = true;
+                }
+                continue;
+            }
+            _ => continue,
         };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -642,6 +654,15 @@ fn run_picker(
         Clear(ClearType::FromCursorDown)
     )?;
     Ok(outcome)
+}
+
+/// ペーストテキストをピッカーのクエリ 1 行に整える。
+/// 改行やタブは空白へ潰す。エディタの `sanitize_paste` と違い `; ` 連結はしない
+/// (クエリはコマンドではなく検索語なので、区切りは空白のままでよい)。
+fn sanitize_query_paste(data: &str) -> String {
+    data.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 /// カーソルがクエリ行 (行0) にある状態で、指定候補を上書き再描画してクエリ行へ戻る。

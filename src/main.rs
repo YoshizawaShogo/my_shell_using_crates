@@ -26,6 +26,7 @@ use exec::execute_command;
 use history::History;
 use selector::Selection;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use term::{RawModeGuard, setup_signal_handlers};
 
 /// RC ファイルパス (起動時に読み込む設定ファイル)
@@ -36,7 +37,8 @@ const RC_FILE: &str = "~/.my_shell_rc";
 struct Shell {
     ed: LineEditor,
     history: History,
-    git_branch: Option<String>,
+    /// プロンプトに出す git の状態 (`main a1b2c3d` 等)
+    git_info: Option<String>,
     ctx: ShellContext,
     ghost: Option<String>,
     /// 履歴ナビゲーション中の位置 (None = ナビゲーション外)
@@ -52,7 +54,7 @@ impl Shell {
         Self {
             ed: LineEditor::default(),
             history: History::load(),
-            git_branch: fetch_git_branch(),
+            git_info: fetch_git_info(),
             ctx: ShellContext::default(),
             ghost: None,
             hist_idx: None,
@@ -66,7 +68,7 @@ impl Shell {
         builtin::reload_recent_paths(&mut self.ctx);
         redraw_prompt(
             &mut self.ed,
-            self.git_branch.as_deref(),
+            self.git_info.as_deref(),
             self.ghost.as_deref(),
         )
     }
@@ -81,6 +83,8 @@ impl Shell {
                 // 停止ジョブがあれば 1 回目は警告して残す。2 回目で SIGHUP して終了。
                 if !self.ctx.jobs.is_empty() && !self.jobs_warned {
                     self.jobs_warned = true;
+                    // 終了要求を取り下げる。残すと次のコマンド実行後に終了してしまう。
+                    self.ctx.exit_status = None;
                     execute!(
                         stdout(),
                         Print("There are stopped jobs (press Ctrl+D again to exit)\r\n")
@@ -134,10 +138,16 @@ impl Shell {
                         ResetColor,
                     )?;
                 }
-                self.git_branch = fetch_git_branch();
+                self.git_info = fetch_git_info();
                 self.ghost = None;
                 self.hist_idx = None;
                 self.saved_input.clear();
+                // exit ビルトインの終了要求。jobs_warned はリセットせずに Exit へ渡す
+                // (停止ジョブがあるとき、2 回目の exit で実際に終了させるため)。
+                if self.ctx.exit_status.is_some() {
+                    pending.push(ShellEvent::Exit);
+                    return Ok(false);
+                }
                 self.jobs_warned = false;
                 // 完了/停止したバックグラウンドジョブをプロンプト表示前に通知する。
                 job::reap_finished(&mut self.ctx)?;
@@ -417,15 +427,21 @@ fn main() -> io::Result<()> {
         libc::mallopt(libc::M_ARENA_MAX, 1);
     }
     setup_signal_handlers()?;
-    let _guard = RawModeGuard::new()?;
-    let result = run();
-    let _ = execute!(stdout(), Print("\r\n"));
-    result
-    // _guard の Drop で disable_raw_mode
-    // shell.history の Drop で HISTORY_FILE へ保存
+    let status = {
+        let _guard = RawModeGuard::new()?;
+        let result = run();
+        let _ = execute!(stdout(), Print("\r\n"));
+        result?
+        // _guard の Drop で disable_raw_mode
+        // shell.history の Drop で HISTORY_FILE へ保存
+    };
+    // Drop をすべて走らせてから終了する (process::exit は Drop を飛ばすので、
+    // raw mode 解除と履歴保存が済んだこの位置でだけ呼ぶ)。
+    std::process::exit(status);
 }
 
-fn run() -> io::Result<()> {
+/// 対話ループ。戻り値はシェルの終了ステータス (`exit [status]` が指定した値)。
+fn run() -> io::Result<i32> {
     let mut shell = Shell::new();
 
     // 起動時に PWD を実際のカレントへ同期しておく。親から継承した PWD が古い / 未設定
@@ -437,6 +453,10 @@ fn run() -> io::Result<()> {
 
     // RC ファイルを読み込んで各行を実行する
     load_rc(&mut shell.ctx);
+
+    // 起動時の cwd を端末へ通知する (以降は cd が送る)。RC に cd があってもその
+    // あとで送るので最終的な cwd が出る。
+    term::notify_cwd();
 
     shell.ghost = compute_ghost(&shell.ed, &shell.history);
     shell.redraw()?;
@@ -457,7 +477,7 @@ fn run() -> io::Result<()> {
         while !pending.is_empty() {
             for ev in std::mem::take(&mut pending) {
                 if shell.handle_event(ev, &mut pending)? {
-                    return Ok(());
+                    return Ok(shell.ctx.exit_status.unwrap_or(0));
                 }
             }
         }
@@ -512,32 +532,99 @@ fn compute_ghost(ed: &LineEditor, history: &History) -> Option<String> {
     completion::get_ghost(ed.line(), &cwd, history)
 }
 
-fn fetch_git_branch() -> Option<String> {
+/// プロンプトに出すコミットハッシュの文字数 (git の短縮ハッシュに合わせる)
+const GIT_HASH_LEN: usize = 7;
+
+/// `.git` の実体ディレクトリを cwd から親へ辿って探す。
+fn find_git_dir() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let mut dir = cwd.as_path();
     loop {
         let dot_git = dir.join(".git");
         if dot_git.is_dir() {
-            let head = std::fs::read_to_string(dot_git.join("HEAD")).ok()?;
-            return head
-                .trim()
-                .strip_prefix("ref: refs/heads/")
-                .map(str::to_string);
+            return Some(dot_git);
         } else if dot_git.is_file() {
             // git worktree: ".git" ファイルに "gitdir: <path>" が入っている
             let content = std::fs::read_to_string(&dot_git).ok()?;
             let gitdir = content.trim().strip_prefix("gitdir: ")?;
-            let gitdir_path = if gitdir.starts_with('/') {
-                std::path::PathBuf::from(gitdir)
+            return Some(if gitdir.starts_with('/') {
+                PathBuf::from(gitdir)
             } else {
                 dir.join(gitdir)
-            };
-            let head = std::fs::read_to_string(gitdir_path.join("HEAD")).ok()?;
-            return head
-                .trim()
-                .strip_prefix("ref: refs/heads/")
-                .map(str::to_string);
+            });
         }
         dir = dir.parent()?;
+    }
+}
+
+/// refs/ と packed-refs を持つディレクトリ。worktree では commondir が本体を指す。
+fn git_common_dir(git_dir: &Path) -> PathBuf {
+    let Ok(content) = std::fs::read_to_string(git_dir.join("commondir")) else {
+        return git_dir.to_path_buf();
+    };
+    let common = content.trim();
+    if common.starts_with('/') {
+        PathBuf::from(common)
+    } else {
+        git_dir.join(common)
+    }
+}
+
+/// `refs/heads/main` のような ref 名をコミットハッシュへ解決する。
+/// 疎ファイル → packed-refs の順に探し、symref は数段だけ辿る。
+fn resolve_ref(common_dir: &Path, ref_name: &str) -> Option<String> {
+    let mut name = ref_name.to_string();
+    for _ in 0..4 {
+        if let Ok(content) = std::fs::read_to_string(common_dir.join(&name)) {
+            let value = content.trim();
+            match value.strip_prefix("ref: ") {
+                Some(target) => {
+                    name = target.to_string();
+                    continue;
+                }
+                None => return Some(value.to_string()),
+            }
+        }
+        if let Ok(packed) = std::fs::read_to_string(common_dir.join("packed-refs")) {
+            for line in packed.lines() {
+                // "#" はヘッダ、"^" は annotated tag の指す先 (ここでは不要)
+                if line.starts_with('#') || line.starts_with('^') {
+                    continue;
+                }
+                let Some((hash, packed_name)) = line.split_once(' ') else {
+                    continue;
+                };
+                if packed_name == name {
+                    return Some(hash.to_string());
+                }
+            }
+        }
+        return None;
+    }
+    None
+}
+
+/// プロンプトのヘッダに出す git の状態 (例: `main a1b2c3d` / `detached a1b2c3d`)。
+fn fetch_git_info() -> Option<String> {
+    let git_dir = find_git_dir()?;
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    let common_dir = git_common_dir(&git_dir);
+
+    // ブランチ上なら "ref: refs/heads/<name>"、detached HEAD なら生のハッシュ
+    let (label, hash) = match head.strip_prefix("ref: ") {
+        Some(ref_name) => (
+            ref_name.strip_prefix("refs/heads/")?.to_string(),
+            resolve_ref(&common_dir, ref_name),
+        ),
+        None => ("detached".to_string(), Some(head.to_string())),
+    };
+
+    // 生成直後などコミットが 1 つも無いリポジトリではハッシュを出せない
+    match hash {
+        Some(hash) if hash.len() >= GIT_HASH_LEN => {
+            Some(format!("{} {}", label, &hash[..GIT_HASH_LEN]))
+        }
+        _ => Some(label),
     }
 }

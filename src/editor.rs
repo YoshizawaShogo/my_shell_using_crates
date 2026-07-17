@@ -239,14 +239,14 @@ fn sanitize_paste(data: &str) -> String {
 /// プロンプトを再描画する。
 ///
 /// 画面構成:
-///   行 H : user@host ~/path (branch)  ← ヘッダ行
+///   行 H : user@host ~/path (branch hash)  ← ヘッダ行
 ///   行 H+1: \[入力バッファ\]              ← 入力行 (折り返し可)
 ///
 /// `lines_above_cursor` は行 H からカーソル行までの距離を保持し、
 /// 次回の `MoveUp` でヘッダ先頭に戻るために使う。
 pub fn redraw_prompt(
     ed: &mut LineEditor,
-    git_branch: Option<&str>,
+    git_info: Option<&str>,
     ghost: Option<&str>,
 ) -> io::Result<()> {
     let (term_cols, _) = terminal::size()?;
@@ -280,8 +280,8 @@ pub fn redraw_prompt(
         Print(&cwd),
         ResetColor,
     )?;
-    if let Some(branch) = git_branch {
-        let branch_text = format!(" ({})", branch);
+    if let Some(info) = git_info {
+        let branch_text = format!(" ({})", info);
         header_display_width += branch_text.width();
         queue!(
             stdout(),
@@ -454,7 +454,7 @@ fn shell_word_right_pos(s: &str, cursor: usize) -> usize {
     s.len()
 }
 
-fn hostname() -> String {
+pub fn hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| std::env::var("HOSTNAME").unwrap_or_else(|_| "?".to_string()))
