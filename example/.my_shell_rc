@@ -1,6 +1,6 @@
 # my_shell_rc - 起動時に読み込まれる設定ファイル
 # コメント行は # で始める。空行は無視される。
-# 使えるコマンド: alias, abbr, set, setenv, cd, reg_path
+# 使えるコマンド: alias, abbr, set, setenv, cd, source-env
 
 # ── ls エイリアス (Ubuntu bashrc デフォルト相当) ─────────────────────────────
 alias ls "ls --color=auto"
@@ -21,7 +21,6 @@ alias rm "rm -i"
 # ── ディレクトリ移動 abbr ─────────────────────────────────────────────────────
 abbr ..  "cd .."
 abbr ... "cd ../.."
-abbr p   popd
 
 # ── cargo abbr ───────────────────────────────────────────────────────────────
 abbr c   cargo
