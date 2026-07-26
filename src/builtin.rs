@@ -314,8 +314,10 @@ fn source_env(args: &[&str], _ctx: &mut ShellContext) -> io::Result<()> {
 
     let file_path = expand_tilde(file);
     let file_str = file_path.to_string_lossy();
+    // csh/tcsh には POSIX の `.` (dot) が無く source は `source`。fish も `source`。
+    // これらを `.` の分岐へ落とすと `.` が外部コマンド扱いになり必ず失敗する。
     let script = match shell.as_str() {
-        "fish" => format!("source '{}' && env -0", file_str),
+        "fish" | "csh" | "tcsh" => format!("source '{}' && env -0", file_str),
         _ => format!(". '{}' && env -0", file_str),
     };
 
