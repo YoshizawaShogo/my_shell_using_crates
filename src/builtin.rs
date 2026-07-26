@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 pub const PATHS_FILE: &str = "~/.my_shell_paths";
 
 /// 記録するパスの上限件数 (これを超えた古い (MRU 末尾) エントリを捨てる)。
-const MAX_RECENT_PATHS: usize = 500;
+const MAX_RECENT_PATHS: usize = 10_000;
 
 // ─── シェル状態 ───────────────────────────────────────────────────────────────
 
@@ -65,37 +65,63 @@ impl Default for ShellContext {
     }
 }
 
-/// 永続化ファイルを読み込む。末尾 (新しい方) を優先して dedup し、
-/// 存在しないパスを除去したうえで MRU 順 (先頭が直近) で返す。
-/// 戻り値: (パス一覧, ファイルサイズ)
+/// 永続化ファイルを読み込む。末尾 (新しい方) を優先して dedup し、MRU 順
+/// (先頭が直近) で返す。戻り値: (パス一覧, ファイルサイズ)
+///
+/// is_dir は各行の末尾 `/` の有無から判定するので **stat しない**。存在しない
+/// パスの除去も `refresh` ビルトインの手動実行に一本化し、起動を軽く保つ
+/// (WSL2 の /mnt などで stat が桁違いに遅い問題を回避する)。
 fn load_recent_paths() -> (Vec<RecentPath>, u64) {
     let path = expand_tilde(PATHS_FILE);
     let content = std::fs::read_to_string(&path).unwrap_or_default();
     let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
-    let lines: Vec<PathBuf> = content
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(PathBuf::from)
-        .collect();
-
-    // 末尾 (新しい方) を優先して dedup → 結果は新しい順 (MRU)
+    // 末尾 (新しい方) を優先して dedup → 結果は新しい順 (MRU)。
     let mut seen = std::collections::HashSet::new();
-    let deduped: Vec<PathBuf> = lines
-        .into_iter()
+    let mut result: Vec<RecentPath> = content
+        .lines()
         .rev()
-        .filter(|p| seen.insert(p.clone()))
+        .filter_map(parse_recent_line)
+        .filter(|rp| seen.insert(rp.path.clone()))
         .collect();
-
-    // 実在チェックと is_dir 判定を 1 回の metadata で兼ねる (存在しなければ除外)。
-    let mut result: Vec<RecentPath> = deduped.into_iter().filter_map(to_recent_path).collect();
     result.truncate(MAX_RECENT_PATHS);
     (result, file_size)
 }
 
+/// ファイルの 1 行を `RecentPath` に変換する (stat しない)。
+/// 末尾 `/` があればディレクトリ、無ければファイルとみなし、パスからは `/` を除く。
+/// 空行や `/` だけの行は `None`。
+///
+/// (末尾 `/` を is_dir の永続フラグとして使う。記録時に 1 回 stat した結果を
+///  ここへ持ち越すことで、起動・リロードで stat し直さずに済む。)
+fn parse_recent_line(line: &str) -> Option<RecentPath> {
+    let (path_str, is_dir) = match line.strip_suffix('/') {
+        Some(stripped) => (stripped, true),
+        None => (line, false),
+    };
+    if path_str.is_empty() {
+        return None;
+    }
+    Some(RecentPath {
+        path: PathBuf::from(path_str),
+        is_dir,
+    })
+}
+
+/// `RecentPath` をファイル 1 行の文字列にする。ディレクトリは末尾 `/` を付けて
+/// is_dir を永続化する ([parse_recent_line] と対を成す)。
+fn recent_line(rp: &RecentPath) -> String {
+    if rp.is_dir {
+        format!("{}/", rp.path.to_string_lossy())
+    } else {
+        rp.path.to_string_lossy().into_owned()
+    }
+}
+
 /// パスを 1 回 `metadata` して `RecentPath` にする。存在しなければ `None`。
 /// (`metadata` はシンボリックリンクを辿るので、実体が dir かで `is_dir` を決める。)
-fn to_recent_path(p: PathBuf) -> Option<RecentPath> {
+/// 実在チェックを伴う唯一の経路なので、`refresh` の掃除でのみ使う。
+fn stat_recent_path(p: PathBuf) -> Option<RecentPath> {
     let is_dir = std::fs::metadata(&p).ok()?.is_dir();
     Some(RecentPath { path: p, is_dir })
 }
@@ -125,9 +151,7 @@ pub fn reload_recent_paths(ctx: &mut ShellContext) {
     let new_paths: Vec<RecentPath> = io::BufReader::new(&file)
         .lines()
         .map_while(Result::ok)
-        .filter(|l| !l.is_empty())
-        .map(PathBuf::from)
-        .filter_map(to_recent_path)
+        .filter_map(|l| parse_recent_line(&l))
         .collect();
     ctx.paths_file_offset = meta.len();
     for rp in new_paths {
@@ -137,15 +161,15 @@ pub fn reload_recent_paths(ctx: &mut ShellContext) {
     ctx.recent_paths.truncate(MAX_RECENT_PATHS);
 }
 
-/// パスをファイル末尾に 1 行追記する。
-fn append_recent_path(p: &Path) -> io::Result<()> {
+/// パスをファイル末尾に 1 行追記する (ディレクトリは末尾 `/` 付き)。
+fn append_recent_path(rp: &RecentPath) -> io::Result<()> {
     use std::io::Write;
     let file_path = expand_tilde(PATHS_FILE);
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(file_path)?;
-    writeln!(file, "{}", p.to_string_lossy())
+    writeln!(file, "{}", recent_line(rp))
 }
 
 /// コマンドの引数群から実在するパスを `recent_paths` に MRU 記録する。
@@ -167,16 +191,14 @@ pub fn record_arg_paths(ctx: &mut ShellContext, args: &[String], cwd: &Path) {
             continue;
         };
         let is_dir = canon.is_dir();
-        // MRU: 既存を取り除いて先頭へ。
+        let rp = RecentPath {
+            path: canon.clone(),
+            is_dir,
+        };
+        // MRU: 既存を取り除いて先頭へ。追記してから insert (insert が rp を消費する)。
         ctx.recent_paths.retain(|x| x.path != canon);
-        ctx.recent_paths.insert(
-            0,
-            RecentPath {
-                path: canon.clone(),
-                is_dir,
-            },
-        );
-        let _ = append_recent_path(&canon);
+        let _ = append_recent_path(&rp);
+        ctx.recent_paths.insert(0, rp);
         changed = true;
     }
     if changed {
@@ -431,13 +453,13 @@ fn refresh(_args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
     // 他端末の追記も取り込んだ最新状態にしてから書き出す。
     reload_recent_paths(ctx);
 
-    // 実在チェックを全件やり直す。reload は追記分しか見ないので、起動後に削除された
-    // パスはメモリ (= 現在のシェルの Ctrl+G 候補) に残ったまま。ここで stat し直して
-    // 消えたエントリを落とし、is_dir も更新することで現在のシェルにも即反映する。
+    // 実在チェックを全件やり直す。起動・リロードは stat しないので、削除された
+    // パスや古い is_dir はメモリに残ったまま。掃除はこの refresh に一本化しており、
+    // ここで stat し直して消えたエントリを落とし、is_dir も現在の実体に合わせて更新する。
     let before = ctx.recent_paths.len();
     ctx.recent_paths = std::mem::take(&mut ctx.recent_paths)
         .into_iter()
-        .filter_map(|rp| to_recent_path(rp.path))
+        .filter_map(|rp| stat_recent_path(rp.path))
         .collect();
     let removed = before - ctx.recent_paths.len();
 
@@ -449,7 +471,7 @@ fn refresh(_args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
     {
         let mut f = std::fs::File::create(&tmp)?;
         for rp in ctx.recent_paths.iter().rev() {
-            writeln!(f, "{}", rp.path.to_string_lossy())?;
+            writeln!(f, "{}", recent_line(rp))?;
         }
         f.sync_all()?;
     }
@@ -495,4 +517,51 @@ fn exit(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
     };
     ctx.exit_status = Some(status);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recent_line_roundtrip() {
+        // ディレクトリは末尾 / 付き、ファイルは無しで往復する。
+        let dir = RecentPath {
+            path: PathBuf::from("/home/x/proj"),
+            is_dir: true,
+        };
+        let file = RecentPath {
+            path: PathBuf::from("/home/x/proj/main.rs"),
+            is_dir: false,
+        };
+        assert_eq!(recent_line(&dir), "/home/x/proj/");
+        assert_eq!(recent_line(&file), "/home/x/proj/main.rs");
+
+        let d = parse_recent_line(&recent_line(&dir)).unwrap();
+        assert_eq!(d.path, dir.path);
+        assert!(d.is_dir);
+        let f = parse_recent_line(&recent_line(&file)).unwrap();
+        assert_eq!(f.path, file.path);
+        assert!(!f.is_dir);
+    }
+
+    #[test]
+    fn parse_recent_line_edges() {
+        // 空行と "/" だけの行は None。
+        assert!(parse_recent_line("").is_none());
+        assert!(parse_recent_line("/").is_none());
+        // 末尾 / 無しはファイル扱い (旧フォーマットもここに落ちる)。
+        let f = parse_recent_line("/tmp/a").unwrap();
+        assert!(!f.is_dir);
+        assert_eq!(f.path, PathBuf::from("/tmp/a"));
+        // ルートディレクトリは "//" として記録され "/" に復元される。
+        let root = RecentPath {
+            path: PathBuf::from("/"),
+            is_dir: true,
+        };
+        assert_eq!(recent_line(&root), "//");
+        let r = parse_recent_line("//").unwrap();
+        assert_eq!(r.path, PathBuf::from("/"));
+        assert!(r.is_dir);
+    }
 }

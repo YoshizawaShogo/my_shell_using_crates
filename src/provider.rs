@@ -43,9 +43,10 @@ pub struct CommandProvider;
 
 impl CandidateProvider for CommandProvider {
     fn candidates(&self, ctx: &CompletionContext<'_>) -> Vec<String> {
-        let prefix = ctx.prefix;
+        // 照合は大小無視 (PathProvider と揃える)。挿入するのは実体の綴り。
+        let prefix = ctx.prefix.to_lowercase();
         let mut cmds: Vec<String> = builtin_names()
-            .filter(|name| name.starts_with(prefix))
+            .filter(|name| name.to_lowercase().starts_with(&prefix))
             .map(|name| name.to_string())
             .collect();
 
@@ -57,7 +58,7 @@ impl CandidateProvider for CommandProvider {
                 for entry in entries.flatten() {
                     let name = entry.file_name();
                     let name_str = name.to_string_lossy();
-                    if name_str.starts_with(prefix) && is_executable(&entry) {
+                    if name_str.to_lowercase().starts_with(&prefix) && is_executable(&entry) {
                         cmds.push(name_str.into_owned());
                     }
                 }
@@ -102,8 +103,13 @@ impl CandidateProvider for PathProvider {
             return vec![];
         };
 
-        // tab_end がある場合: file_prefix を [completed_base][user_filter] に分割する。
-        // ディレクトリ部分 (display_prefix) は tab_end の計算に含まれているので引く。
+        // 照合はすべて大小無視。`needle` はトークンのファイル名部分全体。
+        let needle = file_prefix.to_lowercase();
+
+        // tab_end フィルタ (前回 Tab で base まで補完済み、以降が手入力フィルタ) の分割。
+        // ディレクトリ部分 (display_prefix) は tab_end の計算に含まれるので引く。
+        // これは「前方一致が 0 件のとき」のフォールバック照合にのみ使う:
+        //   base を前方一致しつつ filter を部分一致する候補を拾う。
         let dir_prefix_len = display_prefix.len();
         let (base_lower, filter_lower) = match ctx.tab_end_in_token {
             Some(te) if te > dir_prefix_len && te <= dir_prefix_len + file_prefix.len() => {
@@ -113,72 +119,51 @@ impl CandidateProvider for PathProvider {
                     file_prefix[split..].to_lowercase(),
                 )
             }
-            _ => (file_prefix.to_lowercase(), String::new()),
+            _ => (String::new(), String::new()),
         };
         let has_filter = !filter_lower.is_empty();
-        let needle = file_prefix.to_lowercase();
 
-        if has_filter {
-            // tab_end あり: base がプレフィックス一致 AND user_filter が部分一致
-            let mut results: Vec<String> = entries
-                .flatten()
-                .filter_map(|e| {
-                    let name = e.file_name();
-                    let name_lower = name.to_string_lossy().to_lowercase();
-                    if !name_lower.starts_with(&base_lower) || !name_lower.contains(&filter_lower) {
-                        return None;
-                    }
-                    let is_dir = e.path().is_dir();
-                    if self.dirs_only && !is_dir {
-                        return None;
-                    }
-                    let slash = if is_dir { "/" } else { "" };
-                    Some(format!(
-                        "{}{}{}",
-                        display_prefix,
-                        name.to_string_lossy(),
-                        slash
-                    ))
-                })
-                .collect();
-            results.sort_unstable();
-            results
-        } else {
-            // tab_end なし: prefix 一致優先。prefix 一致があれば contains は除外。
-            let mut prefix_matches: Vec<String> = Vec::new();
-            let mut contains_matches: Vec<String> = Vec::new();
+        // 前方一致 (トークン全体を starts_with) を最優先し、無いときだけフォールバック
+        // (tab_end フィルタ時は base 前方一致 AND filter 部分一致、それ以外は素の部分一致)
+        // へ落とす。tab_end フィルタ経路でも真の前方一致候補が部分一致に埋もれないよう、
+        // 両経路でこの優先規則を共通化している。
+        let mut prefix_matches: Vec<String> = Vec::new();
+        let mut fallback_matches: Vec<String> = Vec::new();
 
-            for e in entries.flatten() {
-                let name = e.file_name();
-                let name_str = name.to_string_lossy();
-                let name_lower = name_str.to_lowercase();
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let name_str = name.to_string_lossy();
+            let name_lower = name_str.to_lowercase();
 
-                let is_prefix = name_lower.starts_with(&needle);
-                let is_contains = !is_prefix && name_lower.contains(&needle);
-                if !is_prefix && !is_contains {
-                    continue;
-                }
-
-                let is_dir = e.path().is_dir();
-                if self.dirs_only && !is_dir {
-                    continue;
-                }
-                let slash = if is_dir { "/" } else { "" };
-                let candidate = format!("{}{}{}", display_prefix, name_str, slash);
-                if is_prefix {
-                    prefix_matches.push(candidate);
-                } else {
-                    contains_matches.push(candidate);
-                }
-            }
-
-            prefix_matches.sort_unstable();
-            if prefix_matches.is_empty() {
-                contains_matches.sort_unstable();
-                contains_matches
+            let is_prefix = name_lower.starts_with(&needle);
+            let is_fallback = if has_filter {
+                name_lower.starts_with(&base_lower) && name_lower.contains(&filter_lower)
             } else {
-                prefix_matches
+                name_lower.contains(&needle)
+            };
+            if !is_prefix && !is_fallback {
+                continue;
             }
+
+            let is_dir = e.path().is_dir();
+            if self.dirs_only && !is_dir {
+                continue;
+            }
+            let slash = if is_dir { "/" } else { "" };
+            let candidate = format!("{}{}{}", display_prefix, name_str, slash);
+            if is_prefix {
+                prefix_matches.push(candidate);
+            } else {
+                fallback_matches.push(candidate);
+            }
+        }
+
+        prefix_matches.sort_unstable();
+        if prefix_matches.is_empty() {
+            fallback_matches.sort_unstable();
+            fallback_matches
+        } else {
+            prefix_matches
         }
     }
 }
@@ -377,5 +362,31 @@ mod tests {
         assert_eq!(dir, PathBuf::from("/home/x/sub/"));
         assert_eq!(file, "fo");
         assert_eq!(disp, "sub/");
+    }
+
+    /// tab_end フィルタ経路でも「トークン全体の前方一致」を最優先する。
+    /// `datafeed` (前方一致) が `datafile` (`e` を含むだけの部分一致) に埋もれず
+    /// 単独候補として返ることを確認する (前方一致優先バグの回帰防止)。
+    #[test]
+    fn path_filter_branch_prefers_prefix() {
+        let dir = std::env::temp_dir().join(format!("prov_prefix_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["datafeed.json", "datafile.csv", "metadata.txt"] {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+        let history = History::load();
+
+        // base="dataf" まで補完済み (tab_end=5)、手入力フィルタ "e" → token "datafe"
+        let ctx = CompletionContext {
+            prefix: "datafe",
+            cwd: &dir,
+            history: &history,
+            tab_end_in_token: Some(5),
+        };
+        let cands = PathProvider { dirs_only: false }.candidates(&ctx);
+        assert_eq!(cands, vec!["datafeed.json".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

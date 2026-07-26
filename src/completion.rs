@@ -81,13 +81,16 @@ pub fn tab_complete(ctx: TabContext<'_>) -> std::io::Result<Selection> {
 
     // 候補が 1 つなら即確定
     if cands.len() == 1 {
-        let base = replace_token(ctx.prefix, &cands[0]);
-        let result = if cands[0].ends_with('/') {
-            base
-        } else {
-            base + " "
-        };
-        return Ok(Selection::Chosen(result));
+        return Ok(Selection::Chosen(finalize_choice(ctx.prefix, &cands[0])));
+    }
+
+    // トークンが候補のどれかと完全一致するなら即確定する (git と gitk が併存しても
+    // `git`+Tab で `git ` を確定できる)。ディレクトリ候補は末尾 `/` を除いて比較する。
+    if let Some(exact) = cands
+        .iter()
+        .find(|c| c.as_str() == token || c.strip_suffix('/') == Some(token))
+    {
+        return Ok(Selection::Chosen(finalize_choice(ctx.prefix, exact)));
     }
 
     // 共通プレフィックスが現在トークンより長く、かつ入力が共通プレフィックスの
@@ -120,13 +123,7 @@ pub fn tab_complete(ctx: TabContext<'_>) -> std::io::Result<Selection> {
     match selector::run_grid_menu(&display_cands, input_display, highlight)? {
         Selection::Chosen(display) => {
             let full = restore_display_choice(token, strip_len, display);
-            let base = replace_token(ctx.prefix, &full);
-            let result = if full.ends_with('/') {
-                base
-            } else {
-                base + " "
-            };
-            Ok(Selection::Chosen(result))
+            Ok(Selection::Chosen(finalize_choice(ctx.prefix, &full)))
         }
         other => Ok(other),
     }
@@ -321,6 +318,17 @@ fn replace_token(prefix: &str, new_token: &str) -> String {
     format!("{}{}", &prefix[..start], new_token)
 }
 
+/// 候補を確定して入力行を作る。ディレクトリ (末尾 `/`) はさらに潜れるよう空白を
+/// 付けず、ファイル/コマンドは次のトークンへ進めるよう末尾に空白を足す。
+fn finalize_choice(prefix: &str, choice: &str) -> String {
+    let base = replace_token(prefix, choice);
+    if choice.ends_with('/') {
+        base
+    } else {
+        base + " "
+    }
+}
+
 /// グリッド表示で候補から隠す現在トークン内のディレクトリ prefix 長。
 fn display_strip_len(kind: &CompletionKind, token: &str) -> usize {
     if matches!(kind, CompletionKind::Path { .. }) {
@@ -339,7 +347,10 @@ fn restore_display_choice(token: &str, strip_len: usize, display: String) -> Str
     }
 }
 
-/// 候補列の最長共通プレフィックスを返す。
+/// 候補列の最長共通プレフィックスを返す (大小無視で比較し、綴りは先頭候補のものを使う)。
+///
+/// 大小無視にするのは `PathProvider` / `CommandProvider` が大小無視で候補を集めるため。
+/// 区別すると `Makefile` と `makeshift` のような候補で延長が効かなくなる。
 fn common_prefix(candidates: &[String]) -> &str {
     let Some(first) = candidates.first() else {
         return "";
@@ -349,7 +360,7 @@ fn common_prefix(candidates: &[String]) -> &str {
         end = first[..end]
             .chars()
             .zip(cand.chars())
-            .take_while(|(a, b)| a == b)
+            .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
             .fold(0, |acc, (c, _)| acc + c.len_utf8());
     }
     &first[..end]
@@ -433,6 +444,22 @@ mod tests {
         assert_eq!(common_prefix(&one), "abc");
         let none = vec!["x".to_string(), "y".to_string()];
         assert_eq!(common_prefix(&none), "");
+    }
+
+    #[test]
+    fn common_prefix_case_insensitive() {
+        // 大小が違っても共通接頭辞を検出し、綴りは先頭候補のものを使う。
+        let v = vec!["Makefile".to_string(), "makeshift".to_string()];
+        assert_eq!(common_prefix(&v), "Make");
+        let v2 = vec!["README".to_string(), "readme.md".to_string()];
+        assert_eq!(common_prefix(&v2), "README");
+    }
+
+    #[test]
+    fn finalize_dir_vs_file() {
+        // ディレクトリ候補 (末尾 /) は空白を付けず、ファイルは空白を足す。
+        assert_eq!(finalize_choice("cd sr", "src/"), "cd src/");
+        assert_eq!(finalize_choice("cat ma", "main.rs"), "cat main.rs ");
     }
 
     #[test]

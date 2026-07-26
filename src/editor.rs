@@ -460,7 +460,7 @@ pub fn hostname() -> String {
         .unwrap_or_else(|_| std::env::var("HOSTNAME").unwrap_or_else(|_| "?".to_string()))
 }
 
-fn full_cwd() -> String {
+pub fn full_cwd() -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())

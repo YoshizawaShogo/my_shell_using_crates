@@ -127,6 +127,8 @@ pub fn run_foreground(command: &mut Command, cmd: &str, ctx: &mut ShellContext) 
     // マーカー文字列で汚れるのを防ぎ、対応する子 (bash/vim 等) が終了時に残した
     // 状態も復帰後の再有効化で自己修復する (raw mode の toggle をミラー)。
     let _ = execute!(stdout(), DisableBracketedPaste);
+    // 実行中はタイトルを `cmd名 @ cwd` にし、終了時に既定へ戻す。
+    crate::term::set_running_title(cmd);
     let child = command.spawn()?;
     let pid = child.id() as i32;
     // 親側でも setpgid して競合を避ける (子が既に exec 済みでもエラーは無害)。
@@ -136,6 +138,7 @@ pub fn run_foreground(command: &mut Command, cmd: &str, ctx: &mut ShellContext) 
     give_terminal(pid);
     let outcome = wait_job(pid);
     give_terminal(shell);
+    crate::term::reset_title();
     terminal::enable_raw_mode()?;
     let _ = execute!(stdout(), EnableBracketedPaste);
     // child は waitpid で回収済み。std Child は Drop で wait しないのでそのまま落とす。
@@ -169,12 +172,14 @@ pub fn fg(arg: Option<&str>, ctx: &mut ShellContext) -> io::Result<()> {
     terminal::disable_raw_mode()?;
     // run_foreground と同じく bracketed paste をミラーで toggle する。
     let _ = execute!(stdout(), DisableBracketedPaste);
+    crate::term::set_running_title(&job.cmd);
     give_terminal(job.pgid);
     unsafe {
         libc::kill(-job.pgid, libc::SIGCONT);
     }
     let outcome = wait_job(job.pgid);
     give_terminal(shell);
+    crate::term::reset_title();
     terminal::enable_raw_mode()?;
     let _ = execute!(stdout(), EnableBracketedPaste);
     settle(outcome, job.pgid, &job.cmd, Some(job.id), ctx);

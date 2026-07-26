@@ -48,14 +48,6 @@ pub fn notify_cwd() {
     };
     let path = cwd.to_string_lossy();
 
-    // "/" には file_name が無いのでパスそのものを使う。
-    let title = match cwd.file_name() {
-        Some(name) => name.to_string_lossy().into_owned(),
-        None => path.clone().into_owned(),
-    };
-    // BEL を含む名前でタイトルが途中で終わらないよう制御文字を落とす。
-    let title: String = title.chars().filter(|c| !c.is_control()).collect();
-
     let _ = execute!(
         stdout(),
         Print(format!(
@@ -63,8 +55,40 @@ pub fn notify_cwd() {
             crate::editor::hostname(),
             percent_encode(&path)
         )),
-        Print(format!("\x1b]2;{}\x07", title)),
     );
+    set_title(&cwd_title());
+}
+
+/// OSC 2 (ウィンドウタイトル) だけを設定する。
+///
+/// BEL を含む文字列でタイトルが途中で終わらないよう制御文字を落とす。
+pub fn set_title(title: &str) {
+    let title: String = title.chars().filter(|c| !c.is_control()).collect();
+    let _ = execute!(stdout(), Print(format!("\x1b]2;{}\x07", title)));
+}
+
+/// 現在の cwd に対応する既定タイトル (末尾ディレクトリ名)。
+fn cwd_title() -> String {
+    let Ok(cwd) = std::env::current_dir() else {
+        return String::new();
+    };
+    // "/" には file_name が無いのでパスそのものを使う。
+    match cwd.file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => cwd.to_string_lossy().into_owned(),
+    }
+}
+
+/// 外部コマンド実行中のタイトルを `cmd名 @ ~/path` にする (子プロセス起動時に呼ぶ)。
+/// コマンド名は先頭トークンだけを出す (引数まで出すと長すぎるため)。
+pub fn set_running_title(cmd: &str) {
+    let name = cmd.split_whitespace().next().unwrap_or(cmd);
+    set_title(&format!("{} @ {}", name, crate::editor::full_cwd()));
+}
+
+/// タイトルを既定 (末尾ディレクトリ名) へ戻す (外部コマンド終了時に呼ぶ)。
+pub fn reset_title() {
+    set_title(&cwd_title());
 }
 
 /// OSC 7 の URI 用エンコード。非予約文字 (RFC 3986) と `/` 以外を `%XX` にする。
