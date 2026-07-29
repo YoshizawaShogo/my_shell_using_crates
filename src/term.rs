@@ -79,11 +79,12 @@ fn cwd_title() -> String {
     }
 }
 
-/// 外部コマンド実行中のタイトルを `cmd名 @ ~/path` にする (子プロセス起動時に呼ぶ)。
-/// コマンド名は先頭トークンだけを出す (引数まで出すと長すぎるため)。
+/// 外部コマンド実行中のタイトルを `cmd名 @ dir` にする (子プロセス起動時に呼ぶ)。
+/// コマンド名は先頭トークンだけ、ディレクトリはフルパスではなく末尾の名前だけを出す
+/// (どちらもフルだとタイトルが長くなりすぎるため)。
 pub fn set_running_title(cmd: &str) {
     let name = cmd.split_whitespace().next().unwrap_or(cmd);
-    set_title(&format!("{} @ {}", name, crate::editor::full_cwd()));
+    set_title(&format!("{} @ {}", name, cwd_title()));
 }
 
 /// タイトルを既定 (末尾ディレクトリ名) へ戻す (外部コマンド終了時に呼ぶ)。

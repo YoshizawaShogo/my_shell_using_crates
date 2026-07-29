@@ -84,15 +84,6 @@ pub fn tab_complete(ctx: TabContext<'_>) -> std::io::Result<Selection> {
         return Ok(Selection::Chosen(finalize_choice(ctx.prefix, &cands[0])));
     }
 
-    // トークンが候補のどれかと完全一致するなら即確定する (git と gitk が併存しても
-    // `git`+Tab で `git ` を確定できる)。ディレクトリ候補は末尾 `/` を除いて比較する。
-    if let Some(exact) = cands
-        .iter()
-        .find(|c| c.as_str() == token || c.strip_suffix('/') == Some(token))
-    {
-        return Ok(Selection::Chosen(finalize_choice(ctx.prefix, exact)));
-    }
-
     // 共通プレフィックスが現在トークンより長く、かつ入力が共通プレフィックスの
     // 前方一致である場合のみ延長する (次の Tab でメニュー)。
     // 部分一致(contains)候補だと common_prefix が入力と無関係になるため除外する。
