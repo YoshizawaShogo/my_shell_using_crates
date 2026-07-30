@@ -470,6 +470,8 @@ fn run() -> io::Result<i32> {
                 shell.ed.insert_paste(&data);
                 vec![ShellEvent::RedrawPrompt]
             }
+            // 端末サイズ変更 (タブ複製直後の winsize 伝搬含む) で再描画し、幅を反映する。
+            Event::Resize(..) => vec![ShellEvent::RedrawPrompt],
             _ => continue,
         };
 

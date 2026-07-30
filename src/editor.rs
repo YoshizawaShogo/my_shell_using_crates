@@ -249,7 +249,12 @@ pub fn redraw_prompt(
     git_info: Option<&str>,
     ghost: Option<&str>,
 ) -> io::Result<()> {
+    // 端末幅は最低 1 に丸める。タブ複製直後など winsize が未伝搬の一瞬は size() が 0 を
+    // 返すことがあり、そのままだと後段の `% term_cols` / `/ term_cols` が 0 除算でパニック
+    // → シェルが起動直後に即死する (古い端末での「新タブが壊れる」原因)。実サイズが届けば
+    // Resize イベントで再描画され表示は直る。
     let (term_cols, _) = terminal::size()?;
+    let term_cols = term_cols.max(1);
 
     // 0. カーソルを I 型 (縦棒) に再指定する。外部コマンド (vim 等) が形を変えても
     //    プロンプトへ戻ったときに I 型へ戻す。同じ ANSI の再送で冪等・数バイト。
