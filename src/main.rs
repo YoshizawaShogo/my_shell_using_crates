@@ -502,19 +502,23 @@ fn run() -> io::Result<i32> {
     loop {
         let mut pending = match event::read()? {
             Event::Key(key) => handle_key(&mut shell.ed, key),
-            // ブラケットペースト: 改行入りでも 1 イベントで届くので実行はしない。
-            // 1 行ならそのまま挿入。2 行以上は確認したうえで 1 行目を入力欄へ入れ、
-            // 残りは貼り付けキューへ積む (Enter を押した時点で 1 行ずつ実行される)。
+            // ブラケットペースト: 改行入りでも 1 イベントで届く。
+            // 1 行なら挿入するだけ (実行は従来どおりユーザーの Enter を待つ)。
+            // 2 行以上は中身をプレビューして確認し、承諾されたらそのまま 1 行ずつ実行する
+            // (何が走るかは確認画面で見せているので、改めて Enter を求めない)。
             Event::Paste(data) => {
                 let mut lines = editor::paste_lines(&data);
                 if lines.len() < 2 {
                     shell.ed.insert_paste(&data);
+                    vec![ShellEvent::RedrawPrompt]
                 } else if confirm_multiline_paste(&mut shell.ed, &lines)? {
                     let first = lines.remove(0);
                     shell.ed.insert_str(&first);
                     shell.paste_queue = lines.into();
+                    vec![ShellEvent::ExecuteCommand]
+                } else {
+                    vec![ShellEvent::RedrawPrompt]
                 }
-                vec![ShellEvent::RedrawPrompt]
             }
             // 端末サイズ変更 (タブ複製直後の winsize 伝搬含む) で再描画し、幅を反映する。
             Event::Resize(..) => vec![ShellEvent::RedrawPrompt],
@@ -581,12 +585,12 @@ fn paste_preview_capacity(ed: &LineEditor, term_rows: u16) -> usize {
 const PASTE_GUTTER: &str = "  │ ";
 
 /// 確認プロンプトの操作ヒント。幅が足りないときは省く。
-const PASTE_HINT: &str = "[Enter: paste / Esc: cancel]";
+const PASTE_HINT: &str = "[Enter: run / Esc: cancel]";
 
 /// 複数行の貼り付けを確認し、承諾されたか返す (呼び出し側で 2 行以上を保証する)。
 ///
 /// ```text
-/// Paste 5 lines?  [Enter: paste / Esc: cancel]
+/// Run 5 pasted lines?  [Enter: run / Esc: cancel]
 ///   │ cd src
 ///   │ cargo build
 ///   │ echo one
@@ -595,8 +599,8 @@ const PASTE_HINT: &str = "[Enter: paste / Esc: cancel]";
 ///
 /// プレビューは画面の残り行数いっぱいまで出し、あふれる分は件数にまとめる。
 ///
-/// Enter で貼り付け、Esc / Ctrl+C で破棄する。画面の扱いはピッカーと同じで、
-/// 入力行の下に質問を出し、終了時にそこを消してから再描画へ戻す。
+/// Enter で承諾 (呼び出し側がそのまま実行する)、Esc / Ctrl+C で破棄する。画面の扱いは
+/// ピッカーと同じで、入力行の下に質問を出し、終了時にそこを消してから再描画へ戻す。
 fn confirm_multiline_paste(ed: &mut LineEditor, lines: &[String]) -> io::Result<bool> {
     // どの行も折り返させない。折り返すと note_newline() で数える行数と実際の行数が
     // ずれ、再描画時の MoveUp が足りずに古いプロンプトが残る。
@@ -606,7 +610,7 @@ fn confirm_multiline_paste(ed: &mut LineEditor, lines: &[String]) -> io::Result<
     let capacity = paste_preview_capacity(ed, term_rows);
 
     // ヘッダー行: 質問 + 操作ヒント (幅が足りなければヒントは省く)
-    let head = format!("Paste {} lines?", lines.len());
+    let head = format!("Run {} pasted lines?", lines.len());
     execute!(
         stdout(),
         Print("\r\n"),
