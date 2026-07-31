@@ -14,9 +14,10 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
-    terminal::{Clear, ClearType},
+    terminal::{self, Clear, ClearType},
 };
 use std::io::{self, stdout};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use builtin::ShellContext;
 use completion::TabContext;
@@ -505,12 +506,13 @@ fn run() -> io::Result<i32> {
             // 1 行ならそのまま挿入。2 行以上は確認したうえで 1 行目を入力欄へ入れ、
             // 残りは貼り付けキューへ積む (Enter を押した時点で 1 行ずつ実行される)。
             Event::Paste(data) => {
-                let lines = editor::paste_lines(&data);
+                let mut lines = editor::paste_lines(&data);
                 if lines.len() < 2 {
                     shell.ed.insert_paste(&data);
                 } else if confirm_multiline_paste(&mut shell.ed, &lines)? {
-                    shell.ed.insert_str(lines[0]);
-                    shell.paste_queue = lines[1..].iter().map(|s| s.to_string()).collect();
+                    let first = lines.remove(0);
+                    shell.ed.insert_str(&first);
+                    shell.paste_queue = lines.into();
                 }
                 vec![ShellEvent::RedrawPrompt]
             }
@@ -532,29 +534,69 @@ fn run() -> io::Result<i32> {
 
 // ─── 複数行ペーストの確認 ─────────────────────────────────────────────────────
 
-/// 確認プロンプトに出す先頭行の最大表示幅。
+/// 表示幅 `max_cols` に収まるよう切り詰める。切ったときは末尾に `…` を付ける。
+fn truncate_with_ellipsis(s: &str, max_cols: usize) -> String {
+    if s.width() <= max_cols {
+        return s.to_string();
+    }
+    let mut w = 0usize;
+    let mut out = String::new();
+    for c in s.chars() {
+        let cw = c.width().unwrap_or(0);
+        // `…` の 1 桁分を残す
+        if w + cw > max_cols.saturating_sub(1) {
+            break;
+        }
+        w += cw;
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
+/// 確認プロンプトに出す先頭行プレビューの最大表示幅。
 const PASTE_PREVIEW_COLS: usize = 40;
+
+/// 確認プロンプトの操作ヒント。幅が足りないときは省く。
+const PASTE_HINT: &str = "[Enter: paste / Esc: cancel]";
 
 /// 複数行の貼り付けを確認し、承諾されたか返す (呼び出し側で 2 行以上を保証する)。
 ///
 /// Enter で貼り付け、Esc / Ctrl+C で破棄する。画面の扱いはピッカーと同じで、
 /// 入力行の 1 行下に質問を出し、終了時にその行を消してから再描画へ戻す。
-fn confirm_multiline_paste(ed: &mut LineEditor, lines: &[&str]) -> io::Result<bool> {
-    let first = lines[0];
-    let preview: String = {
-        let mut w = 0usize;
-        let mut s = String::new();
-        for c in first.chars() {
-            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-            if w + cw > PASTE_PREVIEW_COLS {
-                s.push('…');
-                break;
-            }
-            w += cw;
-            s.push(c);
-        }
-        s
+fn confirm_multiline_paste(ed: &mut LineEditor, lines: &[String]) -> io::Result<bool> {
+    // 質問は必ず 1 物理行に収める。折り返すと note_newline() で数える 1 行と実際の
+    // 行数がずれ、再描画時の MoveUp が足りずに古いプロンプトが残る。
+    let cols = terminal::size()
+        .map(|(c, _)| c as usize)
+        .unwrap_or(80)
+        .max(2);
+    let limit = cols - 1;
+    let head = format!("Paste {} lines starting with ", lines.len());
+    // 見出し + 引用符 2 + "? " が固定幅。プレビューは先頭行の長さ (上限あり) だけ欲しい。
+    let fixed = head.width() + 4;
+    let want = lines[0].width().min(PASTE_PREVIEW_COLS);
+    // ヒントまで入るならヒント付き。入らないならヒントを諦めてプレビューを優先する
+    // (何を貼るのかの方が Enter/Esc の案内より重要)。
+    let show_hint = fixed + want + PASTE_HINT.width() <= limit;
+    let budget = if show_hint {
+        want
+    } else {
+        limit.saturating_sub(fixed).min(PASTE_PREVIEW_COLS)
     };
+    // プレビューは「出したい幅」に届いていれば採用する。短い先頭行 (want < 4) を
+    // 切り捨ててしまわないよう、下限は want と 4 の小さい方で判定する。
+    let question = if budget > 0 && budget >= want.min(4) {
+        format!(
+            "{}\"{}\"? ",
+            head,
+            truncate_with_ellipsis(&lines[0], budget)
+        )
+    } else {
+        // 幅が狭すぎるときはプレビューを諦めて行数だけ出す
+        format!("Paste {} lines? ", lines.len())
+    };
+    let question = truncate_with_ellipsis(&question, limit);
 
     execute!(
         stdout(),
@@ -564,14 +606,12 @@ fn confirm_multiline_paste(ed: &mut LineEditor, lines: &[&str]) -> io::Result<bo
             g: 0xd9,
             b: 0x80
         }),
-        Print(format!(
-            "Paste {} lines starting with \"{}\"? ",
-            lines.len(),
-            preview
-        )),
+        Print(&question),
         ResetColor,
-        Print("[Enter: paste / Esc: cancel]"),
     )?;
+    if show_hint && limit - question.width() >= PASTE_HINT.width() {
+        execute!(stdout(), Print(PASTE_HINT))?;
+    }
     ed.note_newline();
 
     let accepted = loop {
@@ -742,5 +782,23 @@ fn fetch_git_info() -> Option<String> {
             Some(format!("{} {}", label, &hash[..GIT_HASH_LEN]))
         }
         _ => Some(label),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_with_ellipsis_fits_width() {
+        // 収まるならそのまま
+        assert_eq!(truncate_with_ellipsis("abc", 5), "abc");
+        assert_eq!(truncate_with_ellipsis("abcde", 5), "abcde");
+        // 溢れたら … 込みで max_cols に収める
+        assert_eq!(truncate_with_ellipsis("abcdef", 5), "abcd…");
+        assert_eq!(truncate_with_ellipsis("abcdef", 5).width(), 5);
+        // 全角は幅 2 として数える
+        assert_eq!(truncate_with_ellipsis("あいう", 4), "あ…");
+        assert!(truncate_with_ellipsis("あいう", 4).width() <= 4);
     }
 }

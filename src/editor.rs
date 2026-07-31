@@ -227,7 +227,7 @@ impl LineEditor {
 ///   (2 行以上は main の貼り付けキューが 1 行ずつ実行するのでここへ来ない)。
 ///   保険として複数行が来たときだけ `; ` で連結する。
 fn sanitize_paste(data: &str) -> String {
-    if !data.contains('\n') && !data.contains('\r') {
+    if !data.chars().any(char::is_control) {
         return data.to_string();
     }
     paste_lines(data).join("; ")
@@ -235,10 +235,21 @@ fn sanitize_paste(data: &str) -> String {
 
 /// ペーストテキストを、実際に入力へ入る行 (trim 済み・空行を除く) に分解する。
 /// 貼り付け前の確認 (何行貼るか / 先頭行は何か) にも使う。
-pub fn paste_lines(data: &str) -> Vec<&str> {
-    data.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
+///
+/// - 行の区切りは `\n` / `\r` / `\r\n` のいずれも受け付ける。端末は raw mode 中の
+///   ブラケットペーストで改行を **CR で送ることが多い**ため、`\n` だけで分割すると
+///   複数行を 1 行と誤認して確認プロンプトが出ない。
+/// - 行内に残った制御文字 (タブなど) は空白へ潰す。そのまま入れると表示幅の計算が
+///   狂ってプロンプトの再描画が崩れる。
+pub fn paste_lines(data: &str) -> Vec<String> {
+    data.split(['\n', '\r'])
+        .map(|line| {
+            line.trim()
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect::<String>()
+        })
+        .filter(|line| !line.is_empty())
         .collect()
 }
 
@@ -505,6 +516,22 @@ mod tests {
         assert_eq!(sanitize_paste("\n\na\r\n\r\nb\n\n"), "a; b");
         // インデントは除去
         assert_eq!(sanitize_paste("a\n    b"), "a; b");
+    }
+
+    #[test]
+    fn paste_lines_accepts_cr_lf_and_crlf() {
+        // 端末は raw mode のペーストで改行を CR で送ることが多い。
+        // どの区切りでも同じ行数に分解できないと確認プロンプトが出ない。
+        let expect = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(paste_lines("a\nb\nc"), expect);
+        assert_eq!(paste_lines("a\rb\rc"), expect);
+        assert_eq!(paste_lines("a\r\nb\r\nc"), expect);
+        // 先頭末尾・連続の空行、行頭インデントは落とす
+        assert_eq!(paste_lines("\r\n  a  \r\n\r\n b\r\n"), vec!["a", "b"]);
+        // 1 行のみ (末尾改行つき) は 1 要素
+        assert_eq!(paste_lines("solo\r"), vec!["solo"]);
+        // 行内のタブなど制御文字は空白へ潰す (表示幅の計算が狂うため)
+        assert_eq!(paste_lines("echo\ta\tb"), vec!["echo a b"]);
     }
 
     #[test]
