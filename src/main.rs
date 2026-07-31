@@ -554,50 +554,59 @@ fn truncate_with_ellipsis(s: &str, max_cols: usize) -> String {
     out
 }
 
-/// 確認プロンプトに出す先頭行プレビューの最大表示幅。
-const PASTE_PREVIEW_COLS: usize = 40;
+/// 確認プロンプトのプレビュー 1 行を、飾り付きで次の行へ出力する。
+fn queue_paste_preview_row(text: &str) -> io::Result<()> {
+    execute!(
+        stdout(),
+        Print("\r\n"),
+        SetForegroundColor(Color::AnsiValue(243)),
+        Print(PASTE_GUTTER),
+        SetForegroundColor(Color::AnsiValue(253)),
+        Print(text),
+        ResetColor,
+    )
+}
+
+/// 確認プロンプトのプレビューに使える行数を求める。
+///
+/// プロンプト (折り返し込み) + 確認ヘッダー + プレビューが画面に収まる範囲に抑える。
+/// これを超えて描くとプロンプト先頭行が画面外へスクロールし、再描画の `MoveUp` が
+/// 届かなくなって表示が壊れる。
+fn paste_preview_capacity(ed: &LineEditor, term_rows: u16) -> usize {
+    let prompt_rows = ed.lines_above() as usize + 1;
+    (term_rows as usize).saturating_sub(prompt_rows + 1)
+}
+
+/// プレビュー行の先頭に付ける飾り。
+const PASTE_GUTTER: &str = "  │ ";
 
 /// 確認プロンプトの操作ヒント。幅が足りないときは省く。
 const PASTE_HINT: &str = "[Enter: paste / Esc: cancel]";
 
 /// 複数行の貼り付けを確認し、承諾されたか返す (呼び出し側で 2 行以上を保証する)。
 ///
+/// ```text
+/// Paste 5 lines?  [Enter: paste / Esc: cancel]
+///   │ cd src
+///   │ cargo build
+///   │ echo one
+///   │ … +2 more
+/// ```
+///
+/// プレビューは画面の残り行数いっぱいまで出し、あふれる分は件数にまとめる。
+///
 /// Enter で貼り付け、Esc / Ctrl+C で破棄する。画面の扱いはピッカーと同じで、
-/// 入力行の 1 行下に質問を出し、終了時にその行を消してから再描画へ戻す。
+/// 入力行の下に質問を出し、終了時にそこを消してから再描画へ戻す。
 fn confirm_multiline_paste(ed: &mut LineEditor, lines: &[String]) -> io::Result<bool> {
-    // 質問は必ず 1 物理行に収める。折り返すと note_newline() で数える 1 行と実際の
-    // 行数がずれ、再描画時の MoveUp が足りずに古いプロンプトが残る。
-    let cols = terminal::size()
-        .map(|(c, _)| c as usize)
-        .unwrap_or(80)
-        .max(2);
+    // どの行も折り返させない。折り返すと note_newline() で数える行数と実際の行数が
+    // ずれ、再描画時の MoveUp が足りずに古いプロンプトが残る。
+    let (term_cols, term_rows) = terminal::size().unwrap_or((80, 24));
+    let cols = (term_cols as usize).max(2);
     let limit = cols - 1;
-    let head = format!("Paste {} lines starting with ", lines.len());
-    // 見出し + 引用符 2 + "? " が固定幅。プレビューは先頭行の長さ (上限あり) だけ欲しい。
-    let fixed = head.width() + 4;
-    let want = lines[0].width().min(PASTE_PREVIEW_COLS);
-    // ヒントまで入るならヒント付き。入らないならヒントを諦めてプレビューを優先する
-    // (何を貼るのかの方が Enter/Esc の案内より重要)。
-    let show_hint = fixed + want + PASTE_HINT.width() <= limit;
-    let budget = if show_hint {
-        want
-    } else {
-        limit.saturating_sub(fixed).min(PASTE_PREVIEW_COLS)
-    };
-    // プレビューは「出したい幅」に届いていれば採用する。短い先頭行 (want < 4) を
-    // 切り捨ててしまわないよう、下限は want と 4 の小さい方で判定する。
-    let question = if budget > 0 && budget >= want.min(4) {
-        format!(
-            "{}\"{}\"? ",
-            head,
-            truncate_with_ellipsis(&lines[0], budget)
-        )
-    } else {
-        // 幅が狭すぎるときはプレビューを諦めて行数だけ出す
-        format!("Paste {} lines? ", lines.len())
-    };
-    let question = truncate_with_ellipsis(&question, limit);
+    let capacity = paste_preview_capacity(ed, term_rows);
 
+    // ヘッダー行: 質問 + 操作ヒント (幅が足りなければヒントは省く)
+    let head = format!("Paste {} lines?", lines.len());
     execute!(
         stdout(),
         Print("\r\n"),
@@ -606,13 +615,40 @@ fn confirm_multiline_paste(ed: &mut LineEditor, lines: &[String]) -> io::Result<
             g: 0xd9,
             b: 0x80
         }),
-        Print(&question),
+        Print(truncate_with_ellipsis(&head, limit)),
         ResetColor,
     )?;
-    if show_hint && limit - question.width() >= PASTE_HINT.width() {
-        execute!(stdout(), Print(PASTE_HINT))?;
+    if limit >= head.width() + 2 + PASTE_HINT.width() {
+        execute!(stdout(), Print(format!("  {}", PASTE_HINT)))?;
     }
-    ed.note_newline();
+    let mut rows = 1usize;
+
+    // プレビュー行: 画面に入るだけ出し、収まらない分は最終行に `… +N more` とまとめる。
+    let body_width = limit.saturating_sub(PASTE_GUTTER.width());
+    if body_width >= 2 {
+        let (shown, more) = if lines.len() <= capacity {
+            (lines.len(), false)
+        } else if capacity >= 2 {
+            // 最終行を残り件数に使う
+            (capacity - 1, true)
+        } else {
+            // 1 行しか出せないなら先頭行だけ (件数はヘッダーに出ている)
+            (capacity, false)
+        };
+        for line in &lines[..shown] {
+            queue_paste_preview_row(&truncate_with_ellipsis(line, body_width))?;
+            rows += 1;
+        }
+        if more {
+            let msg = format!("… +{} more", lines.len() - shown);
+            queue_paste_preview_row(&truncate_with_ellipsis(&msg, body_width))?;
+            rows += 1;
+        }
+    }
+    // 出力した物理行数だけプロンプト再描画の起点をずらす
+    for _ in 0..rows {
+        ed.note_newline();
+    }
 
     let accepted = loop {
         match event::read()? {
@@ -631,7 +667,8 @@ fn confirm_multiline_paste(ed: &mut LineEditor, lines: &[String]) -> io::Result<
         }
     };
 
-    // 質問行を消してカーソルを行頭へ戻す (ピッカー終了時と同じ状態にする)。
+    // カーソル行 (最終プレビュー行) を消して行頭へ戻す。上の行は続く再描画が
+    // note_newline() 分だけ遡って消すので、ここでは触らない (ピッカーと同じ流儀)。
     execute!(
         stdout(),
         cursor::MoveToColumn(0),

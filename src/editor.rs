@@ -207,6 +207,12 @@ impl LineEditor {
         self.lines_above_cursor += 1;
     }
 
+    /// プロンプト先頭行からカーソル行までの物理行数 (折り返し込み)。
+    /// プロンプトの下に何行描いてよいか (= 画面に収まる残り) の計算に使う。
+    pub fn lines_above(&self) -> u16 {
+        self.lines_above_cursor
+    }
+
     /// 画面クリア (Ctrl+L) 後に呼ぶ: カーソルが最上段に移ったので追跡をリセットする。
     pub fn reset_lines_above(&mut self) {
         self.lines_above_cursor = 0;
