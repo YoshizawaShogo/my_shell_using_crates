@@ -11,7 +11,7 @@ mod term;
 
 use crossterm::{
     cursor,
-    event::{self, Event},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{Clear, ClearType},
@@ -24,8 +24,8 @@ use editor::{LineEditor, redraw_prompt};
 use events::{ShellEvent, handle_key};
 use exec::execute_command;
 use history::History;
-use selector::Selection;
-use std::collections::HashMap;
+use selector::{PickerKind, Selection};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use term::{RawModeGuard, setup_signal_handlers};
 
@@ -47,6 +47,8 @@ struct Shell {
     saved_input: String,
     /// 停止ジョブがある状態で一度終了を試みたか (2 回目で実際に終了する)
     jobs_warned: bool,
+    /// 複数行ペーストの 2 行目以降。実行のたびに先頭を取り出して順に実行する。
+    paste_queue: VecDeque<String>,
 }
 
 impl Shell {
@@ -60,6 +62,7 @@ impl Shell {
             hist_idx: None,
             saved_input: String::new(),
             jobs_warned: false,
+            paste_queue: VecDeque::new(),
         }
     }
 
@@ -71,6 +74,140 @@ impl Shell {
             self.git_info.as_deref(),
             self.ghost.as_deref(),
         )
+    }
+
+    /// fuzzy ピッカーを開く。ピッカー内で別種別のキー (Ctrl+R/T/G/P) が押されたら
+    /// プロンプトへ戻らずその場で切り替え、クエリを引き継ぐ。
+    fn show_picker(&mut self, kind: PickerKind, pending: &mut Vec<ShellEvent>) -> io::Result<()> {
+        execute!(stdout(), Print("\r\n"))?;
+        self.ed.note_newline();
+        let mut kind = kind;
+        // 切り替え時に引き継ぐクエリ。None なら各ピッカーの既定の初期クエリを使う。
+        let mut carried: Option<String> = None;
+        loop {
+            let sel = match kind {
+                PickerKind::History => self.pick_history(carried.take()),
+                PickerKind::Files => self.pick_file(carried.take()),
+                PickerKind::Recent => self.pick_path(PickerKind::Recent, carried.take()),
+                PickerKind::DirStack => self.pick_path(PickerKind::DirStack, carried.take()),
+                // ジョブ選択はキーバインドから開かないのでここには来ない
+                PickerKind::Jobs => Ok(Selection::Dismissed),
+            };
+            match sel {
+                Ok(Selection::Switch(next, query)) => {
+                    kind = next;
+                    carried = Some(query);
+                }
+                Ok(_) => break,
+                Err(e) => {
+                    execute!(stdout(), Print(format!("fzf: {}\r\n", e)))?;
+                    break;
+                }
+            }
+        }
+        pending.push(ShellEvent::RedrawPrompt);
+        Ok(())
+    }
+
+    /// Ctrl+R: 履歴ピッカー。選んだコマンドで入力行を置き換える。
+    fn pick_history(&mut self, carried: Option<String>) -> io::Result<Selection> {
+        // 他端末が直前に追記した履歴を取り込んでから開く
+        self.history.reload();
+        let query = carried.unwrap_or_else(|| self.ed.line().to_string());
+        let sel = completion::fzf_history(&query, &self.history)?;
+        if let Selection::Chosen(s) = &sel {
+            self.ed.set(s.clone());
+        }
+        Ok(sel)
+    }
+
+    /// Ctrl+T: cwd 以下のファイル/ディレクトリピッカー。
+    fn pick_file(&mut self, carried: Option<String>) -> io::Result<Selection> {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        // 入力が空のときは cd モード: ディレクトリのみ列挙し `cd <path>` で挿入する。
+        let empty = self.ed.is_empty();
+        // カーソル前のトークンを取得（owned にして借用を切る）
+        let token: String = {
+            let before = &self.ed.line()[..self.ed.cursor()];
+            let token_start = before.rfind(' ').map(|i| i + 1).unwrap_or(0);
+            before[token_start..].to_owned()
+        };
+        // トークンに '/' が含まれる場合はそのディレクトリをルートにする
+        let (root, token_query, dir_part) = if !token.is_empty() && token.contains('/') {
+            let last_slash = token.rfind('/').unwrap();
+            let dir = token[..=last_slash].to_owned();
+            let file_part = token[last_slash + 1..].to_owned();
+            let root = if dir.starts_with('/') {
+                std::path::PathBuf::from(&dir)
+            } else if let Some(rest) = dir.strip_prefix("~/") {
+                let home = std::env::var("HOME").unwrap_or_default();
+                std::path::PathBuf::from(home).join(rest)
+            } else {
+                cwd.join(&dir)
+            };
+            let query = if file_part.is_empty() {
+                None
+            } else {
+                Some(file_part)
+            };
+            (root, query, Some(dir))
+        } else {
+            (cwd.clone(), None, None)
+        };
+        // 切り替えで来たときは引き継いだクエリを優先する
+        let initial_query = carried.or(token_query);
+        // 行頭のコマンドが cd のとき、または入力が空のときはディレクトリのみに絞る
+        let dirs_only = empty
+            || self
+                .ed
+                .line()
+                .split_whitespace()
+                .next()
+                .is_some_and(|cmd| cmd == "cd");
+        let sel = completion::fzf_files(&root, initial_query.as_deref(), dirs_only)?;
+        if let Selection::Chosen(s) = &sel {
+            if let Some(ref dir) = dir_part {
+                self.ed.delete_before_cursor(token.len());
+                let filename = s.strip_prefix("./").unwrap_or(s);
+                self.ed.insert_str(&format!("{}{}", dir, filename));
+            } else if empty {
+                let dir = s.strip_prefix("./").unwrap_or(s);
+                self.ed.insert_str(&format!("cd {}", dir));
+            } else {
+                self.ed.insert_str(s);
+            }
+        }
+        Ok(sel)
+    }
+
+    /// Ctrl+G / Ctrl+P: 記録パス (MRU) / ディレクトリスタックのピッカー。
+    fn pick_path(&mut self, kind: PickerKind, carried: Option<String>) -> io::Result<Selection> {
+        // 入力が空のときは cd 先選択モード: 候補をディレクトリのみに絞り、
+        // 選択結果を `cd <path>` として挿入する。
+        let prepend_cd = self.ed.is_empty();
+        let candidates: Vec<PathBuf> = if kind == PickerKind::DirStack {
+            // dir_stack は古い順 (末尾が直近) なので逆順でピッカーへ渡す
+            self.ctx.dir_stack.iter().rev().cloned().collect()
+        } else {
+            // 他端末が直前に記録したパスを取り込んでから開く
+            builtin::reload_recent_paths(&mut self.ctx);
+            // is_dir は記録/読込時に確定済みなので、ここで stat し直さない。
+            self.ctx
+                .recent_paths
+                .iter()
+                .filter(|rp| !prepend_cd || rp.is_dir)
+                .map(|rp| rp.path.clone())
+                .collect()
+        };
+        let sel = completion::fzf_paths(&candidates, carried.as_deref(), kind)?;
+        if let Selection::Chosen(s) = &sel {
+            if prepend_cd {
+                self.ed.insert_str(&format!("cd {}", s));
+            } else {
+                self.ed.insert_str(s);
+            }
+        }
+        Ok(sel)
     }
 
     /// 1 個の `ShellEvent` を処理する。
@@ -104,6 +241,8 @@ impl Shell {
                 self.ghost = None;
                 self.hist_idx = None;
                 self.saved_input.clear();
+                // 未実行のペースト行も一緒に捨てる
+                self.paste_queue.clear();
                 execute!(stdout(), Print("^C\r\n"))?;
                 pending.push(ShellEvent::RedrawPrompt);
             }
@@ -151,6 +290,22 @@ impl Shell {
                 self.jobs_warned = false;
                 // 完了/停止したバックグラウンドジョブをプロンプト表示前に通知する。
                 job::reap_finished(&mut self.ctx)?;
+                // 複数行ペーストの残りを 1 行ずつ実行する。Ctrl+C で中断されたときは
+                // 続きを流さずに捨てる (128+SIGINT = 130)。
+                if !self.paste_queue.is_empty() {
+                    if self.ctx.last_status == 130 {
+                        let skipped = self.paste_queue.len();
+                        self.paste_queue.clear();
+                        execute!(
+                            stdout(),
+                            Print(format!("↳ skipped {} pasted lines\r\n", skipped))
+                        )?;
+                    } else if let Some(next) = self.paste_queue.pop_front() {
+                        self.ed.set(next);
+                        pending.push(ShellEvent::ExecuteCommand);
+                        return Ok(false);
+                    }
+                }
                 pending.push(ShellEvent::RedrawPrompt);
             }
 
@@ -185,7 +340,8 @@ impl Shell {
                     Selection::Chosen(choice) => {
                         self.ed.apply_completion(choice, &suffix);
                     }
-                    Selection::Aborted | Selection::Dismissed => {}
+                    // グリッドメニューは Switch を返さない
+                    Selection::Aborted | Selection::Dismissed | Selection::Switch(..) => {}
                     Selection::InsertChar(c) => self.ed.insert(c),
                     Selection::Backspace => self.ed.backspace(),
                 }
@@ -264,129 +420,10 @@ impl Shell {
                 pending.push(ShellEvent::RedrawPrompt);
             }
 
-            ShellEvent::ShowHistoryFzf => {
-                // 他端末が直前に追記した履歴を取り込んでから開く
-                self.history.reload();
-                let query = self.ed.line().to_string();
-                execute!(stdout(), Print("\r\n"))?;
-                self.ed.note_newline();
-                match completion::fzf_history(&query, &self.history) {
-                    Ok(Some(s)) => self.ed.set(s),
-                    Ok(None) => {}
-                    Err(e) => {
-                        execute!(stdout(), Print(format!("fzf: {}\r\n", e)))?;
-                    }
-                }
-                pending.push(ShellEvent::RedrawPrompt);
-            }
-
-            ShellEvent::ShowFileFzf => {
-                let cwd = std::env::current_dir().unwrap_or_default();
-                // 入力が空のときは cd モード: ディレクトリのみ列挙し `cd <path>` で挿入する。
-                let empty = self.ed.is_empty();
-                // カーソル前のトークンを取得（owned にして借用を切る）
-                let token: String = {
-                    let before = &self.ed.line()[..self.ed.cursor()];
-                    let token_start = before.rfind(' ').map(|i| i + 1).unwrap_or(0);
-                    before[token_start..].to_owned()
-                };
-                // トークンに '/' が含まれる場合はそのディレクトリをルートにする
-                let (root, initial_query, dir_part) = if !token.is_empty() && token.contains('/') {
-                    let last_slash = token.rfind('/').unwrap();
-                    let dir = token[..=last_slash].to_owned();
-                    let file_part = token[last_slash + 1..].to_owned();
-                    let root = if dir.starts_with('/') {
-                        std::path::PathBuf::from(&dir)
-                    } else if let Some(rest) = dir.strip_prefix("~/") {
-                        let home = std::env::var("HOME").unwrap_or_default();
-                        std::path::PathBuf::from(home).join(rest)
-                    } else {
-                        cwd.join(&dir)
-                    };
-                    let query = if file_part.is_empty() {
-                        None
-                    } else {
-                        Some(file_part)
-                    };
-                    (root, query, Some(dir))
-                } else {
-                    (cwd.clone(), None, None)
-                };
-                // 行頭のコマンドが cd のとき、または入力が空のときはディレクトリのみに絞る
-                let dirs_only = empty
-                    || self
-                        .ed
-                        .line()
-                        .split_whitespace()
-                        .next()
-                        .is_some_and(|cmd| cmd == "cd");
-                execute!(stdout(), Print("\r\n"))?;
-                self.ed.note_newline();
-                match completion::fzf_files(&root, initial_query.as_deref(), dirs_only) {
-                    Ok(Some(s)) => {
-                        if let Some(ref dir) = dir_part {
-                            self.ed.delete_before_cursor(token.len());
-                            let filename = s.strip_prefix("./").unwrap_or(&s);
-                            self.ed.insert_str(&format!("{}{}", dir, filename));
-                        } else if empty {
-                            let dir = s.strip_prefix("./").unwrap_or(&s);
-                            self.ed.insert_str(&format!("cd {}", dir));
-                        } else {
-                            self.ed.insert_str(&s);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        execute!(stdout(), Print(format!("fzf: {}\r\n", e)))?;
-                    }
-                }
-                pending.push(ShellEvent::RedrawPrompt);
-            }
-
-            ShellEvent::ShowRecentPathFzf => {
-                // 他端末が直前に記録したパスを取り込んでから開く
-                builtin::reload_recent_paths(&mut self.ctx);
-                // 入力が空のときは cd 先選択モード: 候補をディレクトリのみに絞り、
-                // 選択結果を `cd <path>` として挿入する。
-                let prepend_cd = self.ed.is_empty();
-                // is_dir は記録/読込時に確定済みなので、ここで stat し直さない。
-                let candidates: Vec<std::path::PathBuf> = self
-                    .ctx
-                    .recent_paths
-                    .iter()
-                    .filter(|rp| !prepend_cd || rp.is_dir)
-                    .map(|rp| rp.path.clone())
-                    .collect();
-                execute!(stdout(), Print("\r\n"))?;
-                self.ed.note_newline();
-                match completion::fzf_recent_paths(&candidates) {
-                    Ok(Some(s)) if prepend_cd => self.ed.insert_str(&format!("cd {}", s)),
-                    Ok(Some(s)) => self.ed.insert_str(&s),
-                    Ok(None) => {}
-                    Err(e) => {
-                        execute!(stdout(), Print(format!("fzf: {}\r\n", e)))?;
-                    }
-                }
-                pending.push(ShellEvent::RedrawPrompt);
-            }
-
-            ShellEvent::ShowDirStackFzf => {
-                // dir_stack は古い順 (末尾が直近) なので逆順でピッカーへ渡す
-                let stack: Vec<std::path::PathBuf> =
-                    self.ctx.dir_stack.iter().rev().cloned().collect();
-                let prepend_cd = self.ed.is_empty();
-                execute!(stdout(), Print("\r\n"))?;
-                self.ed.note_newline();
-                match completion::fzf_recent_paths(&stack) {
-                    Ok(Some(s)) if prepend_cd => self.ed.insert_str(&format!("cd {}", s)),
-                    Ok(Some(s)) => self.ed.insert_str(&s),
-                    Ok(None) => {}
-                    Err(e) => {
-                        execute!(stdout(), Print(format!("fzf: {}\r\n", e)))?;
-                    }
-                }
-                pending.push(ShellEvent::RedrawPrompt);
-            }
+            ShellEvent::ShowHistoryFzf => self.show_picker(PickerKind::History, pending)?,
+            ShellEvent::ShowFileFzf => self.show_picker(PickerKind::Files, pending)?,
+            ShellEvent::ShowRecentPathFzf => self.show_picker(PickerKind::Recent, pending)?,
+            ShellEvent::ShowDirStackFzf => self.show_picker(PickerKind::DirStack, pending)?,
 
             ShellEvent::InsertSpace => {
                 try_expand_abbr(&mut self.ed, &self.ctx.abbrs);
@@ -464,10 +501,17 @@ fn run() -> io::Result<i32> {
     loop {
         let mut pending = match event::read()? {
             Event::Key(key) => handle_key(&mut shell.ed, key),
-            // ブラケットペースト: 改行入りでも 1 イベントで届くので、実行せず
-            // バッファへ挿入するだけ (改行は insert_paste が `; ` に変換して 1 行化)。
+            // ブラケットペースト: 改行入りでも 1 イベントで届くので実行はしない。
+            // 1 行ならそのまま挿入。2 行以上は確認したうえで 1 行目を入力欄へ入れ、
+            // 残りは貼り付けキューへ積む (Enter を押した時点で 1 行ずつ実行される)。
             Event::Paste(data) => {
-                shell.ed.insert_paste(&data);
+                let lines = editor::paste_lines(&data);
+                if lines.len() < 2 {
+                    shell.ed.insert_paste(&data);
+                } else if confirm_multiline_paste(&mut shell.ed, &lines)? {
+                    shell.ed.insert_str(lines[0]);
+                    shell.paste_queue = lines[1..].iter().map(|s| s.to_string()).collect();
+                }
                 vec![ShellEvent::RedrawPrompt]
             }
             // 端末サイズ変更 (タブ複製直後の winsize 伝搬含む) で再描画し、幅を反映する。
@@ -484,6 +528,76 @@ fn run() -> io::Result<i32> {
             }
         }
     }
+}
+
+// ─── 複数行ペーストの確認 ─────────────────────────────────────────────────────
+
+/// 確認プロンプトに出す先頭行の最大表示幅。
+const PASTE_PREVIEW_COLS: usize = 40;
+
+/// 複数行の貼り付けを確認し、承諾されたか返す (呼び出し側で 2 行以上を保証する)。
+///
+/// Enter で貼り付け、Esc / Ctrl+C で破棄する。画面の扱いはピッカーと同じで、
+/// 入力行の 1 行下に質問を出し、終了時にその行を消してから再描画へ戻す。
+fn confirm_multiline_paste(ed: &mut LineEditor, lines: &[&str]) -> io::Result<bool> {
+    let first = lines[0];
+    let preview: String = {
+        let mut w = 0usize;
+        let mut s = String::new();
+        for c in first.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if w + cw > PASTE_PREVIEW_COLS {
+                s.push('…');
+                break;
+            }
+            w += cw;
+            s.push(c);
+        }
+        s
+    };
+
+    execute!(
+        stdout(),
+        Print("\r\n"),
+        SetForegroundColor(Color::Rgb {
+            r: 0xe2,
+            g: 0xd9,
+            b: 0x80
+        }),
+        Print(format!(
+            "Paste {} lines starting with \"{}\"? ",
+            lines.len(),
+            preview
+        )),
+        ResetColor,
+        Print("[Enter: paste / Esc: cancel]"),
+    )?;
+    ed.note_newline();
+
+    let accepted = loop {
+        match event::read()? {
+            Event::Key(key) => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    KeyCode::Enter => break true,
+                    KeyCode::Esc => break false,
+                    KeyCode::Char('c') if ctrl => break false,
+                    _ => {} // それ以外のキーは無視して回答を待つ
+                }
+            }
+            // 確認中に届いた別のペーストは捨てる (連続ペーストで暴発させない)
+            Event::Paste(_) => {}
+            _ => {}
+        }
+    };
+
+    // 質問行を消してカーソルを行頭へ戻す (ピッカー終了時と同じ状態にする)。
+    execute!(
+        stdout(),
+        cursor::MoveToColumn(0),
+        Clear(ClearType::FromCursorDown)
+    )?;
+    Ok(accepted)
 }
 
 // ─── abbr 展開 ────────────────────────────────────────────────────────────────

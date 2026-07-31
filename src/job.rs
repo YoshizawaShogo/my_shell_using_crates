@@ -242,7 +242,7 @@ fn pick(ctx: &ShellContext, initial: Option<&str>) -> io::Result<Option<u32>> {
             return Ok(Some(ctx.jobs[i].id));
         }
     }
-    match selector::run_fzf(&cands, initial)? {
+    match selector::run_fzf(&cands, initial, selector::PickerKind::Jobs)? {
         Selection::Chosen(s) => Ok(cands.iter().position(|c| *c == s).map(|i| ctx.jobs[i].id)),
         _ => Ok(None),
     }

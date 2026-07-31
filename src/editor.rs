@@ -179,7 +179,8 @@ impl LineEditor {
     }
 
     /// ブラケットペーストで届いたテキストをカーソル位置へ挿入する。
-    /// 改行はコマンド区切り `; ` に変換して 1 行化する ([`sanitize_paste`] 参照)。
+    /// 呼び出し側 (main) が 1 行の貼り付けにだけ使う。改行入りでも中身が実質 1 行
+    /// (空行を除いて 1 行以下) のケースを [`sanitize_paste`] が 1 行に均す。
     /// 実行はしない — ユーザーが Enter を押すまでバッファに留まる。
     pub fn insert_paste(&mut self, data: &str) {
         let text = sanitize_paste(data);
@@ -222,18 +223,23 @@ impl LineEditor {
 /// ペーストテキストを 1 行の入力に整える。
 ///
 /// - 改行を含まなければそのまま返す (ペーストした空白などをそのまま尊重する)。
-/// - 改行を含む複数行ペーストは、各行を trim して空行を捨て、コマンド区切り `; `
-///   で連結する。外部コマンドは行全体が `sh -c` に渡るので `;` は逐次実行される。
-///   (先頭がビルトインのときだけ `;` 以降は引数扱いになり実行されない。)
+/// - 改行を含む場合は各行を trim して空行を捨てる。通常は 1 行しか残らない
+///   (2 行以上は main の貼り付けキューが 1 行ずつ実行するのでここへ来ない)。
+///   保険として複数行が来たときだけ `; ` で連結する。
 fn sanitize_paste(data: &str) -> String {
     if !data.contains('\n') && !data.contains('\r') {
         return data.to_string();
     }
+    paste_lines(data).join("; ")
+}
+
+/// ペーストテキストを、実際に入力へ入る行 (trim 済み・空行を除く) に分解する。
+/// 貼り付け前の確認 (何行貼るか / 先頭行は何か) にも使う。
+pub fn paste_lines(data: &str) -> Vec<&str> {
     data.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join("; ")
+        .collect()
 }
 
 /// プロンプトを再描画する。

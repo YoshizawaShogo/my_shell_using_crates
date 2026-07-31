@@ -22,6 +22,54 @@ pub enum Selection {
     Aborted,          // Ctrl+C
     InsertChar(char), // メニュー中に文字を打った → 挿入してメニュー閉じ
     Backspace,        // メニュー中に Backspace → 削除してメニュー閉じ
+    /// ピッカー中に別ピッカーのキーを押した → その種別へ切り替える (String は現在のクエリ)
+    Switch(PickerKind, String),
+}
+
+// ─── ピッカー種別 ─────────────────────────────────────────────────────────────
+
+/// fuzzy ピッカーの種別。クエリ行の右端に表示し、ピッカー中の切り替えにも使う。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PickerKind {
+    /// Ctrl+R: コマンド履歴
+    History,
+    /// Ctrl+T: cwd 以下のファイル/ディレクトリ
+    Files,
+    /// Ctrl+G: 自動記録したパス (MRU 順)
+    Recent,
+    /// Ctrl+P: ディレクトリスタック
+    DirStack,
+    /// fg/bg/kill のジョブ選択。キーバインドからは開かないので切り替え対象外。
+    Jobs,
+}
+
+impl PickerKind {
+    /// クエリ行の右端に出す短い名前。
+    pub fn label(self) -> &'static str {
+        match self {
+            PickerKind::History => "history",
+            PickerKind::Files => "files",
+            PickerKind::Recent => "recent",
+            PickerKind::DirStack => "dirstack",
+            PickerKind::Jobs => "jobs",
+        }
+    }
+
+    /// `Ctrl+<key>` で他のピッカーへ切り替えられるか。
+    fn switchable(self) -> bool {
+        self != PickerKind::Jobs
+    }
+
+    /// `Ctrl+<char>` がピッカー種別に対応するなら返す (シェル本体のキーバインドと同じ割当)。
+    fn from_ctrl_char(c: char) -> Option<Self> {
+        match c {
+            'r' => Some(PickerKind::History),
+            't' => Some(PickerKind::Files),
+            'g' => Some(PickerKind::Recent),
+            'p' => Some(PickerKind::DirStack),
+            _ => None,
+        }
+    }
 }
 
 // ─── グリッドメニュー (Tab 補完) ──────────────────────────────────────────────
@@ -410,11 +458,13 @@ fn truncate_to_cols(s: &str, max_cols: usize) -> &str {
 ///
 /// `initial_query` は初期クエリ。マッチングも UI も crossterm で自前実装する
 /// (外部バイナリ不要・本体プロセスで完結)。絞り込み規則は `filter_candidates` を参照。
-pub fn run_fzf(candidates: &[String], initial_query: Option<&str>) -> io::Result<Selection> {
-    if candidates.is_empty() {
-        return Ok(Selection::Dismissed);
-    }
-    run_picker(candidates.to_vec(), None, initial_query)
+pub fn run_fzf(
+    candidates: &[String],
+    initial_query: Option<&str>,
+    kind: PickerKind,
+) -> io::Result<Selection> {
+    // 候補が空でもピッカーは開く (種別を切り替えられるようにするため)。
+    run_picker(candidates.to_vec(), None, initial_query, kind)
 }
 
 /// 候補をストリーミングしながら fuzzy 選択させる。
@@ -423,7 +473,11 @@ pub fn run_fzf(candidates: &[String], initial_query: Option<&str>) -> io::Result
 /// `emit` が false を返したとき (= ピッカーが終了して rx が drop されたとき) は走査を
 /// 中断してよい。これにより巨大なツリーでも「列挙したものから順に表示」でき、
 /// 列挙の途中でも Ctrl+C / Esc で即中断できる。
-pub fn run_fzf_streaming<F>(produce: F, initial_query: Option<&str>) -> io::Result<Selection>
+pub fn run_fzf_streaming<F>(
+    produce: F,
+    initial_query: Option<&str>,
+    kind: PickerKind,
+) -> io::Result<Selection>
 where
     F: FnOnce(&mut dyn FnMut(String) -> bool) + Send + 'static,
 {
@@ -434,7 +488,7 @@ where
         let mut emit = |s: String| -> bool { tx.send(s).is_ok() };
         produce(&mut emit);
     });
-    run_picker(Vec::new(), Some(rx), initial_query)
+    run_picker(Vec::new(), Some(rx), initial_query, kind)
 }
 
 /// 自前 fuzzy ピッカーの本体。
@@ -456,7 +510,12 @@ fn run_picker(
     mut master: Vec<String>,
     rx: Option<Receiver<String>>,
     initial_query: Option<&str>,
+    kind: PickerKind,
 ) -> io::Result<Selection> {
+    // 切り替えできないピッカー (ジョブ選択) で候補が無いなら開かない。
+    if master.is_empty() && rx.is_none() && !kind.switchable() {
+        return Ok(Selection::Dismissed);
+    }
     let mut query = initial_query.unwrap_or("").to_string();
     let mut selected = 0usize;
     let mut offset = 0usize;
@@ -559,6 +618,7 @@ fn run_picker(
                 &mut offset,
                 master.len(),
                 streaming,
+                kind,
             )?;
             // フル再描画後にレイアウトを計算
             let visible = filtered.len().saturating_sub(offset).min(view);
@@ -610,6 +670,22 @@ fn run_picker(
                 outcome = Selection::Aborted;
                 break;
             }
+            // 他ピッカーのキー (Ctrl+R/T/G/P) でその種別へ切り替える。
+            // 開いているピッカー自身のキーをもう一度押したときは閉じる。
+            KeyCode::Char(c)
+                if ctrl
+                    && kind.switchable()
+                    && PickerKind::from_ctrl_char(c).is_some_and(|k| k != kind) =>
+            {
+                let next = PickerKind::from_ctrl_char(c).unwrap();
+                outcome = Selection::Switch(next, query.clone());
+                break;
+            }
+            KeyCode::Char(c)
+                if ctrl && kind.switchable() && PickerKind::from_ctrl_char(c).is_some() =>
+            {
+                break; // 自分自身のキー → Dismissed で閉じる
+            }
             KeyCode::Char('g') if ctrl => {
                 outcome = Selection::Aborted;
                 break;
@@ -622,6 +698,8 @@ fn run_picker(
                 break;
             }
             KeyCode::Up => selected = selected.saturating_sub(1),
+            // Ctrl+K も上移動 (切り替え可能なピッカーでは Ctrl+P が切り替えに使われるため)
+            KeyCode::Char('k') if ctrl => selected = selected.saturating_sub(1),
             KeyCode::Char('p') if ctrl => selected = selected.saturating_sub(1),
             KeyCode::Down => {
                 if selected + 1 < filtered.len() {
@@ -778,13 +856,14 @@ const COLOR_SELECTED: Color = Color::AnsiValue(253); // 薄白
 const COLOR_SEL_BG: Color = Color::AnsiValue(237); // 暗灰背景
 const COLOR_NORMAL: Color = Color::AnsiValue(146); // 灰色寄り淡青
 const COLOR_COUNT: Color = Color::AnsiValue(243); // 灰 (件数表示)
+const COLOR_LABEL: Color = Color::AnsiValue(180); // 淡橙 (ピッカー種別表示)
 
 /// ピッカーを 1 フレーム描画する。
 ///
 /// カーソルは開始行の桁0にある前提で、クエリ行＋候補を下方向に描き、
 /// 最後に開始行へ戻す。`offset` は選択がウィンドウ内に収まるよう更新する。
 ///
-/// - クエリ行: 🔍 + テキスト
+/// - クエリ行: 🔍 + テキスト、右端に「種別 マッチ数/総数」
 /// - 選択行:   >  + テキスト (bg=237, fg=253)、折り返しは "  "
 /// - 非選択行: #  + テキスト (fg=146)、折り返しは "  "
 fn draw_picker(
@@ -794,6 +873,7 @@ fn draw_picker(
     offset: &mut usize,
     total: usize,
     streaming: bool,
+    kind: PickerKind,
 ) -> io::Result<()> {
     let (term_cols, term_rows) = terminal::size()?;
     let cols = term_cols as usize;
@@ -809,18 +889,21 @@ fn draw_picker(
     }
     let visible = filtered.len().saturating_sub(*offset).min(view);
 
-    // 右端に「マッチ数/総数」を表示。走査途中は総数の後ろに … を付ける。
+    // 右端に「種別 マッチ数/総数」を表示。走査途中は総数の後ろに … を付ける。
+    // 種別 (history/files/recent/dirstack) は今どのピッカーを開いているかの目印。
+    let label = kind.label();
     let count_str = format!(
         "{}/{}{}",
         filtered.len(),
         total,
         if streaming { "…" } else { "" }
     );
-    let count_width = count_str.width() as u16;
+    // "種別" + 空白 + "n/m" 分の幅を右端に確保する。
+    let status_width = (label.width() + 1 + count_str.width()) as u16;
 
     // クエリ行: 🔍 は表示幅2なのでプレフィックス幅=3 ("🔍 ")
-    // カウントと被らないようクエリを切り詰め、右端に右寄せで配置する。
-    let query_max = cols.saturating_sub(count_str.width() + 1);
+    // ステータスと被らないようクエリを切り詰め、右端に右寄せで配置する。
+    let query_max = cols.saturating_sub(status_width as usize + 1);
     queue!(
         stdout(),
         cursor::MoveToColumn(0),
@@ -828,9 +911,11 @@ fn draw_picker(
         SetForegroundColor(COLOR_QUERY),
         Print(truncate_to_cols(&format!("🔍 {}", query), query_max)),
         ResetColor,
-        cursor::MoveToColumn(term_cols - count_width),
+        cursor::MoveToColumn(term_cols.saturating_sub(status_width)),
+        SetForegroundColor(COLOR_LABEL),
+        Print(label),
         SetForegroundColor(COLOR_COUNT),
-        Print(&count_str),
+        Print(format!(" {}", count_str)),
         ResetColor,
         Print("\r\n"),
     )?;

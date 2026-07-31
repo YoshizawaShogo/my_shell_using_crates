@@ -8,7 +8,7 @@ use crate::provider::{
     CandidateProvider, CommandProvider, CompletionContext, EnvVarProvider, FileProvider,
     HistoryProvider, PathProvider, walk_dirs, walk_files,
 };
-use crate::selector::{self, Selection};
+use crate::selector::{self, PickerKind, Selection};
 use std::path::Path;
 use unicode_width::UnicodeWidthStr;
 
@@ -123,12 +123,9 @@ pub fn tab_complete(ctx: TabContext<'_>) -> std::io::Result<Selection> {
 // ─── Ctrl+R ──────────────────────────────────────────────────────────────────
 
 /// 全履歴を fzf で検索する。`initial_query` は初期絞り込み文字列。
-pub fn fzf_history(initial_query: &str, history: &History) -> std::io::Result<Option<String>> {
+pub fn fzf_history(initial_query: &str, history: &History) -> std::io::Result<Selection> {
     let cands = history.search_completions("");
-    match selector::run_fzf(&cands, Some(initial_query))? {
-        Selection::Chosen(s) => Ok(Some(s)),
-        _ => Ok(None),
-    }
+    selector::run_fzf(&cands, Some(initial_query), PickerKind::History)
 }
 
 // ─── Ctrl+T ──────────────────────────────────────────────────────────────────
@@ -140,10 +137,10 @@ pub fn fzf_files(
     root: &Path,
     initial_query: Option<&str>,
     dirs_only: bool,
-) -> std::io::Result<Option<String>> {
+) -> std::io::Result<Selection> {
     let root = root.to_path_buf();
     let max_depth = FileProvider::default().max_depth;
-    let sel = selector::run_fzf_streaming(
+    selector::run_fzf_streaming(
         move |emit| {
             if dirs_only {
                 walk_dirs(&root, max_depth, emit)
@@ -152,25 +149,23 @@ pub fn fzf_files(
             }
         },
         initial_query,
-    )?;
-    match sel {
-        Selection::Chosen(s) => Ok(Some(s)),
-        _ => Ok(None),
-    }
+        PickerKind::Files,
+    )
 }
 
-// ─── Ctrl+G ──────────────────────────────────────────────────────────────────
+// ─── Ctrl+G / Ctrl+P ─────────────────────────────────────────────────────────
 
-/// 自動記録したパス (MRU 順) をピッカーで選択する。
-pub fn fzf_recent_paths(recent_paths: &[std::path::PathBuf]) -> std::io::Result<Option<String>> {
-    let cands: Vec<String> = recent_paths
+/// パス一覧 (MRU 順の記録パス / ディレクトリスタック) をピッカーで選択する。
+pub fn fzf_paths(
+    paths: &[std::path::PathBuf],
+    initial_query: Option<&str>,
+    kind: PickerKind,
+) -> std::io::Result<Selection> {
+    let cands: Vec<String> = paths
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
-    match selector::run_fzf(&cands, None)? {
-        Selection::Chosen(s) => Ok(Some(s)),
-        _ => Ok(None),
-    }
+    selector::run_fzf(&cands, initial_query, kind)
 }
 
 // ─── ゴーストテキスト ─────────────────────────────────────────────────────────
@@ -196,26 +191,24 @@ pub fn get_ghost(prefix: &str, cwd: &Path, history: &History) -> Option<String> 
         .filter(|s| !s.is_empty())
 }
 
-/// コマンド中のパス引数がすべて実在するか確認する。実在しないものがあれば false。
+/// `ls` / `cd` の引数パスがすべて実在するか確認する。実在しないものがあれば false。
 ///
-/// - `/`・`./`・`../`・`~/`・`~` 始まりのトークンは常に検査する。
-/// - 先頭トークンが `ls` / `cd` のときは、フラグ (`-` 始まり) 以外の引数
-///   (裸の相対パス含む) も検査する。頻出コマンドの古い候補を絞るため。
-/// - glob (`*?[`) や変数 (`$`) を含むトークンは検査できないのでスキップする。
-/// - それ以外のトークンは無視する。
+/// 検査するのは先頭トークンが `ls` / `cd` のときだけ。この 2 つは「対象が実在しないと
+/// 意味がない」コマンドなので、消えたディレクトリを指す古い履歴を候補から外せる。
+/// 他のコマンドは引数が実在しなくてよい (`cp src dst` の dst、`mkdir new` など) ので
+/// 一切検査しない。
+///
+/// - フラグ (`-` 始まり) は無視する。
+/// - glob (`*?[`) や変数 (`$`) を含むトークンは展開できないのでスキップする。
 pub(crate) fn cmd_paths_exist(cmd: &str, cwd: &Path) -> bool {
     let Ok(tokens) = shell_words::split(cmd) else {
         return true;
     };
-    let is_lscd = matches!(tokens.first().map(String::as_str), Some("ls") | Some("cd"));
-    for (i, t) in tokens.iter().enumerate() {
-        let pathlike = t == "~"
-            || t.starts_with('/')
-            || t.starts_with("./")
-            || t.starts_with("../")
-            || t.starts_with("~/");
-        let lscd_arg = is_lscd && i > 0 && !t.starts_with('-');
-        if !pathlike && !lscd_arg {
+    if !matches!(tokens.first().map(String::as_str), Some("ls") | Some("cd")) {
+        return true;
+    }
+    for t in tokens.iter().skip(1) {
+        if t.starts_with('-') {
             continue;
         }
         if t.contains(['*', '?', '[', '$']) {
@@ -471,8 +464,11 @@ mod tests {
         assert!(cmd_paths_exist("ls *.rs", &base));
         assert!(cmd_paths_exist("ls $HOME", &base));
 
-        // ls/cd 以外の裸の引数は検査しない
+        // ls/cd 以外は一切検査しない (cp の dst のように実在しなくてよい引数があるため)
         assert!(cmd_paths_exist("cat no_such_dir_xyz", &base));
+        assert!(cmd_paths_exist("cp a.txt /no/such/dir/b.txt", &base));
+        assert!(cmd_paths_exist("mkdir ./new_dir_xyz", &base));
+        assert!(cmd_paths_exist("vim ~/no_such_file_xyz", &base));
 
         let _ = std::fs::remove_dir_all(&sub);
     }
