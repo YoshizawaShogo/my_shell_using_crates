@@ -55,6 +55,18 @@ impl PickerKind {
         }
     }
 
+    /// クエリ行の先頭に出すアイコン。スコープごとに変えて検索対象を示す。
+    /// いずれも表示幅 2 (draw_picker はプレフィックス幅 3 = "絵文字 " を前提)。
+    pub fn icon(self) -> &'static str {
+        match self {
+            PickerKind::History => "📜",  // コマンド履歴 (巻物)
+            PickerKind::Files => "📂",    // cwd 以下のファイル/ディレクトリ
+            PickerKind::Recent => "⚙️",   // 永続 MRU パス (歯車)
+            PickerKind::DirStack => "👣", // セッション内の cd 足取り (足跡)
+            PickerKind::Jobs => "⏯️",     // 実行中のジョブ (再生/一時停止)
+        }
+    }
+
     /// `Ctrl+<key>` で他のピッカーへ切り替えられるか。
     fn switchable(self) -> bool {
         self != PickerKind::Jobs
@@ -638,7 +650,7 @@ fn run_picker(
             });
         }
 
-        // カーソルをクエリ末尾に表示する ("🔍 " は表示幅 3)。検索入力欄として自然な位置。
+        // カーソルをクエリ末尾に表示する (アイコン+空白は表示幅 3)。検索入力欄として自然な位置。
         let qcol = (3 + query.width()).min(cols.saturating_sub(1)) as u16;
         execute!(stdout(), cursor::MoveToColumn(qcol), cursor::Show)?;
 
@@ -863,7 +875,7 @@ const COLOR_LABEL: Color = Color::AnsiValue(180); // 淡橙 (ピッカー種別�
 /// カーソルは開始行の桁0にある前提で、クエリ行＋候補を下方向に描き、
 /// 最後に開始行へ戻す。`offset` は選択がウィンドウ内に収まるよう更新する。
 ///
-/// - クエリ行: 🔍 + テキスト、右端に「種別 マッチ数/総数」
+/// - クエリ行: 種別アイコン + テキスト、右端に「種別 マッチ数/総数」
 /// - 選択行:   >  + テキスト (bg=237, fg=253)、折り返しは "  "
 /// - 非選択行: #  + テキスト (fg=146)、折り返しは "  "
 fn draw_picker(
@@ -901,7 +913,7 @@ fn draw_picker(
     // "種別" + 空白 + "n/m" 分の幅を右端に確保する。
     let status_width = (label.width() + 1 + count_str.width()) as u16;
 
-    // クエリ行: 🔍 は表示幅2なのでプレフィックス幅=3 ("🔍 ")
+    // クエリ行: アイコンは表示幅2なのでプレフィックス幅=3 ("絵文字 ")
     // ステータスと被らないようクエリを切り詰め、右端に右寄せで配置する。
     let query_max = cols.saturating_sub(status_width as usize + 1);
     queue!(
@@ -909,7 +921,10 @@ fn draw_picker(
         cursor::MoveToColumn(0),
         Clear(ClearType::FromCursorDown),
         SetForegroundColor(COLOR_QUERY),
-        Print(truncate_to_cols(&format!("🔍 {}", query), query_max)),
+        Print(truncate_to_cols(
+            &format!("{} {}", kind.icon(), query),
+            query_max
+        )),
         ResetColor,
         cursor::MoveToColumn(term_cols.saturating_sub(status_width)),
         SetForegroundColor(COLOR_LABEL),
