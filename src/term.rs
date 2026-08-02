@@ -4,6 +4,7 @@ use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::style::Print;
 use crossterm::{cursor::SetCursorStyle, execute, terminal};
 use std::io::{self, stdout};
+use std::sync::OnceLock;
 
 /// 端末の raw mode を確実に後始末する RAII ガード。
 ///
@@ -14,6 +15,8 @@ pub struct RawModeGuard;
 
 impl RawModeGuard {
     pub fn new() -> io::Result<Self> {
+        // 素の (cooked) termios を raw 化より前に確保する (自前 termios 管理の基準)。
+        capture_cooked();
         terminal::enable_raw_mode()?;
         // ブラケットペーストを有効化する。これで貼り付けは 1 つの Event::Paste として
         // 届き、中の改行が Enter (= 即実行) にならず、レビュー前の誤爆を防げる。
@@ -32,6 +35,63 @@ impl Drop for RawModeGuard {
         );
         let _ = terminal::disable_raw_mode();
     }
+}
+
+// ─── 端末モード (termios) の自前管理 ─────────────────────────────────────────
+//
+// crossterm の raw mode は「元 termios」をキャッシュして復元する方式なので、子が
+// 異常終了して端末を変な状態で残すと、その壊れた状態を次の復元基準として取り込んで
+// しまう。そこで cooked/raw を自前で持ち、tcsetattr で決め打ちの termios を直接張り直す。
+// これにより子が端末をどう残しても、確実に狙った状態へ収束できる。
+
+/// 起動時に確保した「素の (cooked) termios」。raw 化より前に 1 度だけ捕まえる。
+static COOKED: OnceLock<libc::termios> = OnceLock::new();
+
+/// 現在の termios を cooked の基準として保存する。raw mode にする前に呼ぶこと。
+/// 端末でない (パイプ等) 場合は保存されず、以降の [`set_raw`]/[`set_cooked`] は無効になる。
+pub fn capture_cooked() {
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut t) } == 0 {
+        let _ = COOKED.set(t);
+    }
+}
+
+/// 保存済み cooked termios から raw termios を作る (crossterm と同じ `cfmakeraw`)。
+fn raw_termios() -> Option<libc::termios> {
+    let mut t = *COOKED.get()?;
+    unsafe { libc::cfmakeraw(&mut t) };
+    Some(t)
+}
+
+/// 端末を raw mode へ張り直す。crossterm のキャッシュを介さず tcsetattr で直接設定する
+/// ので、直前の状態が何であっても確実に raw へ収束する。
+pub fn set_raw() {
+    if let Some(t) = raw_termios() {
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &t) };
+    }
+}
+
+/// 端末を cooked mode (起動時の素の状態) へ戻す。子コマンドへ渡す前に呼ぶ。
+/// 出力を吐き切ってから切り替えるよう `TCSADRAIN` を使う。
+pub fn set_cooked() {
+    if let Some(t) = COOKED.get() {
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSADRAIN, t) };
+    }
+}
+
+/// プロンプト入力を読む直前に端末状態を強制的に整える。
+///
+/// - `tcsetpgrp`: 端末のフォアグラウンドをシェルへ奪い返す (異常終了した子の孤児
+///   プロセスが端末を握ったままでも取り戻す)。SIGTTOU は無視済みなのでここで
+///   シェルが止められることはない。
+/// - [`set_raw`]: raw mode を張り直す。子が cooked のまま残しても、これで復帰し
+///   Ctrl+C がキー入力として読めるようになる (cooked のままだと Ctrl+C の SIGINT が
+///   本体の `SIG_IGN` で握り潰され、`^C` がエコーされるだけで効かなくなる)。
+pub fn reassert_terminal() {
+    unsafe {
+        libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp());
+    }
+    set_raw();
 }
 
 // ─── カレントディレクトリの通知 ───────────────────────────────────────────────

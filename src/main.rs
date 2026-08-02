@@ -500,6 +500,10 @@ fn run() -> io::Result<i32> {
     shell.redraw()?;
 
     loop {
+        // プロンプト入力の直前に端末状態を強制復帰する。子の異常終了で端末が cooked の
+        // まま取り残されても、ここで raw を張り直し端末所有権を奪い返すので、Ctrl+C 等が
+        // 効かなくなった状態から確実に立ち直る。
+        term::reassert_terminal();
         let mut pending = match event::read()? {
             Event::Key(key) => handle_key(&mut shell.ed, key),
             // ブラケットペースト: 改行入りでも 1 イベントで届く。

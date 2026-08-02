@@ -10,7 +10,7 @@
 use crate::builtin::ShellContext;
 use crate::selector::{self, Selection};
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
-use crossterm::{execute, style::Print, terminal};
+use crossterm::{execute, style::Print};
 use std::io::{self, stdout};
 use std::process::Command;
 
@@ -122,7 +122,7 @@ fn print_line(id: u32, state: &str, cmd: &str) -> io::Result<()> {
 /// `command` には呼び出し側で `pre_exec` (setpgid＋シグナル既定化) を設定済みであること。
 pub fn run_foreground(command: &mut Command, cmd: &str, ctx: &mut ShellContext) -> io::Result<()> {
     let shell = shell_pgid();
-    terminal::disable_raw_mode()?;
+    crate::term::set_cooked();
     // 子には bracketed paste を解除した端末を渡す。非対応の子への貼り付けが
     // マーカー文字列で汚れるのを防ぎ、対応する子 (bash/vim 等) が終了時に残した
     // 状態も復帰後の再有効化で自己修復する (raw mode の toggle をミラー)。
@@ -139,7 +139,7 @@ pub fn run_foreground(command: &mut Command, cmd: &str, ctx: &mut ShellContext) 
     let outcome = wait_job(pid);
     give_terminal(shell);
     crate::term::reset_title();
-    terminal::enable_raw_mode()?;
+    crate::term::set_raw();
     let _ = execute!(stdout(), EnableBracketedPaste);
     // child は waitpid で回収済み。std Child は Drop で wait しないのでそのまま落とす。
     settle(outcome, pid, cmd, None, ctx);
@@ -169,7 +169,7 @@ pub fn fg(arg: Option<&str>, ctx: &mut ShellContext) -> io::Result<()> {
     execute!(stdout(), Print(format!("{}\r\n", job.cmd)))?;
 
     let shell = shell_pgid();
-    terminal::disable_raw_mode()?;
+    crate::term::set_cooked();
     // run_foreground と同じく bracketed paste をミラーで toggle する。
     let _ = execute!(stdout(), DisableBracketedPaste);
     crate::term::set_running_title(&job.cmd);
@@ -180,7 +180,7 @@ pub fn fg(arg: Option<&str>, ctx: &mut ShellContext) -> io::Result<()> {
     let outcome = wait_job(job.pgid);
     give_terminal(shell);
     crate::term::reset_title();
-    terminal::enable_raw_mode()?;
+    crate::term::set_raw();
     let _ = execute!(stdout(), EnableBracketedPaste);
     settle(outcome, job.pgid, &job.cmd, Some(job.id), ctx);
     Ok(())
