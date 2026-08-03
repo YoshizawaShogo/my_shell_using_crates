@@ -61,9 +61,9 @@ impl PickerKind {
         match self {
             PickerKind::History => "📜",  // コマンド履歴 (巻物)
             PickerKind::Files => "📂",    // cwd 以下のファイル/ディレクトリ
-            PickerKind::Recent => "⚙️",   // 永続 MRU パス (歯車)
+            PickerKind::Recent => "🧩",   // 永続 MRU パス (パズルのピース)
             PickerKind::DirStack => "👣", // セッション内の cd 足取り (足跡)
-            PickerKind::Jobs => "⏯️",     // 実行中のジョブ (再生/一時停止)
+            PickerKind::Jobs => "⏳",     // 実行中のジョブ (砂時計)
         }
     }
 
