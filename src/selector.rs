@@ -55,15 +55,18 @@ impl PickerKind {
         }
     }
 
-    /// クエリ行の先頭に出すアイコン。スコープごとに変えて検索対象を示す。
-    /// いずれも表示幅 2 (draw_picker はプレフィックス幅 3 = "絵文字 " を前提)。
-    pub fn icon(self) -> &'static str {
+    /// クエリ行の先頭に出すアイコンと、その端末表示幅。スコープごとに変えて検索対象を示す。
+    ///
+    /// 幅は端末が実際に描く桁数を明示する: 星域面の絵文字は 2、BMP 記号＋VS16
+    /// (歯車 ⚙️ / 再生 ⏯️) は多くの端末で 1 桁でしか描かれないので 1。プレフィックス幅
+    /// (= 幅 + 空白 1) とカーソル位置はこの値から出すので、絵文字ごとにここで揃える。
+    pub fn icon(self) -> (&'static str, usize) {
         match self {
-            PickerKind::History => "📜",  // コマンド履歴 (巻物)
-            PickerKind::Files => "📂",    // cwd 以下のファイル/ディレクトリ
-            PickerKind::Recent => "🧩",   // 永続 MRU パス (パズルのピース)
-            PickerKind::DirStack => "👣", // セッション内の cd 足取り (足跡)
-            PickerKind::Jobs => "⏳",     // 実行中のジョブ (砂時計)
+            PickerKind::History => ("📜", 2),  // コマンド履歴 (巻物)
+            PickerKind::Files => ("📂", 2),    // cwd 以下のファイル/ディレクトリ
+            PickerKind::Recent => ("⚙️", 1),   // 永続 MRU パス (歯車)。端末では幅 1
+            PickerKind::DirStack => ("👣", 2), // セッション内の cd 足取り (足跡)
+            PickerKind::Jobs => ("⏯️", 1),     // 実行中のジョブ (再生/一時停止)。端末では幅 1
         }
     }
 
@@ -650,8 +653,10 @@ fn run_picker(
             });
         }
 
-        // カーソルをクエリ末尾に表示する (アイコン+空白は表示幅 3)。検索入力欄として自然な位置。
-        let qcol = (3 + query.width()).min(cols.saturating_sub(1)) as u16;
+        // カーソルをクエリ末尾に表示する。プレフィックス幅 = アイコン表示幅 + 空白 1。
+        // アイコン幅は icon() の申告値を使い、端末の実描画 (歯車等は幅1) と一致させる。
+        let prefix = kind.icon().1 + 1;
+        let qcol = (prefix + query.width()).min(cols.saturating_sub(1)) as u16;
         execute!(stdout(), cursor::MoveToColumn(qcol), cursor::Show)?;
 
         prev_selected = Some(selected);
@@ -913,18 +918,16 @@ fn draw_picker(
     // "種別" + 空白 + "n/m" 分の幅を右端に確保する。
     let status_width = (label.width() + 1 + count_str.width()) as u16;
 
-    // クエリ行: アイコンは表示幅2なのでプレフィックス幅=3 ("絵文字 ")
+    // クエリ行: プレフィックスは "アイコン + 空白"。アイコン幅は icon() が申告した値を使う。
     // ステータスと被らないようクエリを切り詰め、右端に右寄せで配置する。
+    let (icon, _) = kind.icon();
     let query_max = cols.saturating_sub(status_width as usize + 1);
     queue!(
         stdout(),
         cursor::MoveToColumn(0),
         Clear(ClearType::FromCursorDown),
         SetForegroundColor(COLOR_QUERY),
-        Print(truncate_to_cols(
-            &format!("{} {}", kind.icon(), query),
-            query_max
-        )),
+        Print(truncate_to_cols(&format!("{} {}", icon, query), query_max)),
         ResetColor,
         cursor::MoveToColumn(term_cols.saturating_sub(status_width)),
         SetForegroundColor(COLOR_LABEL),
