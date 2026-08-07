@@ -467,6 +467,10 @@ fn truncate_to_cols(s: &str, max_cols: usize) -> &str {
     &s[..end]
 }
 
+/// クエリの開始列 (= アイコンプレフィックスの幅)。アイコンの表示幅によらず一定にし、
+/// 幅1の絵文字 (歯車/再生) は不足分を空白で埋めて幅2の絵文字と同じ間隔にする。
+const QUERY_COL: usize = 3;
+
 // ─── fuzzy ピッカー (Ctrl+R / Ctrl+T / Ctrl+G) ─────────────────────────────────
 
 /// 候補を fuzzy 絞り込みでインタラクティブに選択させる。
@@ -653,10 +657,8 @@ fn run_picker(
             });
         }
 
-        // カーソルをクエリ末尾に表示する。プレフィックス幅 = アイコン表示幅 + 空白 1。
-        // アイコン幅は icon() の申告値を使い、端末の実描画 (歯車等は幅1) と一致させる。
-        let prefix = kind.icon().1 + 1;
-        let qcol = (prefix + query.width()).min(cols.saturating_sub(1)) as u16;
+        // カーソルをクエリ末尾に表示する。クエリ開始列は QUERY_COL で一定。
+        let qcol = (QUERY_COL + query.width()).min(cols.saturating_sub(1)) as u16;
         execute!(stdout(), cursor::MoveToColumn(qcol), cursor::Show)?;
 
         prev_selected = Some(selected);
@@ -918,16 +920,21 @@ fn draw_picker(
     // "種別" + 空白 + "n/m" 分の幅を右端に確保する。
     let status_width = (label.width() + 1 + count_str.width()) as u16;
 
-    // クエリ行: プレフィックスは "アイコン + 空白"。アイコン幅は icon() が申告した値を使う。
-    // ステータスと被らないようクエリを切り詰め、右端に右寄せで配置する。
-    let (icon, _) = kind.icon();
+    // クエリ行: クエリ開始を QUERY_COL 列に固定する。幅1の絵文字 (歯車/再生) は実際には
+    // 2 桁近く描かれ空白1だとカーソルが近すぎるので、不足分だけ空白を足して幅2の絵文字と
+    // 同じ間隔にする。ステータスと被らないようクエリを切り詰め、右端に右寄せで配置する。
+    let (icon, icon_w) = kind.icon();
+    let pad = " ".repeat(QUERY_COL.saturating_sub(icon_w));
     let query_max = cols.saturating_sub(status_width as usize + 1);
     queue!(
         stdout(),
         cursor::MoveToColumn(0),
         Clear(ClearType::FromCursorDown),
         SetForegroundColor(COLOR_QUERY),
-        Print(truncate_to_cols(&format!("{} {}", icon, query), query_max)),
+        Print(truncate_to_cols(
+            &format!("{}{}{}", icon, pad, query),
+            query_max
+        )),
         ResetColor,
         cursor::MoveToColumn(term_cols.saturating_sub(status_width)),
         SetForegroundColor(COLOR_LABEL),

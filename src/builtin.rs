@@ -395,6 +395,14 @@ fn abbr(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
             ctx.abbrs.insert(from.to_string(), to.to_string());
             Ok(())
         }
+        // 引数 1 個: 登録済みなら現在の展開先を表示する。
+        (Some(&from), None) => match ctx.abbrs.get(from) {
+            Some(to) => {
+                execute!(stdout(), Print(format!("{} = {}\r\n", from, to)))?;
+                Ok(())
+            }
+            None => Err(io::Error::other(format!("no such abbr: {}", from))),
+        },
         _ => Err(io::Error::other("usage: abbr FROM TO")),
     }
 }
@@ -407,6 +415,14 @@ fn alias(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
             ctx.aliases.insert(from.to_string(), to.to_string());
             Ok(())
         }
+        // 引数 1 個: 登録済みなら現在の展開先を表示する。
+        (Some(&from), None) => match ctx.aliases.get(from) {
+            Some(to) => {
+                execute!(stdout(), Print(format!("{} = {}\r\n", from, to)))?;
+                Ok(())
+            }
+            None => Err(io::Error::other(format!("no such alias: {}", from))),
+        },
         _ => Err(io::Error::other("usage: alias FROM TO")),
     }
 }
