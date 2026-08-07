@@ -535,7 +535,12 @@ fn print_expansion_target(to: &str) -> io::Result<Option<PathBuf>> {
     if let Some(first) = to.split_whitespace().next()
         && let Some(p) = which(first)
     {
-        println_raw(&format!("    → {} = {}", first, format_binary(&p)))?;
+        let disp = format_binary(&p);
+        // 左右が同じ (値の先頭が既にフルパス) なら冗長なので出さない。
+        // dedup 用に実体パスは返す (名前自体の PATH 解決と同一なら下の行も省く)。
+        if first != disp {
+            println_raw(&format!("    → {} = {}", first, disp))?;
+        }
         return Ok(Some(p));
     }
     Ok(None)
