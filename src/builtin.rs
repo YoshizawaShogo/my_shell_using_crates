@@ -1,7 +1,8 @@
 //! シェル組み込みコマンド。
 
 use crate::history::expand_tilde;
-use crossterm::{execute, style::Print};
+use crossterm::execute;
+use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Seek, SeekFrom, stdout};
 use std::path::{Path, PathBuf};
@@ -220,6 +221,7 @@ const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("source-env", source_env),
     ("abbr", abbr),
     ("alias", alias),
+    ("type", type_info),
     ("set", set),
     ("setenv", set), // setenv は set のエイリアス
     ("fg", fg),
@@ -425,6 +427,224 @@ fn alias(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
         },
         _ => Err(io::Error::other("usage: alias FROM TO")),
     }
+}
+
+// ─── type (名前について分かることを種別を問わず全部出す) ───────────────────────
+
+/// raw mode 用に 1 行出力する (改行は `\r\n`)。
+fn println_raw(s: &str) -> io::Result<()> {
+    execute!(stdout(), Print(format!("{}\r\n", s)))
+}
+
+/// パスが実行可能ファイル (通常ファイルかつ実行ビットあり) か。
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(p) {
+        Ok(m) => m.is_file() && m.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
+}
+
+/// PATH を走査して `name` に一致する **最初の** 実行可能ファイル (実際に走る 1 件) を返す。
+/// `name` に `/` を含むならパス指定とみなし PATH 検索しない。
+fn which(name: &str) -> Option<PathBuf> {
+    if name.contains('/') {
+        let p = PathBuf::from(name);
+        return is_executable(&p).then_some(p);
+    }
+    let path = std::env::var("PATH").ok()?;
+    path.split(':')
+        .filter(|d| !d.is_empty())
+        .map(|dir| Path::new(dir).join(name))
+        .find(|cand| is_executable(cand))
+}
+
+/// 実体パスの表示文字列。symlink なら最終ターゲットまで辿って `(→ target)` を付ける
+/// (`vi → vim`、`python → python3.x`、`/etc/alternatives/...` を一目で分かるように)。
+fn format_binary(p: &Path) -> String {
+    let base = p.display().to_string();
+    match std::fs::symlink_metadata(p) {
+        // symlink のときだけ canonicalize で全リンクを解決した最終実体を添える。
+        Ok(m) if m.file_type().is_symlink() => match std::fs::canonicalize(p) {
+            Ok(real) if real != *p => format!("{} (→ {})", base, real.display()),
+            _ => base,
+        },
+        _ => base,
+    }
+}
+
+/// sh 側で解釈される語ならその種別ラベルを返す。このシェルは外部コマンドを `sh -c` に
+/// 流すので、これらは PATH の実体ではなく sh が解釈する (echo/test/if など)。
+fn sh_word_kind(name: &str) -> Option<&'static str> {
+    const KEYWORDS: &[&str] = &[
+        "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
+        "in", "function", "select", "time", "{", "}", "!", "[[", "]]", "coproc",
+    ];
+    const BUILTINS: &[&str] = &[
+        "echo", "printf", "test", "[", "read", "eval", "exec", "export", "readonly", "unset",
+        "shift", "return", "break", "continue", "trap", "wait", "umask", "ulimit", "times",
+        "command", "builtin", "true", "false", ":", ".", "source", "local", "declare", "typeset",
+        "let", "getopts", "hash", "help", "dirs", "pushd", "popd",
+    ];
+    if KEYWORDS.contains(&name) {
+        Some("sh keyword")
+    } else if BUILTINS.contains(&name) {
+        Some("sh builtin")
+    } else {
+        None
+    }
+}
+
+/// `name: <label>[rest]` を label だけ色付きで 1 行出す (カテゴリを一目で識別できるように)。
+fn print_kind(name: &str, label: &str, color: Color, rest: &str) -> io::Result<()> {
+    execute!(
+        stdout(),
+        Print(format!("{}: ", name)),
+        SetForegroundColor(color),
+        Print(label.to_string()),
+        ResetColor,
+        Print(format!("{}\r\n", rest)),
+    )
+}
+
+/// 色付きの見出し (末尾コロン込み) だけを 1 行出す (下に項目が続くセクション用)。
+fn print_header(label: &str, color: Color) -> io::Result<()> {
+    execute!(
+        stdout(),
+        SetForegroundColor(color),
+        Print(label.to_string()),
+        ResetColor,
+        Print("\r\n"),
+    )
+}
+
+/// 色付きラベル + 値を 1 行で出す (`label value`)。
+fn print_field(label: &str, color: Color, value: &str) -> io::Result<()> {
+    execute!(
+        stdout(),
+        SetForegroundColor(color),
+        Print(label.to_string()),
+        ResetColor,
+        Print(format!(" {}\r\n", value)),
+    )
+}
+
+/// 展開先 (alias/abbr の値) の先頭コマンドを PATH 解決し、実体パスを字下げして示す。
+/// 出力した実体パスを返す (呼び出し側で直接 PATH 解決との重複判定に使う)。
+fn print_expansion_target(to: &str) -> io::Result<Option<PathBuf>> {
+    if let Some(first) = to.split_whitespace().next()
+        && let Some(p) = which(first)
+    {
+        println_raw(&format!("    → {} = {}", first, format_binary(&p)))?;
+        return Ok(Some(p));
+    }
+    Ok(None)
+}
+
+/// 1 つの名前について、シェルが知っていることを該当する分だけ全部出す。
+/// builtin / alias / abbr / PATH 上の実行ファイルは排他ではないので順に調べて出す。
+fn describe_name(name: &str, ctx: &ShellContext) -> io::Result<()> {
+    let mut found = false;
+    // 展開先解決で既に出した実体パス。名前自体の PATH 解決と重複したら出さない。
+    let mut shown_paths: Vec<PathBuf> = Vec::new();
+
+    if find_builtin(name).is_some() {
+        print_kind(name, "shell builtin", Color::Cyan, "")?;
+        found = true;
+    }
+    if let Some(to) = ctx.aliases.get(name) {
+        print_kind(name, "alias", Color::Green, &format!(" = {}", to))?;
+        shown_paths.extend(print_expansion_target(to)?);
+        found = true;
+    }
+    if let Some(to) = ctx.abbrs.get(name) {
+        print_kind(name, "abbr", Color::Yellow, &format!(" = {}", to))?;
+        shown_paths.extend(print_expansion_target(to)?);
+        found = true;
+    }
+    if let Some(label) = sh_word_kind(name) {
+        print_kind(name, label, Color::Cyan, " (run by sh)")?;
+        found = true;
+    }
+    if let Some(p) = which(name) {
+        // alias/abbr が同じ実体を指していた場合 (`cp='cp -i'` 等) は重複なので省く。
+        if !shown_paths.contains(&p) {
+            println_raw(&format!("{}: {}", name, format_binary(&p)))?;
+        }
+        found = true;
+    }
+    // 同名の環境変数があれば併せて出す (set/setenv で管理しているものも含む)。
+    if let Ok(val) = std::env::var(name) {
+        print_kind(name, "env", Color::Magenta, &format!(" = {}", val))?;
+        found = true;
+    }
+
+    if !found {
+        print_kind(name, "not found", Color::Red, "")?;
+    }
+    Ok(())
+}
+
+/// 引数なし: シェルが保持する情報を一括で出す。ソートして安定した並びにする。
+/// セクション見出しは describe_name と同じ配色 (builtins=cyan, alias=green, abbr=yellow,
+/// 構造的な項目=blue) にして走査しやすくする。
+fn dump_all(ctx: &ShellContext) -> io::Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    print_field("cwd:", Color::Blue, &cwd.display().to_string())?;
+    print_field("last status:", Color::Blue, &ctx.last_status.to_string())?;
+
+    let builtins: Vec<&str> = builtin_names().collect();
+    print_field(
+        &format!("builtins ({}):", builtins.len()),
+        Color::Cyan,
+        &builtins.join(" "),
+    )?;
+
+    let mut aliases: Vec<(&String, &String)> = ctx.aliases.iter().collect();
+    aliases.sort_by(|a, b| a.0.cmp(b.0));
+    print_header(&format!("aliases ({}):", aliases.len()), Color::Green)?;
+    for (k, v) in aliases {
+        println_raw(&format!("  {} = {}", k, v))?;
+    }
+
+    let mut abbrs: Vec<(&String, &String)> = ctx.abbrs.iter().collect();
+    abbrs.sort_by(|a, b| a.0.cmp(b.0));
+    print_header(&format!("abbrs ({}):", abbrs.len()), Color::Yellow)?;
+    for (k, v) in abbrs {
+        println_raw(&format!("  {} = {}", k, v))?;
+    }
+
+    print_header(
+        &format!("dir stack ({}):", ctx.dir_stack.len()),
+        Color::Blue,
+    )?;
+    for d in &ctx.dir_stack {
+        println_raw(&format!("  {}", d.display()))?;
+    }
+
+    print_header(&format!("jobs ({}):", ctx.jobs.len()), Color::Blue)?;
+    for j in &ctx.jobs {
+        println_raw(&format!("  [{}] {}", j.id, j.cmd))?;
+    }
+
+    print_field(
+        "recent paths:",
+        Color::Blue,
+        &ctx.recent_paths.len().to_string(),
+    )?;
+    Ok(())
+}
+
+/// `type [NAME...]`: 名前について分かることを種別を問わずまとめて出す。
+/// 引数なしのときはシェルが持つ情報を全部列挙する。
+fn type_info(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
+    if args.is_empty() {
+        return dump_all(ctx);
+    }
+    for &name in args {
+        describe_name(name, ctx)?;
+    }
+    Ok(())
 }
 
 // ─── set / setenv ─────────────────────────────────────────────────────────────
