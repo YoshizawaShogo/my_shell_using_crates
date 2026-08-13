@@ -191,43 +191,93 @@ pub fn get_ghost(prefix: &str, cwd: &Path, history: &History) -> Option<String> 
         .filter(|s| !s.is_empty())
 }
 
-/// `ls` / `cd` の引数パスがすべて実在するか確認する。実在しないものがあれば false。
+/// 「対象が実在しないと意味がないコマンド」について、引数パスが実在するか確認する。
+/// 実在しないものがあれば false を返し、消えたパスを指す古い履歴を候補から外す。
 ///
-/// 検査するのは先頭トークンが `ls` / `cd` のときだけ。この 2 つは「対象が実在しないと
-/// 意味がない」コマンドなので、消えたディレクトリを指す古い履歴を候補から外せる。
-/// 他のコマンドは引数が実在しなくてよい (`cp src dst` の dst、`mkdir new` など) ので
-/// 一切検査しない。
+/// 検査するのは次のいずれかのときだけ。それ以外は一切検査せず true を返す
+/// (`cp src dst` の dst、`mkdir new`、`vim newfile` のように実在しなくてよい引数が
+/// あるコマンドを誤って外さないため)。
 ///
-/// - フラグ (`-` 始まり) は無視する。
+/// 1. 先頭トークンがパス指定のコマンド実行 (`./x`, `../x`, `/abs/x`, `sub/x`, `~/x`)
+///    → 実行ファイル自体 (先頭トークン) の実在のみ検査する。
+/// 2. 先頭トークンが読み取り専用・対象必須のコマンド ([`PATH_INPUT_CMDS`])
+///    → 非フラグ引数がすべて実在するか検査する。
+/// 3. 先頭トークンが `source` / `.` → 読み込むスクリプト (第 2 トークン) のみ検査する。
+///
+/// 共通の除外規則:
+/// - リダイレクト/パイプ (`> < | &`) を含む行は、出力先を作るケースがあるので検査しない。
+/// - フラグ (`-` 始まり) と、フラグの値になりうる数値のみのトークンは無視する。
 /// - glob (`*?[`) や変数 (`$`) を含むトークンは展開できないのでスキップする。
 pub(crate) fn cmd_paths_exist(cmd: &str, cwd: &Path) -> bool {
     let Ok(tokens) = shell_words::split(cmd) else {
         return true;
     };
-    if !matches!(tokens.first().map(String::as_str), Some("ls") | Some("cd")) {
+    // リダイレクト/パイプ/バックグラウンドを含む複合行は、出力先ファイルを新規に作る
+    // ケース (`cat > out.txt`) があるので一切検査しない。
+    if tokens.iter().any(|t| t.contains(['>', '<', '|', '&'])) {
+        return true;
+    }
+    let Some(first) = tokens.first().map(String::as_str) else {
+        return true;
+    };
+
+    // ① 先頭トークンがパス指定のコマンド実行: 実行ファイル自体の実在だけを見る。
+    if first.contains('/') || first.starts_with('~') {
+        return match resolve_path_token(first, cwd) {
+            Some(p) => p.exists(),
+            None => true, // glob/変数は展開できないので検査しない
+        };
+    }
+
+    // ③ source / . : 読み込むスクリプト (第 2 トークン) のみ検査する。
+    if matches!(first, "source" | ".") {
+        return match tokens.get(1).and_then(|t| resolve_path_token(t, cwd)) {
+            Some(p) => p.exists(),
+            None => true,
+        };
+    }
+
+    // ② 読み取り専用・対象必須のコマンド: 非フラグ引数をすべて検査する。
+    if !PATH_INPUT_CMDS.contains(&first) {
         return true;
     }
     for t in tokens.iter().skip(1) {
         if t.starts_with('-') {
             continue;
         }
-        if t.contains(['*', '?', '[', '$']) {
-            continue; // glob/変数は展開できないので検査しない
+        // `head -n 5 file` の `5` のようなフラグの値 (数値のみ) はパスではない。
+        if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
         }
-        let path = if t == "~" {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        } else if let Some(rest) = t.strip_prefix("~/") {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest)
-        } else if t.starts_with('/') {
-            std::path::PathBuf::from(t.as_str())
-        } else {
-            cwd.join(t.as_str())
-        };
-        if !path.exists() {
-            return false;
+        match resolve_path_token(t, cwd) {
+            Some(p) if !p.exists() => return false,
+            _ => {} // glob/変数はスキップ、実在すれば継続
         }
     }
     true
+}
+
+/// 引数実在を検査する読み取り専用・対象必須コマンドの一覧 (先頭トークンで一致)。
+const PATH_INPUT_CMDS: &[&str] = &[
+    "ls", "cd", "less", "more", "bat", "cat", "head", "tail", "diff", "file", "stat", "wc",
+];
+
+/// トークンを実在検査用のパスに解決する。glob/変数を含み展開できない場合は `None`。
+fn resolve_path_token(t: &str, cwd: &Path) -> Option<std::path::PathBuf> {
+    if t.contains(['*', '?', '[', '$']) {
+        return None;
+    }
+    let home = || std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let p = if t == "~" {
+        home()
+    } else if let Some(rest) = t.strip_prefix("~/") {
+        home().join(rest)
+    } else if t.starts_with('/') {
+        std::path::PathBuf::from(t)
+    } else {
+        cwd.join(t)
+    };
+    Some(p)
 }
 
 // ─── 補完種別の分類 ───────────────────────────────────────────────────────────
@@ -464,11 +514,29 @@ mod tests {
         assert!(cmd_paths_exist("ls *.rs", &base));
         assert!(cmd_paths_exist("ls $HOME", &base));
 
-        // ls/cd 以外は一切検査しない (cp の dst のように実在しなくてよい引数があるため)
-        assert!(cmd_paths_exist("cat no_such_dir_xyz", &base));
+        // 出力を作るコマンドは一切検査しない (cp の dst、mkdir、エディタの新規ファイル)
         assert!(cmd_paths_exist("cp a.txt /no/such/dir/b.txt", &base));
         assert!(cmd_paths_exist("mkdir ./new_dir_xyz", &base));
         assert!(cmd_paths_exist("vim ~/no_such_file_xyz", &base));
+
+        // ② 読み取り専用コマンドは非フラグ引数の実在を検査する
+        assert!(!cmd_paths_exist("cat no_such_file_xyz", &base));
+        assert!(!cmd_paths_exist("less no_such_file_xyz", &base));
+        assert!(cmd_paths_exist(&format!("cat {}", name), &base));
+        // フラグの値 (数値) はパスとして扱わない
+        assert!(!cmd_paths_exist("head -n 5 no_such_file_xyz", &base));
+        assert!(cmd_paths_exist(&format!("head -n 5 {}", name), &base));
+        // リダイレクトを含む行は出力先を作りうるので検査しない
+        assert!(cmd_paths_exist("cat foo > no_such_file_xyz", &base));
+
+        // ① 先頭トークンがパス指定のコマンド実行: 実行ファイル自体を検査する
+        assert!(!cmd_paths_exist("./no_such_script_xyz.sh", &base));
+        assert!(!cmd_paths_exist("no_such_dir_xyz/run.sh --flag", &base));
+        assert!(!cmd_paths_exist("/no/such/abs/script_xyz.sh", &base));
+
+        // ③ source / . : 読み込むスクリプトのみ検査する
+        assert!(!cmd_paths_exist("source no_such_env_xyz.sh", &base));
+        assert!(!cmd_paths_exist(". no_such_env_xyz.sh", &base));
 
         let _ = std::fs::remove_dir_all(&sub);
     }
