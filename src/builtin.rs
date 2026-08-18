@@ -294,12 +294,15 @@ fn cd(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
 
 // ─── source-env ───────────────────────────────────────────────────────────────
 
-/// 別シェルで設定ファイルを source し、環境変数をこのシェルへ取り込む。
+/// 別シェルで設定ファイルを source し、環境変数と alias をこのシェルへ取り込む。
+///
+/// 環境変数だけでは不足するケース (例: PATH を alias で通している設定) があるため、
+/// alias も継承する。
 ///
 /// 使い方:
 ///   `source-env <file>`           ファイル名・拡張子・shebang からシェルを自動判別
 ///   `source-env <file> <shell>`   シェルを明示
-fn source_env(args: &[&str], _ctx: &mut ShellContext) -> io::Result<()> {
+fn source_env(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
     let (shell, file) = match args.len() {
         2 => {
             let shell = args[1].to_string();
@@ -316,11 +319,31 @@ fn source_env(args: &[&str], _ctx: &mut ShellContext) -> io::Result<()> {
 
     let file_path = expand_tilde(file);
     let file_str = file_path.to_string_lossy();
+    // env (NUL 区切り) と alias (改行区切り) をこのマーカーで分けて 1 度に取得する。
+    // 先頭の NUL は env -0 の最終レコード境界と重なるが、空レコードとして無視される。
+    const MARKER: &str = "\0__SRCENV_ALIASES__\n";
+    let fmt = AliasFmt::for_shell(&shell);
     // csh/tcsh には POSIX の `.` (dot) が無く source は `source`。fish も `source`。
     // これらを `.` の分岐へ落とすと `.` が外部コマンド扱いになり必ず失敗する。
-    let script = match shell.as_str() {
-        "fish" | "csh" | "tcsh" => format!("source '{}' && env -0", file_str),
-        _ => format!(". '{}' && env -0", file_str),
+    // グループ構文と `alias` の出力形式もシェル系統ごとに異なる。source が成功した
+    // ときだけ env/alias を出力する (`&&`) ことで、source 失敗を検出する。マーカー
+    // (`\0__SRCENV_ALIASES__\n`) を printf で挟み、env 部と alias 部を区切る。
+    let script = match fmt {
+        // fish: `.` は無く source。グループは begin/end。末尾 true で空 alias でも成功。
+        AliasFmt::Fish => format!(
+            "source '{}' && begin; env -0; printf '\\0__SRCENV_ALIASES__\\n'; alias; true; end",
+            file_str
+        ),
+        // csh/tcsh: `{{ }}`/begin は無いので `&&` のフラットな連結。alias は空でも 0 を返す。
+        AliasFmt::Csh => format!(
+            "source '{}' && env -0 && printf '\\0__SRCENV_ALIASES__\\n' && alias",
+            file_str
+        ),
+        // POSIX 系 (bash/zsh/sh/…): `{{ }}` グループ。alias 皆無の非 0 終了を true で均す。
+        AliasFmt::Posix => format!(
+            ". '{}' && {{ env -0; printf '\\0__SRCENV_ALIASES__\\n'; alias 2>/dev/null; true; }}",
+            file_str
+        ),
     };
 
     let output = std::process::Command::new(&shell)
@@ -337,7 +360,13 @@ fn source_env(args: &[&str], _ctx: &mut ShellContext) -> io::Result<()> {
         )));
     }
 
-    for record in output.stdout.split(|&b| b == 0) {
+    // マーカーで env 部と alias 部に分ける (マーカーが無ければ全体が env 部)。
+    let (env_bytes, alias_bytes) = match find_subslice(&output.stdout, MARKER.as_bytes()) {
+        Some(i) => (&output.stdout[..i], &output.stdout[i + MARKER.len()..]),
+        None => (&output.stdout[..], &[][..]),
+    };
+
+    for record in env_bytes.split(|&b| b == 0) {
         if record.is_empty() {
             continue;
         }
@@ -348,7 +377,84 @@ fn source_env(args: &[&str], _ctx: &mut ShellContext) -> io::Result<()> {
         }
     }
 
+    for line in String::from_utf8_lossy(alias_bytes).lines() {
+        if let Some((name, value)) = parse_alias_line(line, fmt) {
+            ctx.aliases.insert(name, value);
+        }
+    }
+
     Ok(())
+}
+
+/// `alias` 出力の書式。シェル系統ごとに区切り方が異なる。
+#[derive(Clone, Copy, PartialEq)]
+enum AliasFmt {
+    /// bash/zsh/sh/…: `alias ll='ls -la'` / `ll='ls -la'` (`=` 区切り・引用符)
+    Posix,
+    /// fish: `alias ll 'ls -la'` (先頭に `alias `・スペース区切り・引用符)
+    Fish,
+    /// csh/tcsh: `ll<TAB>ls -la` (タブ区切り・引用符なし)
+    Csh,
+}
+
+impl AliasFmt {
+    fn for_shell(shell: &str) -> Self {
+        match shell {
+            "fish" => AliasFmt::Fish,
+            "csh" | "tcsh" => AliasFmt::Csh,
+            _ => AliasFmt::Posix,
+        }
+    }
+}
+
+/// `haystack` 内で `needle` が最初に現れるバイト位置を返す。
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
+}
+
+/// `alias` の 1 行を (名前, 展開先) に分解する。書式は [`AliasFmt`] で切り替える。
+fn parse_alias_line(line: &str, fmt: AliasFmt) -> Option<(String, String)> {
+    let line = line.trim();
+    let (name, value) = match fmt {
+        // bash/POSIX の `alias ll='ls -la'`、zsh の `ll='ls -la'` / `ll=ls`。
+        AliasFmt::Posix => {
+            let body = line.strip_prefix("alias ").unwrap_or(line).trim();
+            let (name, raw) = body.split_once('=')?;
+            (name, unquote_shell_value(raw.trim()))
+        }
+        // fish の `alias ll 'ls -la'` (先頭 `alias ` 必須・スペース区切り・引用符)。
+        AliasFmt::Fish => {
+            let body = line.strip_prefix("alias ")?;
+            let (name, raw) = body.split_once(' ')?;
+            (name, unquote_shell_value(raw.trim()))
+        }
+        // csh/tcsh の `ll<TAB>ls -la` (タブ区切り・引用符なし)。
+        AliasFmt::Csh => {
+            let (name, raw) = line.split_once('\t')?;
+            (name, raw.trim().to_string())
+        }
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), value))
+}
+
+/// シェルが `alias` 表示で付ける引用符を外す。
+fn unquote_shell_value(s: &str) -> String {
+    let b = s.as_bytes();
+    if b.len() >= 2 && b[0] == b'\'' && b[b.len() - 1] == b'\'' {
+        // bash/zsh は値中のリテラル `'` を `'\''` で表す。
+        return s[1..s.len() - 1].replace("'\\''", "'");
+    }
+    if b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"' {
+        return s[1..s.len() - 1].to_string();
+    }
+    s.to_string()
 }
 
 /// ファイル名・shebang の順でシェルを推定する。
@@ -806,5 +912,77 @@ mod tests {
         let r = parse_recent_line("//").unwrap();
         assert_eq!(r.path, PathBuf::from("/"));
         assert!(r.is_dir);
+    }
+
+    #[test]
+    fn parse_alias_line_posix() {
+        use AliasFmt::Posix;
+        // bash/POSIX: `alias ` 前置 + 単一引用符
+        assert_eq!(
+            parse_alias_line("alias ll='ls -la'", Posix),
+            Some(("ll".to_string(), "ls -la".to_string()))
+        );
+        // zsh: 前置なし
+        assert_eq!(
+            parse_alias_line("g='git'", Posix),
+            Some(("g".to_string(), "git".to_string()))
+        );
+        // 引用符なしの単純値
+        assert_eq!(
+            parse_alias_line("py=python3", Posix),
+            Some(("py".to_string(), "python3".to_string()))
+        );
+        // 値中のリテラル単一引用符 (`'\''` エスケープ)
+        assert_eq!(
+            parse_alias_line(r"alias say='echo '\''hi'\'''", Posix),
+            Some(("say".to_string(), "echo 'hi'".to_string()))
+        );
+        // 二重引用符
+        assert_eq!(
+            parse_alias_line(r#"alias e="editor -w""#, Posix),
+            Some(("e".to_string(), "editor -w".to_string()))
+        );
+        // = を含まない行・空行は無視
+        assert!(parse_alias_line("", Posix).is_none());
+        assert!(parse_alias_line("no equals here", Posix).is_none());
+    }
+
+    #[test]
+    fn parse_alias_line_fish() {
+        use AliasFmt::Fish;
+        // fish: `alias NAME 'BODY'` (先頭 `alias ` 必須・スペース区切り・引用符)
+        assert_eq!(
+            parse_alias_line("alias ll 'ls -la'", Fish),
+            Some(("ll".to_string(), "ls -la".to_string()))
+        );
+        assert_eq!(
+            parse_alias_line("alias tool '/opt/tool/bin/tool --fast'", Fish),
+            Some(("tool".to_string(), "/opt/tool/bin/tool --fast".to_string()))
+        );
+        // 前置 `alias ` が無い行は fish 書式ではない
+        assert!(parse_alias_line("ll='ls -la'", Fish).is_none());
+    }
+
+    #[test]
+    fn parse_alias_line_csh() {
+        use AliasFmt::Csh;
+        // csh/tcsh: `NAME<TAB>VALUE` (タブ区切り・引用符なし)
+        assert_eq!(
+            parse_alias_line("ll\tls -la", Csh),
+            Some(("ll".to_string(), "ls -la".to_string()))
+        );
+        assert_eq!(
+            parse_alias_line("tool\t/opt/tool/bin/tool --fast", Csh),
+            Some(("tool".to_string(), "/opt/tool/bin/tool --fast".to_string()))
+        );
+        // タブが無い行は無視
+        assert!(parse_alias_line("ll ls -la", Csh).is_none());
+    }
+
+    #[test]
+    fn find_subslice_basic() {
+        assert_eq!(find_subslice(b"abc\0MARK\ndef", b"\0MARK\n"), Some(3));
+        assert_eq!(find_subslice(b"no marker here", b"\0MARK\n"), None);
+        assert_eq!(find_subslice(b"", b"x"), None);
     }
 }
