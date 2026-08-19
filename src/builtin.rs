@@ -319,54 +319,20 @@ fn source_env(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
 
     let file_path = expand_tilde(file);
     let file_str = file_path.to_string_lossy();
-    // env (NUL 区切り) と alias (改行区切り) をこのマーカーで分けて 1 度に取得する。
-    // 先頭の NUL は env -0 の最終レコード境界と重なるが、空レコードとして無視される。
-    const MARKER: &str = "\0__SRCENV_ALIASES__\n";
     let fmt = AliasFmt::for_shell(&shell);
     // csh/tcsh には POSIX の `.` (dot) が無く source は `source`。fish も `source`。
-    // これらを `.` の分岐へ落とすと `.` が外部コマンド扱いになり必ず失敗する。
-    // グループ構文と `alias` の出力形式もシェル系統ごとに異なる。source が成功した
-    // ときだけ env/alias を出力する (`&&`) ことで、source 失敗を検出する。マーカー
-    // (`\0__SRCENV_ALIASES__\n`) を printf で挟み、env 部と alias 部を区切る。
-    let script = match fmt {
-        // fish: `.` は無く source。グループは begin/end。末尾 true で空 alias でも成功。
-        AliasFmt::Fish => format!(
-            "source '{}' && begin; env -0; printf '\\0__SRCENV_ALIASES__\\n'; alias; true; end",
-            file_str
-        ),
-        // csh/tcsh: `{{ }}`/begin は無いので `&&` のフラットな連結。alias は空でも 0 を返す。
-        AliasFmt::Csh => format!(
-            "source '{}' && env -0 && printf '\\0__SRCENV_ALIASES__\\n' && alias",
-            file_str
-        ),
-        // POSIX 系 (bash/zsh/sh/…): `{{ }}` グループ。alias 皆無の非 0 終了を true で均す。
-        AliasFmt::Posix => format!(
-            ". '{}' && {{ env -0; printf '\\0__SRCENV_ALIASES__\\n'; alias 2>/dev/null; true; }}",
-            file_str
-        ),
+    // これを `.` の分岐へ落とすと `.` が外部コマンド扱いになり必ず失敗する。
+    let src = if fmt == AliasFmt::Posix {
+        "."
+    } else {
+        "source"
     };
 
-    let output = std::process::Command::new(&shell)
-        .args(["-c", &script])
-        .output()
-        .map_err(|e| io::Error::other(format!("failed to run {}: {}", shell, e)))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(io::Error::other(format!(
-            "{} exited with error: {}",
-            shell,
-            stderr.trim()
-        )));
-    }
-
-    // マーカーで env 部と alias 部に分ける (マーカーが無ければ全体が env 部)。
-    let (env_bytes, alias_bytes) = match find_subslice(&output.stdout, MARKER.as_bytes()) {
-        Some(i) => (&output.stdout[..i], &output.stdout[i + MARKER.len()..]),
-        None => (&output.stdout[..], &[][..]),
-    };
-
-    for record in env_bytes.split(|&b| b == 0) {
+    // env と alias を 2 回に分けて取り込む (1 回で混ぜるより設計が単純)。どちらも
+    // `source が成功したときだけ出力する` (`&&`) 形にして source 失敗を検出する。
+    // env は複数行値も NUL で確実に区切れるよう `env -0` を使う。
+    let env_out = run_shell_capture(&shell, &format!("{} '{}' && env -0", src, file_str))?;
+    for record in env_out.split(|&b| b == 0) {
         if record.is_empty() {
             continue;
         }
@@ -377,13 +343,32 @@ fn source_env(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
         }
     }
 
-    for line in String::from_utf8_lossy(alias_bytes).lines() {
-        if let Some((name, value)) = parse_alias_line(line, fmt) {
-            ctx.aliases.insert(name, value);
-        }
+    // alias は 2 回目の起動で取得する。source は env 取得時に検証済み。空 alias でも
+    // `alias` は 0 を返す (bash/fish/csh とも確認済み) ので追加のガードは要らない。
+    let alias_out = run_shell_capture(&shell, &format!("{} '{}' && alias", src, file_str))?;
+    for (name, value) in parse_aliases(&String::from_utf8_lossy(&alias_out), fmt) {
+        ctx.aliases.insert(name, value);
     }
 
     Ok(())
+}
+
+/// `shell -c <script>` を実行し、成功時のみ stdout を返す。失敗時は stderr を載せた
+/// エラーにする。
+fn run_shell_capture(shell: &str, script: &str) -> io::Result<Vec<u8>> {
+    let output = std::process::Command::new(shell)
+        .args(["-c", script])
+        .output()
+        .map_err(|e| io::Error::other(format!("failed to run {}: {}", shell, e)))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::other(format!(
+            "{} exited with error: {}",
+            shell,
+            stderr.trim()
+        )));
+    }
+    Ok(output.stdout)
 }
 
 /// `alias` 出力の書式。シェル系統ごとに区切り方が異なる。
@@ -407,54 +392,177 @@ impl AliasFmt {
     }
 }
 
-/// `haystack` 内で `needle` が最初に現れるバイト位置を返す。
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
+/// `alias` の全出力を (名前, 展開先) の並びへ分解する。書式は [`AliasFmt`] で切り替える。
+fn parse_aliases(text: &str, fmt: AliasFmt) -> Vec<(String, String)> {
+    match fmt {
+        AliasFmt::Posix => parse_aliases_posix(text),
+        AliasFmt::Fish => parse_aliases_fish(text),
+        AliasFmt::Csh => parse_aliases_csh(text),
     }
-    (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
 }
 
-/// `alias` の 1 行を (名前, 展開先) に分解する。書式は [`AliasFmt`] で切り替える。
-fn parse_alias_line(line: &str, fmt: AliasFmt) -> Option<(String, String)> {
-    let line = line.trim();
-    let (name, value) = match fmt {
-        // bash/POSIX の `alias ll='ls -la'`、zsh の `ll='ls -la'` / `ll=ls`。
-        AliasFmt::Posix => {
-            let body = line.strip_prefix("alias ").unwrap_or(line).trim();
-            let (name, raw) = body.split_once('=')?;
-            (name, unquote_shell_value(raw.trim()))
+/// bash/zsh/sh の `alias` 出力を解析する。
+///
+/// 各定義は `alias NAME='VALUE'` (zsh は先頭 `alias ` 無し)。VALUE は単一引用符・
+/// 二重引用符・引用符なしのいずれかで、引用符付きの値は物理改行をまたぐことがある
+/// (複数行 alias)。bash は値中のリテラル `'` を `'\''` で表す。
+fn parse_aliases_posix(text: &str) -> Vec<(String, String)> {
+    let b = text.as_bytes();
+    let mut i = 0;
+    let mut out = Vec::new();
+    while i < b.len() {
+        // レコード先頭: 改行を読み飛ばす。
+        if b[i] == b'\n' || b[i] == b'\r' {
+            i += 1;
+            continue;
         }
-        // fish の `alias ll 'ls -la'` (先頭 `alias ` 必須・スペース区切り・引用符)。
-        AliasFmt::Fish => {
-            let body = line.strip_prefix("alias ")?;
-            let (name, raw) = body.split_once(' ')?;
-            (name, unquote_shell_value(raw.trim()))
+        // 先頭の "alias " を任意に外す (bash は前置、zsh は無し)。
+        if text[i..].starts_with("alias ") {
+            i += "alias ".len();
         }
-        // csh/tcsh の `ll<TAB>ls -la` (タブ区切り・引用符なし)。
-        AliasFmt::Csh => {
-            let (name, raw) = line.split_once('\t')?;
-            (name, raw.trim().to_string())
+        // NAME を '=' まで読む。'=' の前に改行/EOF なら不正行として捨てる。
+        let name_start = i;
+        while i < b.len() && b[i] != b'=' && b[i] != b'\n' {
+            i += 1;
         }
+        if i >= b.len() || b[i] == b'\n' {
+            continue; // '=' 無し → この行はスキップ (改行は次ループで処理)
+        }
+        let name = text[name_start..i].trim().to_string();
+        i += 1; // '=' を飛ばす
+        let (value, next) = read_posix_value(text, i);
+        i = next;
+        if !name.is_empty() {
+            out.push((name, value));
+        }
+    }
+    out
+}
+
+/// `=` の直後 (`start`) から値を読み、(値, 次の走査位置) を返す。
+/// 引用符付きの値は行をまたいで閉じ引用符まで、引用符なしは行末まで読む。
+fn read_posix_value(text: &str, start: usize) -> (String, usize) {
+    let b = text.as_bytes();
+    match b.get(start) {
+        Some(b'\'') => read_quoted(text, start + 1, Quote::Single),
+        Some(b'"') => read_quoted(text, start + 1, Quote::Double),
+        _ => {
+            let mut i = start;
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            (text[start..i].to_string(), i)
+        }
+    }
+}
+
+enum Quote {
+    Single,
+    Double,
+}
+
+/// 引用符の内側 (`start`) から閉じ引用符までを読む。閉じたあとは行末まで読み飛ばす。
+///
+/// - Single: bash/zsh の `'\''` (閉じ→エスケープした `'`→開き) をリテラル `'` に戻す。
+/// - Double: `\"` `\\` のバックスラッシュエスケープを外す。
+fn read_quoted(text: &str, start: usize, quote: Quote) -> (String, usize) {
+    let b = text.as_bytes();
+    let (q, esc): (u8, u8) = match quote {
+        Quote::Single => (b'\'', b'\''),
+        Quote::Double => (b'"', b'\\'),
     };
-    let name = name.trim();
-    if name.is_empty() {
-        return None;
+    let mut v = String::new();
+    let mut seg = start;
+    let mut i = start;
+    while i < b.len() {
+        // Double: `\"` / `\\` を外す。
+        if esc == b'\\'
+            && b[i] == b'\\'
+            && matches!(b.get(i + 1), Some(&c) if c == b'"' || c == b'\\')
+        {
+            v.push_str(&text[seg..i]);
+            v.push(b[i + 1] as char);
+            i += 2;
+            seg = i;
+            continue;
+        }
+        // Single: `'\''` をリテラル `'` に戻す。
+        if esc == b'\'' && b[i] == b'\'' && text[i..].starts_with("'\\''") {
+            v.push_str(&text[seg..i]);
+            v.push('\'');
+            i += 4;
+            seg = i;
+            continue;
+        }
+        if b[i] == q {
+            v.push_str(&text[seg..i]);
+            i += 1;
+            while i < b.len() && b[i] != b'\n' {
+                i += 1; // 閉じ引用符のあとの残り (通常は空) を読み飛ばす
+            }
+            return (v, i);
+        }
+        i += 1;
     }
-    Some((name.to_string(), value))
+    // 未終端: 残り全部を値とする。
+    v.push_str(&text[seg..]);
+    (v, b.len())
 }
 
-/// シェルが `alias` 表示で付ける引用符を外す。
-fn unquote_shell_value(s: &str) -> String {
-    let b = s.as_bytes();
-    if b.len() >= 2 && b[0] == b'\'' && b[b.len() - 1] == b'\'' {
-        // bash/zsh は値中のリテラル `'` を `'\''` で表す。
-        return s[1..s.len() - 1].replace("'\\''", "'");
+/// fish の `alias` 出力を解析する。各行は `alias NAME 'BODY'`。
+///
+/// fish は出力を必ず 1 行に収める (値中の改行は `\n` へエスケープ) ので行単位で解析
+/// できる。ただし fish は alias を関数として保持し、複数行 alias は `alias` 表示時に
+/// 値が崩れる (先頭に関数名が混じる等)。このため単一行 alias のみ忠実に復元でき、
+/// 複数行 alias はベストエフォート (fish のエスケープ済み文字列のまま取り込む)。
+fn parse_aliases_fish(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some(body) = line.trim().strip_prefix("alias ") else {
+            continue;
+        };
+        let Some((name, raw)) = body.split_once(' ') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        out.push((name.to_string(), unquote_fish_value(raw.trim())));
     }
-    if b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"' {
+    out
+}
+
+/// fish が値を囲む単一/二重引用符を外す。
+fn unquote_fish_value(s: &str) -> String {
+    let b = s.as_bytes();
+    if b.len() >= 2
+        && ((b[0] == b'\'' && b[b.len() - 1] == b'\'') || (b[0] == b'"' && b[b.len() - 1] == b'"'))
+    {
         return s[1..s.len() - 1].to_string();
     }
     s.to_string()
+}
+
+/// csh/tcsh の `alias` 出力を解析する。各定義は `NAME<TAB>VALUE` (引用符なし)。
+///
+/// 複数行 alias の 2 行目以降はタブを含まない継続行になるので、直前の値へ改行付きで
+/// 連結する。
+fn parse_aliases_csh(text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in text.lines() {
+        if let Some((name, val)) = line.split_once('\t') {
+            let name = name.trim();
+            if !name.is_empty() {
+                out.push((name.to_string(), val.to_string()));
+            }
+        } else if let Some(last) = out.last_mut() {
+            // タブ無し = 継続行
+            last.1.push('\n');
+            last.1.push_str(line);
+        }
+    }
+    out
 }
 
 /// ファイル名・shebang の順でシェルを推定する。
@@ -914,75 +1022,78 @@ mod tests {
         assert!(r.is_dir);
     }
 
-    #[test]
-    fn parse_alias_line_posix() {
-        use AliasFmt::Posix;
-        // bash/POSIX: `alias ` 前置 + 単一引用符
-        assert_eq!(
-            parse_alias_line("alias ll='ls -la'", Posix),
-            Some(("ll".to_string(), "ls -la".to_string()))
-        );
-        // zsh: 前置なし
-        assert_eq!(
-            parse_alias_line("g='git'", Posix),
-            Some(("g".to_string(), "git".to_string()))
-        );
-        // 引用符なしの単純値
-        assert_eq!(
-            parse_alias_line("py=python3", Posix),
-            Some(("py".to_string(), "python3".to_string()))
-        );
-        // 値中のリテラル単一引用符 (`'\''` エスケープ)
-        assert_eq!(
-            parse_alias_line(r"alias say='echo '\''hi'\'''", Posix),
-            Some(("say".to_string(), "echo 'hi'".to_string()))
-        );
-        // 二重引用符
-        assert_eq!(
-            parse_alias_line(r#"alias e="editor -w""#, Posix),
-            Some(("e".to_string(), "editor -w".to_string()))
-        );
-        // = を含まない行・空行は無視
-        assert!(parse_alias_line("", Posix).is_none());
-        assert!(parse_alias_line("no equals here", Posix).is_none());
+    fn pairs(v: &[(String, String)]) -> Vec<(&str, &str)> {
+        v.iter()
+            .map(|(k, val)| (k.as_str(), val.as_str()))
+            .collect()
     }
 
     #[test]
-    fn parse_alias_line_fish() {
-        use AliasFmt::Fish;
-        // fish: `alias NAME 'BODY'` (先頭 `alias ` 必須・スペース区切り・引用符)
+    fn parse_aliases_posix_single_line() {
+        // bash 前置あり・zsh 前置なし・引用符なしが混在しても解析できる。
+        let out = parse_aliases_posix("alias ll='ls -la'\ng='git'\npy=python3\n");
         assert_eq!(
-            parse_alias_line("alias ll 'ls -la'", Fish),
-            Some(("ll".to_string(), "ls -la".to_string()))
+            pairs(&out),
+            vec![("ll", "ls -la"), ("g", "git"), ("py", "python3")]
         );
-        assert_eq!(
-            parse_alias_line("alias tool '/opt/tool/bin/tool --fast'", Fish),
-            Some(("tool".to_string(), "/opt/tool/bin/tool --fast".to_string()))
-        );
-        // 前置 `alias ` が無い行は fish 書式ではない
-        assert!(parse_alias_line("ll='ls -la'", Fish).is_none());
+        // 値中のリテラル単一引用符 (`'\''`) と二重引用符。
+        let out = parse_aliases_posix(concat!(
+            r"alias say='echo '\''hi'\'''",
+            "\n",
+            r#"alias e="editor -w""#,
+            "\n"
+        ));
+        assert_eq!(pairs(&out), vec![("say", "echo 'hi'"), ("e", "editor -w")]);
     }
 
     #[test]
-    fn parse_alias_line_csh() {
-        use AliasFmt::Csh;
-        // csh/tcsh: `NAME<TAB>VALUE` (タブ区切り・引用符なし)
+    fn parse_aliases_posix_multiline() {
+        // bash 実出力: 単一引用符の値が物理改行をまたぐ複数行 alias。
+        let out = parse_aliases_posix("alias multi='echo one\necho two'\nalias single='ls -la'\n");
         assert_eq!(
-            parse_alias_line("ll\tls -la", Csh),
-            Some(("ll".to_string(), "ls -la".to_string()))
+            pairs(&out),
+            vec![("multi", "echo one\necho two"), ("single", "ls -la")]
         );
-        assert_eq!(
-            parse_alias_line("tool\t/opt/tool/bin/tool --fast", Csh),
-            Some(("tool".to_string(), "/opt/tool/bin/tool --fast".to_string()))
-        );
-        // タブが無い行は無視
-        assert!(parse_alias_line("ll ls -la", Csh).is_none());
     }
 
     #[test]
-    fn find_subslice_basic() {
-        assert_eq!(find_subslice(b"abc\0MARK\ndef", b"\0MARK\n"), Some(3));
-        assert_eq!(find_subslice(b"no marker here", b"\0MARK\n"), None);
-        assert_eq!(find_subslice(b"", b"x"), None);
+    fn parse_aliases_fish_single_line() {
+        // fish 実出力: `alias NAME 'BODY'`。
+        let out = parse_aliases_fish("alias ll 'ls -la'\nalias tool '/opt/bin/tool --fast'\n");
+        assert_eq!(
+            pairs(&out),
+            vec![("ll", "ls -la"), ("tool", "/opt/bin/tool --fast")]
+        );
+    }
+
+    #[test]
+    fn parse_aliases_fish_multiline_best_effort() {
+        // fish は複数行 alias を関数として保持し `alias` 表示で値が崩れる (先頭に名前が
+        // 混じる・空白/改行がエスケープされる)。名前は取れるが値は忠実に復元できない、
+        // というベストエフォート挙動を固定する。
+        let out = parse_aliases_fish("alias multi multi\\ echo\\ one\\necho\\ two\n");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "multi");
+        assert!(out[0].1.contains("echo")); // 値は取り込むが fish のエスケープ済み文字列
+    }
+
+    #[test]
+    fn parse_aliases_csh_single_line() {
+        // csh/tcsh 実出力: `NAME<TAB>VALUE`。
+        let out = parse_aliases_csh("ll\tls -la\ntool\t/opt/bin/tool --fast\n");
+        assert_eq!(
+            pairs(&out),
+            vec![("ll", "ls -la"), ("tool", "/opt/bin/tool --fast")]
+        );
+    }
+
+    #[test]
+    fn parse_aliases_csh_multiline() {
+        // csh 実出力: 2 行目以降はタブ無しの継続行。直前の値へ改行付きで連結する。
+        let out = parse_aliases_csh("multi\techo one\necho two\nsingle\tls -la\n");
+        assert_eq!(
+            pairs(&out),
+            vec![("multi", "echo one\necho two"), ("single", "ls -la")]
+        );
     }
 }
