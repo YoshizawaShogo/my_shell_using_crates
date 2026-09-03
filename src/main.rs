@@ -509,6 +509,10 @@ fn run() -> io::Result<i32> {
                     shell.ed.insert_paste(&data);
                     vec![ShellEvent::RedrawPrompt]
                 } else if confirm_multiline_paste(&mut shell.ed, &lines)? {
+                    // 確認プレビューはそのまま画面に残す (何を実行したかの記録になる)。
+                    // note_newline() で上がった再描画起点をリセットしておかないと、実行後の
+                    // 再描画が MoveUp+Clear でコマンド出力ごと消してしまう。
+                    shell.ed.reset_lines_above();
                     // 改行を保ったまま 1 コマンドとして実行する (行ごとの分割はしない)。
                     vec![ShellEvent::ExecutePasted(editor::normalize_newlines(&data))]
                 } else {
