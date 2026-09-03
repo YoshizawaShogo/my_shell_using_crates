@@ -10,9 +10,11 @@ use std::os::unix::process::CommandExt;
 /// load_rc からは false で呼ぶ (起動時に空行が大量発生するのを防ぐ)。
 ///
 /// 外部コマンドはトークン分割せず、先頭トークンの abbr 展開だけ行って残りは
-/// そのまま `sh -c` に渡す。alias はすべて `sh` の `alias` 定義として前置し、
+/// そのまま `bash -c` に渡す。alias はすべて `bash` の `alias` 定義として前置し、
 /// パイプ後 (`ls | grep`) を含むあらゆるコマンド位置で展開させる。
-/// これによりパイプ・リダイレクト・グロブ・`$VAR`・クォートも `sh` が解釈する。
+/// これによりパイプ・リダイレクト・グロブ・`$VAR`・クォートも `bash` が解釈する。
+/// 単一行・複数行とも bash に統一している (`[[ ]]`・配列などが 1 行でも貼り付けでも
+/// 同じように動くようにするため。`sh`=dash では bash 拡張が動かず挙動が食い違う)。
 pub fn execute_command(cmd: &str, ctx: &mut ShellContext, interactive: bool) -> io::Result<()> {
     if interactive {
         execute!(stdout(), Print("\r\n"))?;
@@ -96,12 +98,12 @@ pub fn execute_command(cmd: &str, ctx: &mut ShellContext, interactive: bool) -> 
         return Ok(());
     }
 
-    // 外部コマンド: alias 定義を前置し、行 (abbr 展開済み) はそのまま sh に渡す。
-    // alias 展開はパイプ後を含めて sh に任せる。先頭の `(exit N)` で直前コマンドの
-    // 終了ステータスを $? に引き継ぐ (sh -c は毎回新しいシェルなので明示が必要)。
+    // 外部コマンド: alias 定義を前置し、行 (abbr 展開済み) はそのまま bash に渡す。
+    // alias 展開はパイプ後を含めて bash に任せる。先頭の `(exit N)` で直前コマンドの
+    // 終了ステータスを $? に引き継ぐ (bash -c は毎回新しいシェルなので明示が必要)。
     let prelude = build_alias_prelude(&ctx.aliases);
     let sh_cmd = format!("{}(exit {}); {}", prelude, ctx.last_status, abbr_line);
-    let mut command = shell_command("sh", &sh_cmd);
+    let mut command = shell_command("bash", &sh_cmd);
     // フォアグラウンド実行＋ Ctrl+Z 停止の検知は job モジュールが担う。
     // 表示用のコマンド名には abbr 展開済みの行を渡す。
     crate::job::run_foreground(&mut command, abbr_line.trim(), ctx)
@@ -110,8 +112,8 @@ pub fn execute_command(cmd: &str, ctx: &mut ShellContext, interactive: bool) -> 
 /// 複数行コマンド (ペーストされたスクリプト) を改行込みでそのまま bash へ渡して実行する。
 ///
 /// 単一行のような加工 (abbr / ドット展開 / alias→ビルトイン判定) はしない。alias 定義
-/// だけは前置し、`(exit N)` で直前の終了ステータスを `$?` へ引き継ぐ。実行シェルを
-/// bash にするのは、`sh` (dash) では `[[ ]]`・配列などの bash 拡張が動かないため。
+/// だけは前置し、`(exit N)` で直前の終了ステータスを `$?` へ引き継ぐ。実行シェルは
+/// 単一行パスと同じく bash (`[[ ]]`・配列などの bash 拡張をそのまま使えるようにするため)。
 fn run_script(script: &str, ctx: &mut ShellContext) -> io::Result<()> {
     let prelude = build_alias_prelude(&ctx.aliases);
     let sh_cmd = format!("{}(exit {}); {}", prelude, ctx.last_status, script);
@@ -176,12 +178,12 @@ fn split_first_word(s: &str) -> (&str, &str) {
     }
 }
 
-/// 全 alias を sh の `alias` 定義に変換した前文を作る。
+/// 全 alias を bash の `alias` 定義に変換した前文を作る。
 ///
-/// この前文を外部コマンドの前に置くと、sh がコマンド位置 (行頭・`|`/`;`/`&&` の
+/// この前文を外部コマンドの前に置くと、bash がコマンド位置 (行頭・`|`/`;`/`&&` の
 /// 直後など) ごとに alias を展開する。各定義を別行に置くのは「alias は次の行から
-/// 有効」という sh の規則のため。`shopt` 行は bash が `/bin/sh` の場合に展開を
-/// 有効化する保険で、dash では未知コマンドとして無害に失敗する。
+/// 有効」という規則のため。`shopt -s expand_aliases` は非対話 (`bash -c`) では既定で
+/// 無効な alias 展開を有効化するために必須。
 fn build_alias_prelude(aliases: &HashMap<String, String>) -> String {
     let mut out = String::from("shopt -s expand_aliases 2>/dev/null\n");
     for (name, value) in aliases {
