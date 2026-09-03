@@ -239,6 +239,12 @@ fn sanitize_paste(data: &str) -> String {
     paste_lines(data).join("; ")
 }
 
+/// ブラケットペーストの改行を LF に揃える (端末は CR / CRLF で送ることがある)。
+/// bash へ 1 コマンドとしてそのまま渡すため、行数やインデント・タブは保持する。
+pub fn normalize_newlines(data: &str) -> String {
+    data.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 /// ペーストテキストを、実際に入力へ入る行 (trim 済み・空行を除く) に分解する。
 /// 貼り付け前の確認 (何行貼るか / 先頭行は何か) にも使う。
 ///
@@ -522,6 +528,18 @@ mod tests {
         assert_eq!(sanitize_paste("\n\na\r\n\r\nb\n\n"), "a; b");
         // インデントは除去
         assert_eq!(sanitize_paste("a\n    b"), "a; b");
+    }
+
+    #[test]
+    fn normalize_newlines_unifies_to_lf() {
+        // CR / CRLF を LF に揃える。インデント・タブ・空行は保持する。
+        assert_eq!(
+            normalize_newlines("for f in *; do\r\n\techo $f\r\ndone"),
+            "for f in *; do\n\techo $f\ndone"
+        );
+        assert_eq!(normalize_newlines("a\rb\rc"), "a\nb\nc");
+        // 改行なしはそのまま
+        assert_eq!(normalize_newlines("echo hi"), "echo hi");
     }
 
     #[test]

@@ -23,6 +23,12 @@ pub fn execute_command(cmd: &str, ctx: &mut ShellContext, interactive: bool) -> 
         return Ok(());
     }
 
+    // 複数行 (ペーストされたスクリプト) は abbr/ドット展開/ビルトイン判定をせず、改行を
+    // 保ったまま bash へそのまま渡す ("そのまま入力→そのまま実行")。
+    if trimmed.contains('\n') {
+        return run_script(trimmed, ctx);
+    }
+
     // ドットのみで構成され 2 個以上のトークンを相対パスに展開する。
     // コマンド位置 (行全体がドット) → `cd <path>`
     // 引数位置 (ls .... 等)          → トークンをパスに置換して渡す
@@ -95,10 +101,32 @@ pub fn execute_command(cmd: &str, ctx: &mut ShellContext, interactive: bool) -> 
     // 終了ステータスを $? に引き継ぐ (sh -c は毎回新しいシェルなので明示が必要)。
     let prelude = build_alias_prelude(&ctx.aliases);
     let sh_cmd = format!("{}(exit {}); {}", prelude, ctx.last_status, abbr_line);
-    let mut command = std::process::Command::new("sh");
-    command.arg("-c").arg(&sh_cmd);
-    // 子を独立プロセスグループに入れて端末ジョブ制御の対象にし、親シェルが無視している
-    // シグナルは既定動作へ戻す。これをしないと Ctrl+Z で停止できず、Ctrl+C も効かない。
+    let mut command = shell_command("sh", &sh_cmd);
+    // フォアグラウンド実行＋ Ctrl+Z 停止の検知は job モジュールが担う。
+    // 表示用のコマンド名には abbr 展開済みの行を渡す。
+    crate::job::run_foreground(&mut command, abbr_line.trim(), ctx)
+}
+
+/// 複数行コマンド (ペーストされたスクリプト) を改行込みでそのまま bash へ渡して実行する。
+///
+/// 単一行のような加工 (abbr / ドット展開 / alias→ビルトイン判定) はしない。alias 定義
+/// だけは前置し、`(exit N)` で直前の終了ステータスを `$?` へ引き継ぐ。実行シェルを
+/// bash にするのは、`sh` (dash) では `[[ ]]`・配列などの bash 拡張が動かないため。
+fn run_script(script: &str, ctx: &mut ShellContext) -> io::Result<()> {
+    let prelude = build_alias_prelude(&ctx.aliases);
+    let sh_cmd = format!("{}(exit {}); {}", prelude, ctx.last_status, script);
+    let mut command = shell_command("bash", &sh_cmd);
+    // ジョブ表示は先頭行だけを見せ、複数行であることを `…` で示す。
+    let label = format!("{} …", script.lines().next().unwrap_or(script));
+    crate::job::run_foreground(&mut command, &label, ctx)
+}
+
+/// `program -c <sh_cmd>` の Command を作る。子を独立プロセスグループに入れて端末ジョブ
+/// 制御の対象にし、親シェルが無視しているシグナルを既定動作へ戻す。これをしないと
+/// Ctrl+Z で停止できず、Ctrl+C も効かない。
+fn shell_command(program: &str, sh_cmd: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command.arg("-c").arg(sh_cmd);
     unsafe {
         command.pre_exec(|| {
             libc::setpgid(0, 0);
@@ -114,9 +142,7 @@ pub fn execute_command(cmd: &str, ctx: &mut ShellContext, interactive: bool) -> 
             Ok(())
         });
     }
-    // フォアグラウンド実行＋ Ctrl+Z 停止の検知は job モジュールが担う。
-    // 表示用のコマンド名には abbr 展開済みの行を渡す。
-    crate::job::run_foreground(&mut command, abbr_line.trim(), ctx)
+    command
 }
 
 /// 先頭の単語と、それに続く残り (前後の空白を除く) に分割する。

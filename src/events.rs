@@ -12,6 +12,8 @@ pub enum ShellEvent {
     CancelInput,
     RedrawPrompt,
     ExecuteCommand,
+    /// 複数行ペーストを 1 つのコマンドとして実行する (エディタバッファは経由しない)。
+    ExecutePasted(String),
     ShowCompletion,
     AcceptGhost,
     ShowHistoryFzf,

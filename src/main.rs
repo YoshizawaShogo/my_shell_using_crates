@@ -26,7 +26,7 @@ use events::{ShellEvent, handle_key};
 use exec::execute_command;
 use history::History;
 use selector::{PickerKind, Selection};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use term::{RawModeGuard, setup_signal_handlers};
 
@@ -48,8 +48,6 @@ struct Shell {
     saved_input: String,
     /// 停止ジョブがある状態で一度終了を試みたか (2 回目で実際に終了する)
     jobs_warned: bool,
-    /// 複数行ペーストの 2 行目以降。実行のたびに先頭を取り出して順に実行する。
-    paste_queue: VecDeque<String>,
 }
 
 impl Shell {
@@ -63,7 +61,6 @@ impl Shell {
             hist_idx: None,
             saved_input: String::new(),
             jobs_warned: false,
-            paste_queue: VecDeque::new(),
         }
     }
 
@@ -211,6 +208,43 @@ impl Shell {
         Ok(sel)
     }
 
+    /// コマンド文字列を実行し、履歴追加・終了ステータス表示・git 情報更新・ジョブ回収
+    /// までの後処理をまとめて行う。`ExecuteCommand` (単一行) と `ExecutePasted`
+    /// (複数行) の共通処理。終了要求 (`exit` ビルトイン) なら `Exit` を積む。
+    fn finish_execute(&mut self, cmd: String, pending: &mut Vec<ShellEvent>) -> io::Result<bool> {
+        execute_command(&cmd, &mut self.ctx, true)?;
+        if !cmd.trim().is_empty() {
+            self.history.add(&cmd);
+        }
+        if self.ctx.last_status != 0 {
+            execute!(
+                stdout(),
+                SetForegroundColor(Color::Rgb {
+                    r: 0xe2,
+                    g: 0x78,
+                    b: 0x78
+                }),
+                Print(format!("↳ exit {}\r\n", self.ctx.last_status)),
+                ResetColor,
+            )?;
+        }
+        self.git_info = fetch_git_info();
+        self.ghost = None;
+        self.hist_idx = None;
+        self.saved_input.clear();
+        // exit ビルトインの終了要求。jobs_warned はリセットせずに Exit へ渡す
+        // (停止ジョブがあるとき、2 回目の exit で実際に終了させるため)。
+        if self.ctx.exit_status.is_some() {
+            pending.push(ShellEvent::Exit);
+            return Ok(false);
+        }
+        self.jobs_warned = false;
+        // 完了/停止したバックグラウンドジョブをプロンプト表示前に通知する。
+        job::reap_finished(&mut self.ctx)?;
+        pending.push(ShellEvent::RedrawPrompt);
+        Ok(false)
+    }
+
     /// 1 個の `ShellEvent` を処理する。
     ///
     /// 端末 I/O を伴うため戻り値は `io::Result`。終了要求なら `Ok(true)` を返す。
@@ -242,8 +276,6 @@ impl Shell {
                 self.ghost = None;
                 self.hist_idx = None;
                 self.saved_input.clear();
-                // 未実行のペースト行も一緒に捨てる
-                self.paste_queue.clear();
                 execute!(stdout(), Print("^C\r\n"))?;
                 pending.push(ShellEvent::RedrawPrompt);
             }
@@ -260,54 +292,15 @@ impl Shell {
                 // 2. ゴーストを消してクリーンな表示にしてから改行
                 self.ghost = None;
                 self.redraw()?;
-                // 3. バッファを取得してエディタをクリア
+                // 3. バッファを取得してエディタをクリアし、実行する
                 let cmd = self.ed.take();
-                execute_command(&cmd, &mut self.ctx, true)?;
-                if !cmd.trim().is_empty() {
-                    self.history.add(&cmd);
-                }
-                if self.ctx.last_status != 0 {
-                    execute!(
-                        stdout(),
-                        SetForegroundColor(Color::Rgb {
-                            r: 0xe2,
-                            g: 0x78,
-                            b: 0x78
-                        }),
-                        Print(format!("↳ exit {}\r\n", self.ctx.last_status)),
-                        ResetColor,
-                    )?;
-                }
-                self.git_info = fetch_git_info();
-                self.ghost = None;
-                self.hist_idx = None;
-                self.saved_input.clear();
-                // exit ビルトインの終了要求。jobs_warned はリセットせずに Exit へ渡す
-                // (停止ジョブがあるとき、2 回目の exit で実際に終了させるため)。
-                if self.ctx.exit_status.is_some() {
-                    pending.push(ShellEvent::Exit);
-                    return Ok(false);
-                }
-                self.jobs_warned = false;
-                // 完了/停止したバックグラウンドジョブをプロンプト表示前に通知する。
-                job::reap_finished(&mut self.ctx)?;
-                // 複数行ペーストの残りを 1 行ずつ実行する。Ctrl+C で中断されたときは
-                // 続きを流さずに捨てる (128+SIGINT = 130)。
-                if !self.paste_queue.is_empty() {
-                    if self.ctx.last_status == 130 {
-                        let skipped = self.paste_queue.len();
-                        self.paste_queue.clear();
-                        execute!(
-                            stdout(),
-                            Print(format!("↳ skipped {} pasted lines\r\n", skipped))
-                        )?;
-                    } else if let Some(next) = self.paste_queue.pop_front() {
-                        self.ed.set(next);
-                        pending.push(ShellEvent::ExecuteCommand);
-                        return Ok(false);
-                    }
-                }
-                pending.push(ShellEvent::RedrawPrompt);
+                return self.finish_execute(cmd, pending);
+            }
+
+            // 複数行ペーストを 1 コマンドとして実行する。エディタバッファは複数行を
+            // 描画できないので経由せず、正規化済みのスクリプトを直接実行する。
+            ShellEvent::ExecutePasted(script) => {
+                return self.finish_execute(script, pending);
             }
 
             ShellEvent::AcceptGhost => {
@@ -511,15 +504,13 @@ fn run() -> io::Result<i32> {
             // 2 行以上は中身をプレビューして確認し、承諾されたらそのまま 1 行ずつ実行する
             // (何が走るかは確認画面で見せているので、改めて Enter を求めない)。
             Event::Paste(data) => {
-                let mut lines = editor::paste_lines(&data);
+                let lines = editor::paste_lines(&data);
                 if lines.len() < 2 {
                     shell.ed.insert_paste(&data);
                     vec![ShellEvent::RedrawPrompt]
                 } else if confirm_multiline_paste(&mut shell.ed, &lines)? {
-                    let first = lines.remove(0);
-                    shell.ed.insert_str(&first);
-                    shell.paste_queue = lines.into();
-                    vec![ShellEvent::ExecuteCommand]
+                    // 改行を保ったまま 1 コマンドとして実行する (行ごとの分割はしない)。
+                    vec![ShellEvent::ExecutePasted(editor::normalize_newlines(&data))]
                 } else {
                     vec![ShellEvent::RedrawPrompt]
                 }

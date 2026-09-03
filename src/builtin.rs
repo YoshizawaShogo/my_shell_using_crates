@@ -218,6 +218,7 @@ type BuiltinFn = fn(&[&str], &mut ShellContext) -> io::Result<()>;
 /// ビルトインを増やすときはここに 1 行足せばよい。
 const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("cd", cd),
+    ("groot", groot),
     ("source-env", source_env),
     ("abbr", abbr),
     ("alias", alias),
@@ -264,17 +265,23 @@ fn cd(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
             .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?,
     };
 
-    // 移動前の cwd を控えておき、cd が成功したときだけ OLDPWD とスタックを更新する。
-    // (存在しないディレクトリへの cd で OLDPWD やスタックが壊れるのを防ぐ)
+    change_dir(&target, ctx)
+}
+
+/// カレントディレクトリを `target` へ移し、OLDPWD・dir_stack・端末通知を更新する。
+/// cd / groot など「移動するビルトイン」が共通で使う。
+fn change_dir(target: &Path, ctx: &mut ShellContext) -> io::Result<()> {
+    // 移動前の cwd を控えておき、移動が成功したときだけ OLDPWD とスタックを更新する。
+    // (存在しないディレクトリへの移動で OLDPWD やスタックが壊れるのを防ぐ)
     let prev = std::env::current_dir();
-    std::env::set_current_dir(&target)?;
+    std::env::set_current_dir(target)?;
 
     // SAFETY: ビルトインはメインスレッドからのみ実行される。Ctrl+T 列挙で一時的に
     // spawn されるワーカースレッドは getenv/setenv を一切呼ばないため、environ への
     // 並行アクセスは発生しない。
     //
     // PWD を実際のカレントへ更新する。これで `$PWD` (ビルトインは env::var、外部
-    // コマンドは sh 経由で参照) が cd 後も正しい値になる。target は相対の場合が
+    // コマンドは sh 経由で参照) が移動後も正しい値になる。target は相対の場合が
     // あるので current_dir() で絶対パスを取り直す。
     if let Ok(now) = std::env::current_dir() {
         unsafe { std::env::set_var("PWD", &now) };
@@ -286,10 +293,35 @@ fn cd(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
         ctx.dir_stack.push(cwd);
     }
 
-    // 移動先を端末へ知らせる (OSC 7 / タイトル)。cwd を変えるのは cd だけなので
-    // ここと起動時の 1 回で足りる (毎回の再描画で送るとキー入力ごとに出てしまう)。
+    // 移動先を端末へ知らせる (OSC 7 / タイトル)。cwd を変えるのは移動系ビルトインだけ
+    // なので、ここと起動時の 1 回で足りる (毎回の再描画で送るとキー入力ごとに出る)。
     crate::term::notify_cwd();
     Ok(())
+}
+
+// ─── groot ──────────────────────────────────────────────────────────────────────
+
+/// 現在の git リポジトリ (worktree) のルートへ移動する。リポジトリ外ならエラー。
+/// カスタマイズ無しで使えるよう組み込みで提供する。
+fn groot(_args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
+    let root = git_toplevel()?;
+    change_dir(&root, ctx)
+}
+
+/// `git rev-parse --show-toplevel` で現在の worktree ルートを求める。
+fn git_toplevel() -> io::Result<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|e| io::Error::other(format!("failed to run git: {}", e)))?;
+    if !output.status.success() {
+        return Err(io::Error::other("not a git repository"));
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        return Err(io::Error::other("not a git repository"));
+    }
+    Ok(PathBuf::from(path))
 }
 
 // ─── source-env ───────────────────────────────────────────────────────────────
@@ -1084,6 +1116,19 @@ mod tests {
         assert_eq!(
             pairs(&out),
             vec![("ll", "ls -la"), ("tool", "/opt/bin/tool --fast")]
+        );
+    }
+
+    #[test]
+    fn git_toplevel_in_repo() {
+        // このクレート自体が git リポジトリなので、ルートが取れて cwd を含むはず。
+        // (cwd を変更すると並行テストに影響するので、解決だけを検証し移動はしない)
+        let root = git_toplevel().expect("should resolve repo root");
+        assert!(root.is_absolute());
+        let cwd = std::env::current_dir().unwrap();
+        assert!(
+            cwd.starts_with(&root),
+            "cwd {cwd:?} should be under root {root:?}"
         );
     }
 
