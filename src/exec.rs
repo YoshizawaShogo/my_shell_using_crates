@@ -32,11 +32,14 @@ pub fn execute_command(cmd: &str, ctx: &mut ShellContext, interactive: bool) -> 
     }
 
     // ドットのみで構成され 2 個以上のトークンを相対パスに展開する。
-    // コマンド位置 (行全体がドット) → `cd <path>`
-    // 引数位置 (ls .... 等)          → トークンをパスに置換して渡す
+    // コマンド位置 (行全体がドット、末尾 `/` は許容) → `cd <path>`
+    // 引数位置 (ls .... / cd .../src 等)            → トークンをパスに置換して渡す
+    // 例: `...` `.../` → `cd ../..`、`....` → `cd ../../..`
     let dot_expanded: String;
-    let trimmed = if trimmed.len() >= 2 && trimmed.chars().all(|c| c == '.') {
-        let levels = trimmed.len() - 1;
+    // 行全体がドット列か判定するとき、末尾の `/` (`.../` の見た目) は無視する。
+    let dot_core = trimmed.strip_suffix('/').unwrap_or(trimmed);
+    let trimmed = if dot_core.len() >= 2 && dot_core.bytes().all(|b| b == b'.') {
+        let levels = dot_core.len() - 1;
         dot_expanded = format!("cd {}", vec![".."; levels].join("/"));
         dot_expanded.as_str()
     } else if let Some(s) = expand_dot_args(trimmed) {
@@ -147,20 +150,18 @@ fn shell_command(program: &str, sh_cmd: &str) -> std::process::Command {
     command
 }
 
-/// 先頭の単語と、それに続く残り (前後の空白を除く) に分割する。
-/// 行中の引数位置にあるドット列 (`..` 以上) を相対パスに展開する。
+/// 行中の各トークンに含まれるドット列 (`...` 以上) を相対パスに展開する。
 /// 変換が不要なら `None` を返す。
 fn expand_dot_args(line: &str) -> Option<String> {
     let mut changed = false;
     let result: Vec<String> = line
         .split_whitespace()
-        .map(|t| {
-            if t.len() >= 2 && t.chars().all(|c| c == '.') {
+        .map(|t| match expand_dot_token(t) {
+            Some(exp) => {
                 changed = true;
-                vec![".."; t.len() - 1].join("/")
-            } else {
-                t.to_string()
+                exp
             }
+            None => t.to_string(),
         })
         .collect();
     if changed {
@@ -168,6 +169,31 @@ fn expand_dot_args(line: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// トークンを `/` 区切りのコンポーネントに分け、3 個以上のドットだけからなる
+/// コンポーネントを `..` の連鎖に展開する。
+///
+/// 例: `...` → `../..`、`.../` → `../../`、`.../src` → `../../src`。
+/// `.` / `..` と、ドット以外を含むコンポーネント (`..foo` 等) は変えない。
+/// 変換が無ければ `None`。
+fn expand_dot_token(token: &str) -> Option<String> {
+    if !token.contains('.') {
+        return None;
+    }
+    let mut changed = false;
+    let comps: Vec<String> = token
+        .split('/')
+        .map(|c| {
+            if c.len() >= 3 && c.bytes().all(|b| b == b'.') {
+                changed = true;
+                vec![".."; c.len() - 1].join("/")
+            } else {
+                c.to_string()
+            }
+        })
+        .collect();
+    if changed { Some(comps.join("/")) } else { None }
 }
 
 fn split_first_word(s: &str) -> (&str, &str) {
@@ -288,6 +314,38 @@ mod tests {
         assert_eq!(split_first_word("  ls  -la  x"), ("ls", "-la  x"));
         assert_eq!(split_first_word("solo"), ("solo", ""));
         assert_eq!(split_first_word(""), ("", ""));
+    }
+
+    #[test]
+    fn expand_dot_token_cases() {
+        // 3 個以上のドット列 → `..` の連鎖。末尾スラッシュ・後続パスも対応。
+        assert_eq!(expand_dot_token("..."), Some("../..".to_string()));
+        assert_eq!(expand_dot_token("...."), Some("../../..".to_string()));
+        assert_eq!(expand_dot_token(".../"), Some("../../".to_string()));
+        assert_eq!(expand_dot_token(".../src"), Some("../../src".to_string()));
+        assert_eq!(
+            expand_dot_token("..../a/b"),
+            Some("../../../a/b".to_string())
+        );
+        // `.` / `..` / `../` と、ドット以外を含むコンポーネントは変えない。
+        assert_eq!(expand_dot_token("."), None);
+        assert_eq!(expand_dot_token(".."), None);
+        assert_eq!(expand_dot_token("../"), None);
+        assert_eq!(expand_dot_token("../foo"), None);
+        assert_eq!(expand_dot_token("..foo"), None);
+        assert_eq!(expand_dot_token("foo"), None);
+    }
+
+    #[test]
+    fn expand_dot_args_in_line() {
+        assert_eq!(expand_dot_args("ls .../"), Some("ls ../../".to_string()));
+        assert_eq!(
+            expand_dot_args("cd .../src"),
+            Some("cd ../../src".to_string())
+        );
+        // ドット列が無ければ変換しない (元の行をそのまま使う)。
+        assert_eq!(expand_dot_args("git status"), None);
+        assert_eq!(expand_dot_args("cd ../foo"), None);
     }
 
     #[test]

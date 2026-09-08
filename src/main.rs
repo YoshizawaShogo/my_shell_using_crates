@@ -213,7 +213,9 @@ impl Shell {
     /// (複数行) の共通処理。終了要求 (`exit` ビルトイン) なら `Exit` を積む。
     fn finish_execute(&mut self, cmd: String, pending: &mut Vec<ShellEvent>) -> io::Result<bool> {
         execute_command(&cmd, &mut self.ctx, true)?;
-        if !cmd.trim().is_empty() {
+        // マルチライン (ペーストされたスクリプト) は履歴に残さない。履歴一覧・Ctrl+R の
+        // レイアウトが崩れるうえ、複数行コマンドを後から再利用することはまずないため。
+        if !cmd.trim().is_empty() && !cmd.contains('\n') {
             self.history.add(&cmd);
         }
         if self.ctx.last_status != 0 {
