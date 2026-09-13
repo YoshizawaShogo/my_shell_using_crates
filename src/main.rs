@@ -313,6 +313,25 @@ impl Shell {
                 pending.push(ShellEvent::RedrawPrompt);
             }
 
+            // Shift+Right: ゴーストを `/`・空白の 1 区切りだけ受理する。残りは
+            // RedrawPrompt の compute_ghost が履歴から再計算する。
+            ShellEvent::AcceptGhostWord => {
+                if let Some(ghost) = self.ghost.take() {
+                    let n = editor::ghost_seg_len(&ghost);
+                    self.ed.move_end();
+                    self.ed.insert_str(&ghost[..n]);
+                }
+                pending.push(ShellEvent::RedrawPrompt);
+            }
+
+            // Shift+Left: 直前の 1 区切りをバッファから削除する。削除した語は
+            // compute_ghost が履歴から再計算してゴーストとして再表示する。
+            ShellEvent::RetractGhostWord => {
+                self.ed.move_end();
+                self.ed.delete_seg_backward();
+                pending.push(ShellEvent::RedrawPrompt);
+            }
+
             ShellEvent::ShowCompletion => {
                 let prefix = self.ed.line()[..self.ed.cursor()].to_string();
                 // カーソル後ろのテキストは補完で消さずに残す。

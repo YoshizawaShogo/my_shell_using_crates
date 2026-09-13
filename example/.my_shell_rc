@@ -58,3 +58,6 @@ abbr gst "git status"
 # ── 環境変数 ──────────────────────────────────────────────────────────────────
 set EDITOR vim
 set PAGER  less
+# less を代替画面でページングさせ、終了時に出力を残さない (色は保持)。
+# 未設定だと git が LESS=FRX を強制し、git log が cat のように画面に残る。
+set LESS   -R

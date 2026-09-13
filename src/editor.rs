@@ -123,6 +123,15 @@ impl LineEditor {
         self.tab_end = None;
     }
 
+    /// Shift+Left: `/` または空白の 1 区切り分だけカーソル直前を削除する。
+    /// ゴースト補完を 1 語ぶん引き戻す用途 (削除後は履歴から ghost が再計算される)。
+    pub fn delete_seg_backward(&mut self) {
+        let new_pos = seg_left_pos(&self.buf[..self.cursor]);
+        self.buf.drain(new_pos..self.cursor);
+        self.cursor = new_pos;
+        self.tab_end = None;
+    }
+
     /// Ctrl+U: カーソルより前をすべて削除する。
     pub fn kill_to_start(&mut self) {
         self.buf.drain(..self.cursor);
@@ -379,6 +388,41 @@ fn header_physical_lines(display_width: usize, cols: u16) -> u16 {
     display_width.div_ceil(cols) as u16
 }
 
+/// Shift+Left の削除範囲用: `/` または空白を区切りとして、最後の 1 区切りの開始
+/// バイト位置を返す。末尾の区切り (`src/` の `/`) はその左の語とまとめて 1 区切りと
+/// 数える。`/` `空白` は ASCII なので、バイト走査でも char 境界で止まる。
+///
+/// 例: `cd src/main.rs` → 7 (`cd src/`)、`cd src/` → 3 (`cd `)、`cd ` → 0。
+fn seg_left_pos(s: &str) -> usize {
+    let b = s.as_bytes();
+    let sep = |c: u8| c == b'/' || c == b' ';
+    let mut i = s.len();
+    while i > 0 && sep(b[i - 1]) {
+        i -= 1; // 末尾の区切り列を飛ばす
+    }
+    while i > 0 && !sep(b[i - 1]) {
+        i -= 1; // 語の本体を飛ばす
+    }
+    i
+}
+
+/// Shift+Right の受理範囲用: ghost 先頭から `/` または空白の 1 区切り分の長さ
+/// (語本体＋直後の区切り列) を返す。区切りが無ければ全体を返す。
+///
+/// 例: `src/main.rs` → 4 (`src/`)、`foo bar` → 4 (`foo `)、`main.rs` → 7 (全体)。
+pub fn ghost_seg_len(ghost: &str) -> usize {
+    let b = ghost.as_bytes();
+    let sep = |c: u8| c == b'/' || c == b' ';
+    let mut i = 0;
+    while i < b.len() && !sep(b[i]) {
+        i += 1; // 語の本体
+    }
+    while i < b.len() && sep(b[i]) {
+        i += 1; // 直後の区切り列
+    }
+    i
+}
+
 /// Ctrl+W / Ctrl+Left 用: クォート/エスケープを尊重した最後の単語の開始位置を返す。
 /// クォート外の空白だけを区切りとし、最後の単語＋直後の末尾空白をまとめて
 /// 消せるよう、その単語の開始バイト位置を返す。
@@ -556,6 +600,27 @@ mod tests {
         assert_eq!(paste_lines("solo\r"), vec!["solo"]);
         // 行内のタブなど制御文字は空白へ潰す (表示幅の計算が狂うため)
         assert_eq!(paste_lines("echo\ta\tb"), vec!["echo a b"]);
+    }
+
+    #[test]
+    fn seg_left_pos_by_slash_or_space() {
+        // 最後の `/`・空白の 1 区切りを削除対象にする (末尾区切りは左の語と一体)。
+        assert_eq!(seg_left_pos("cd src/main.rs"), 7); // → "cd src/"
+        assert_eq!(seg_left_pos("cd src/"), 3); // → "cd "
+        assert_eq!(seg_left_pos("cd "), 0); // → ""
+        assert_eq!(seg_left_pos("foo bar baz"), 8); // → "foo bar "
+        assert_eq!(seg_left_pos("foo"), 0);
+        assert_eq!(seg_left_pos(""), 0);
+    }
+
+    #[test]
+    fn ghost_seg_len_by_slash_or_space() {
+        // ghost 先頭から語本体＋直後の区切り列ぶん。
+        assert_eq!(ghost_seg_len("src/main.rs"), 4); // "src/"
+        assert_eq!(ghost_seg_len("foo bar"), 4); // "foo "
+        assert_eq!(ghost_seg_len("main.rs"), 7); // 区切り無し → 全体
+        assert_eq!(ghost_seg_len("a/b/c"), 2); // "a/"
+        assert_eq!(ghost_seg_len(""), 0);
     }
 
     #[test]

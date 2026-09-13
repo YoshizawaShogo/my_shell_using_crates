@@ -16,6 +16,10 @@ pub enum ShellEvent {
     ExecutePasted(String),
     ShowCompletion,
     AcceptGhost,
+    /// Shift+Right: ゴースト補完を `/`・空白の 1 区切りだけ受理する。
+    AcceptGhostWord,
+    /// Shift+Left: 直前の 1 区切りをバッファから戻し、ゴースト補完を 1 語引き戻す。
+    RetractGhostWord,
     ShowHistoryFzf,
     ShowFileFzf,
     ShowRecentPathFzf,
@@ -33,6 +37,7 @@ pub enum ShellEvent {
 pub fn handle_key(ed: &mut LineEditor, key: KeyEvent) -> Vec<ShellEvent> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let at_end = ed.cursor() == ed.line().len();
 
     match key.code {
@@ -93,6 +98,15 @@ pub fn handle_key(ed: &mut LineEditor, key: KeyEvent) -> Vec<ShellEvent> {
         // ゴースト消去・abbr 展開は main.rs 側で行うため take() しない
         KeyCode::Enter => vec![ShellEvent::ExecuteCommand],
 
+        // Shift+Left: 行末ならゴーストを 1 区切り引き戻す、それ以外は左移動
+        KeyCode::Left if shift => {
+            if at_end {
+                vec![ShellEvent::RetractGhostWord]
+            } else {
+                ed.move_left();
+                vec![ShellEvent::RedrawPrompt]
+            }
+        }
         KeyCode::Left if ctrl => {
             ed.move_word_left();
             vec![ShellEvent::RedrawPrompt]
@@ -100,6 +114,15 @@ pub fn handle_key(ed: &mut LineEditor, key: KeyEvent) -> Vec<ShellEvent> {
         KeyCode::Left => {
             ed.move_left();
             vec![ShellEvent::RedrawPrompt]
+        }
+        // Shift+Right: 行末ならゴーストを 1 区切り受理する、それ以外は右移動
+        KeyCode::Right if shift => {
+            if at_end {
+                vec![ShellEvent::AcceptGhostWord]
+            } else {
+                ed.move_right();
+                vec![ShellEvent::RedrawPrompt]
+            }
         }
         KeyCode::Right if ctrl => {
             ed.move_word_right();
