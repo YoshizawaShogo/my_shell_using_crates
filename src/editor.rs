@@ -392,28 +392,51 @@ fn header_physical_lines(display_width: usize, cols: u16) -> u16 {
 /// バイト位置を返す。末尾の区切り (`src/` の `/`) はその左の語とまとめて 1 区切りと
 /// 数える。`/` `空白` は ASCII なので、バイト走査でも char 境界で止まる。
 ///
-/// 例: `cd src/main.rs` → 7 (`cd src/`)、`cd src/` → 3 (`cd `)、`cd ` → 0。
+/// 絶対パス先頭の `/` (行頭か空白の直後) は、その後ろの語と同じ区切りとして扱う
+/// ([`ghost_seg_len`] が `/usr/` を 1 回で受理するのと対称にするため)。
+///
+/// 例: `cd src/main.rs` → 7 (`cd src/`)、`cd src/` → 3 (`cd `)、`cd ` → 0、
+/// `cat /usr/` → 4 (`cat `)、`cat /` → 4 (`cat `)。
 fn seg_left_pos(s: &str) -> usize {
     let b = s.as_bytes();
     let sep = |c: u8| c == b'/' || c == b' ';
+    // `/` が絶対パスの先頭か (行頭、または直前が空白)。
+    let is_root_slash = |k: usize| b[k] == b'/' && (k == 0 || b[k - 1] == b' ');
     let mut i = s.len();
     while i > 0 && sep(b[i - 1]) {
         i -= 1; // 末尾の区切り列を飛ばす
     }
+    // 末尾が絶対パスの `/` だけ (`cat /`) なら、その `/` から先を 1 区切りとする。
+    if let Some(k) = (i..s.len()).find(|&k| is_root_slash(k)) {
+        return k;
+    }
     while i > 0 && !sep(b[i - 1]) {
         i -= 1; // 語の本体を飛ばす
+    }
+    // 語の直前の `/` 列が絶対パスの先頭なら一緒に戻す (`cat /usr/` → `cat `)。
+    let mut j = i;
+    while j > 0 && b[j - 1] == b'/' {
+        j -= 1;
+    }
+    if j < i && is_root_slash(j) {
+        i = j;
     }
     i
 }
 
 /// Shift+Right の受理範囲用: ghost 先頭から `/` または空白の 1 区切り分の長さ
-/// (語本体＋直後の区切り列) を返す。区切りが無ければ全体を返す。
+/// (先頭の区切り列＋語本体＋直後の区切り列) を返す。区切りが無ければ全体を返す。
+/// 先頭の区切りも含めるのは、絶対パス (`/usr/bin`) で 1 回目が `/` だけになるのを
+/// 避けるため。
 ///
-/// 例: `src/main.rs` → 4 (`src/`)、`foo bar` → 4 (`foo `)、`main.rs` → 7 (全体)。
+/// 例: `src/main.rs` → 4 (`src/`)、`/usr/bin` → 5 (`/usr/`)、`main.rs` → 7 (全体)。
 pub fn ghost_seg_len(ghost: &str) -> usize {
     let b = ghost.as_bytes();
     let sep = |c: u8| c == b'/' || c == b' ';
     let mut i = 0;
+    while i < b.len() && sep(b[i]) {
+        i += 1; // 先頭の区切り列 (絶対パスの `/` など)
+    }
     while i < b.len() && !sep(b[i]) {
         i += 1; // 語の本体
     }
@@ -611,6 +634,11 @@ mod tests {
         assert_eq!(seg_left_pos("foo bar baz"), 8); // → "foo bar "
         assert_eq!(seg_left_pos("foo"), 0);
         assert_eq!(seg_left_pos(""), 0);
+        // 絶対パス: 先頭の `/` は後ろの語と一緒に戻す (Shift+→ の `/usr/` と対称)。
+        assert_eq!(seg_left_pos("cat /usr/"), 4); // → "cat "
+        assert_eq!(seg_left_pos("cat /"), 4); // → "cat "
+        assert_eq!(seg_left_pos("/usr/"), 0); // → ""
+        assert_eq!(seg_left_pos("cat /usr/bin"), 9); // → "cat /usr/" (途中の `/` は従来どおり)
     }
 
     #[test]
@@ -621,6 +649,11 @@ mod tests {
         assert_eq!(ghost_seg_len("main.rs"), 7); // 区切り無し → 全体
         assert_eq!(ghost_seg_len("a/b/c"), 2); // "a/"
         assert_eq!(ghost_seg_len(""), 0);
+        // 絶対パス: 先頭の `/` だけで止まらず最初のコンポーネントまで進む。
+        assert_eq!(ghost_seg_len("/usr/bin"), 5); // "/usr/"
+        assert_eq!(ghost_seg_len("/etc"), 4); // "/etc"
+        // 空白始まりも同様 (`ls` の後の " -la" など)。
+        assert_eq!(ghost_seg_len(" -la foo"), 5); // " -la "
     }
 
     #[test]

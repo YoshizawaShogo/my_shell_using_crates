@@ -229,6 +229,7 @@ const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("bg", bg),
     ("jobs", jobs),
     ("refresh", refresh),
+    ("rep", rep),
     ("exit", exit),
 ];
 
@@ -981,6 +982,40 @@ fn refresh(_args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
 
 // ─── exit ─────────────────────────────────────────────────────────────────────
 
+// ─── rep ──────────────────────────────────────────────────────────────────────
+
+/// 登録テーブル用の入口。実際の呼び出しは `execute_command` が分割前の生の行で
+/// [`rep_line`] を直接呼ぶので、ここへ来るのはテーブル経由で呼ばれた場合だけ。
+fn rep(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
+    rep_line(&shell_words::join(args), ctx)
+}
+
+/// `rep <n> <cmd>`: `<cmd>` を `n` 回繰り返し実行する。
+///
+/// `<cmd>` はトークン分割・`$VAR` 展開をせず生の文字列のまま毎回実行し直す
+/// (クォート・パイプ・`$RANDOM` 等を毎回 bash に解釈させるため)。Ctrl+C で中断された
+/// (終了ステータス 130) ら残りを打ち切る。終了ステータスは最後に実行した回のもの。
+pub fn rep_line(line: &str, ctx: &mut ShellContext) -> io::Result<()> {
+    let line = line.trim();
+    let (count, cmd) = match line.split_once(char::is_whitespace) {
+        Some((n, rest)) => (n, rest.trim()),
+        None => (line, ""),
+    };
+    if count.is_empty() || cmd.is_empty() {
+        return Err(io::Error::other("usage: rep <n> <cmd>"));
+    }
+    let n: usize = count
+        .parse()
+        .map_err(|_| io::Error::other(format!("invalid count: {}", count)))?;
+    for _ in 0..n {
+        crate::exec::execute_command(cmd, ctx, false)?;
+        if ctx.last_status == 130 {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// シェルを終了する。`exit [status]`、引数なしは直前コマンドのステータスを引き継ぐ。
 ///
 /// ここでは要求を [`ShellContext::exit_status`] に置くだけで、実際の終了は
@@ -1117,6 +1152,17 @@ mod tests {
             pairs(&out),
             vec![("ll", "ls -la"), ("tool", "/opt/bin/tool --fast")]
         );
+    }
+
+    #[test]
+    fn rep_line_rejects_bad_args() {
+        // 引数検証はコマンド実行前に行う (ここではどれも何も実行しない)。
+        let mut ctx = ShellContext::default();
+        assert!(rep_line("", &mut ctx).is_err()); // 回数もコマンドも無い
+        assert!(rep_line("3", &mut ctx).is_err()); // コマンドが無い
+        assert!(rep_line("x echo hi", &mut ctx).is_err()); // 回数が数値でない
+        assert!(rep_line("-1 echo hi", &mut ctx).is_err()); // 負数は不可
+        assert!(rep_line("0 echo hi", &mut ctx).is_ok()); // 0 回は何もせず成功
     }
 
     #[test]

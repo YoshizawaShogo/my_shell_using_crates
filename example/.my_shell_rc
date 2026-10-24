@@ -18,10 +18,6 @@ alias cp "cp -i"
 alias mv "mv -i"
 alias rm "rm -i"
 
-# ── ディレクトリ移動 abbr ─────────────────────────────────────────────────────
-abbr ..  "cd .."
-abbr ... "cd ../.."
-
 # ── cargo abbr ───────────────────────────────────────────────────────────────
 abbr c   cargo
 abbr cc  "cargo check"
