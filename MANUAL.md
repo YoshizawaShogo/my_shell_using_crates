@@ -56,6 +56,7 @@ cargo run --release
      例: `cd build && make`、`make && cd out`、貼り付けたスクリプト中の `cd`、`pushd` / `popd`。
      サブシェル `(cd x; ...)` の中の移動と、バックグラウンドのまま終わったジョブの移動は、`bash` と同じく反映しない。
      Ctrl+Z で止めたジョブは `fg` で前面に戻して終わったときに反映する。
+   - `bash` が構文エラー（終了コード 2）やコマンド未検出（127）で失敗し、行に他のシェル特有の書き方（`; end`、`; and`、`for i in (seq 3)`、`&|`、`Get-ChildItem` など）があるときは、`↳ note: this shell runs commands with bash syntax; …` と注意書きを出す。どのシェルの書き方かは断定しない。成功したコマンドには出さない。
 
 ---
 
@@ -291,7 +292,7 @@ Run 30 pasted lines?  [Enter: run / Esc: cancel]
 | `rep N CMD` | `CMD` を `N` 回繰り返し実行。`CMD` は分割・展開せず毎回そのまま実行（クォート・パイプ・`$VAR` 可）。Ctrl+C で打ち切り |
 | `abbr FROM TO` | 略語を定義 |
 | `alias FROM TO` | エイリアスを定義 |
-| `set VAR VAL` / `setenv VAR VAL` | 環境変数を設定（`setenv` は `set` の別名） |
+| `set VAR VAL` / `setenv VAR VAL` | 環境変数を設定（`setenv` は `set` の別名）。変数名が識別子でない・引数が 2 個でないもの（`set -x VAR VAL`、`set VAR = VAL` など他シェルの書き方）はエラー |
 | `source-env FILE [SHELL]` | 別シェルで設定ファイルを source し、その環境変数を取り込む |
 | `jobs` | ジョブ一覧を表示（[ジョブ制御](#ジョブ制御)） |
 | `fg [ID]` | ジョブをフォアグラウンドで再開（`ID` 省略時はピッカー） |

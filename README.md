@@ -86,7 +86,7 @@ cargo run --release
 | `rep N CMD` | `CMD` を `N` 回繰り返し実行。`CMD` は分割・展開せず毎回そのまま実行（クォート・パイプ・`$VAR` 可）。Ctrl+C で打ち切り |
 | `abbr FROM TO` | 略語を定義（Space／実行時に展開、fish 風の視覚展開） |
 | `alias FROM TO` | エイリアスを定義（実行時に先頭トークンを展開） |
-| `set VAR VAL` / `setenv VAR VAL` | 環境変数を設定 |
+| `set VAR VAL` / `setenv VAR VAL` | 環境変数を設定（`set -x VAR VAL` や `set VAR = VAL` など他シェルの書き方はエラー） |
 | `source-env FILE [SHELL]` | 別シェルで設定ファイルを source し、その環境変数を取り込む（シェルは拡張子・shebang から自動判別、明示も可） |
 | `jobs` | 停止/バックグラウンドのジョブ一覧を表示 |
 | `fg [ID/タグ]` / `bg [ID/タグ]` | ジョブを再開。ジョブが 1 つなら即確定、タグ指定で 1 件に絞れれば即確定、それ以外はピッカー |

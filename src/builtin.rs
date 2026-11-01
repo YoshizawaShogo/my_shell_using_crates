@@ -927,16 +927,29 @@ fn type_info(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
 // ─── set / setenv ─────────────────────────────────────────────────────────────
 
 fn set(args: &[&str], _ctx: &mut ShellContext) -> io::Result<()> {
-    match (args.first(), args.get(1)) {
-        (Some(&var), Some(&val)) => {
+    match args {
+        // 変数名が識別子でない (`set -gx PATH foo`) か、引数の数が違う (`set x = 1`) ものは
+        // 他のシェルの set の書き方。黙って変な環境変数を作らないようエラーにする。
+        &[var, val] if is_env_name(var) => {
             // SAFETY: ビルトインはメインスレッドからのみ実行される。Ctrl+T 列挙で一時的に
             // spawn されるワーカースレッドは getenv/setenv を一切呼ばないため、environ への
             // 並行アクセスは発生しない。
             unsafe { std::env::set_var(var, val) };
             Ok(())
         }
-        _ => Err(io::Error::other("usage: set VAR VAL")),
+        _ => Err(io::Error::other(
+            "usage: set VAR VALUE (other shells' set syntax such as `set -x VAR VAL` \
+             or `set VAR = VAL` is not supported)",
+        )),
     }
+}
+
+/// 環境変数名として妥当か (`[A-Za-z_][A-Za-z0-9_]*`)。
+fn is_env_name(name: &str) -> bool {
+    let mut cs = name.chars();
+    cs.next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 // ─── fg / bg / jobs (ジョブ制御は job モジュールへ委譲) ────────────────────────
@@ -1177,6 +1190,21 @@ mod tests {
             pairs(&out),
             vec![("ll", "ls -la"), ("tool", "/opt/bin/tool --fast")]
         );
+    }
+
+    #[test]
+    fn set_rejects_other_shell_syntax() {
+        let mut ctx = ShellContext::default();
+        // 他のシェルの set の書き方はエラーにし、環境変数を作らない。
+        assert!(set(&["-gx", "MY_SHELL_TEST_SET_A", "1"], &mut ctx).is_err());
+        assert!(set(&["MY_SHELL_TEST_SET_A", "=", "1"], &mut ctx).is_err());
+        assert!(set(&["-e"], &mut ctx).is_err());
+        assert!(std::env::var("-gx").is_err());
+        assert!(std::env::var("MY_SHELL_TEST_SET_A").is_err());
+        // このシェルの書き方 (値は `-R` のようにハイフン始まりでもよい)。
+        assert!(set(&["MY_SHELL_TEST_SET_B", "-R"], &mut ctx).is_ok());
+        assert_eq!(std::env::var("MY_SHELL_TEST_SET_B").as_deref(), Ok("-R"));
+        assert!(is_env_name("_A1") && !is_env_name("1A") && !is_env_name("A-B"));
     }
 
     #[test]

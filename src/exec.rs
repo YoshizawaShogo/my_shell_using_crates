@@ -1,7 +1,10 @@
 //! コマンド実行。
 
 use crate::builtin::{ShellContext, find_builtin};
-use crossterm::{execute, style::Print};
+use crossterm::{
+    execute,
+    style::{Color, Print, ResetColor, SetForegroundColor},
+};
 use std::collections::HashMap;
 use std::io::{self, stdout};
 use std::os::unix::process::CommandExt;
@@ -138,7 +141,8 @@ pub fn execute_command(cmd: &str, ctx: &mut ShellContext, interactive: bool) -> 
     let mut command = bash_command(&sh_cmd, &cwd_file);
     // フォアグラウンド実行＋ Ctrl+Z 停止の検知と、終了後のカレントの持ち帰りは job
     // モジュールが担う。表示用のコマンド名には abbr 展開済みの行を渡す。
-    crate::job::run_foreground(&mut command, abbr_line.trim(), cwd_file, ctx)
+    crate::job::run_foreground(&mut command, abbr_line.trim(), cwd_file, ctx)?;
+    note_if_non_bash(&abbr_line, ctx)
 }
 
 /// 複数行コマンド (ペーストされたスクリプト) を改行込みでそのまま bash へ渡して実行する。
@@ -153,7 +157,8 @@ fn run_script(script: &str, ctx: &mut ShellContext) -> io::Result<()> {
     let mut command = bash_command(&sh_cmd, &cwd_file);
     // ジョブ表示は先頭行だけを見せ、複数行であることを `…` で示す。
     let label = format!("{} …", script.lines().next().unwrap_or(script));
-    crate::job::run_foreground(&mut command, &label, cwd_file, ctx)
+    crate::job::run_foreground(&mut command, &label, cwd_file, ctx)?;
+    note_if_non_bash(script, ctx)
 }
 
 /// 外部コマンドの最終カレントを受け取る一時ファイルのパスを、実行 1 回ごとに払い出す。
@@ -193,14 +198,16 @@ fn with_cwd_report(sh_cmd: &str, cwd_file: &Path) -> String {
 /// 引用符の外に bash の制御演算子・グループ化 (`;` `&` `|` `(` `)` 改行 `` ` ``) があるか。
 /// 二重引用符の中でも有効なコマンド置換 (`$(` / `` ` ``) も対象にする
 /// (`cd "$(git rev-parse --show-toplevel)"` を bash で評価させるため)。
+/// リダイレクトの一部の `&` `|` (`2>&1` `>&2` `&>` `&>>` `>|`) は演算子とみなさない。
 fn has_control_operator(s: &str) -> bool {
+    let chars: Vec<char> = s.chars().collect();
     let mut quote: Option<char> = None;
     let mut escaped = false;
-    let mut prev = '\0';
-    for c in s.chars() {
+    for (i, &c) in chars.iter().enumerate() {
+        let prev = if i > 0 { chars[i - 1] } else { '\0' };
+        let next = chars.get(i + 1).copied().unwrap_or('\0');
         if escaped {
             escaped = false;
-            prev = '\0';
             continue;
         }
         match quote {
@@ -219,13 +226,147 @@ fn has_control_operator(s: &str) -> bool {
             None => match c {
                 '\\' => escaped = true,
                 '\'' | '"' => quote = Some(c),
+                '&' if prev == '>' || next == '>' => {}
+                '|' if prev == '>' => {}
                 ';' | '&' | '|' | '(' | ')' | '\n' | '`' => return true,
                 _ => {}
             },
         }
-        prev = c;
     }
     false
+}
+
+/// 引用符の中身とエスケープされた文字を `x` に置き換える (語の区切りは保つ)。
+/// 他シェルの書き方の判定で、引用符の中の記号や単語を拾わないため。
+fn mask_quoted(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for c in s.chars() {
+        if escaped {
+            escaped = false;
+            out.push('x');
+            continue;
+        }
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else if q == '"' && c == '\\' {
+                    escaped = true;
+                }
+                out.push('x');
+            }
+            None => {
+                match c {
+                    '\\' => escaped = true,
+                    '\'' | '"' => quote = Some(c),
+                    _ => {
+                        out.push(c);
+                        continue;
+                    }
+                }
+                out.push('x');
+            }
+        }
+    }
+    out
+}
+
+/// コマンドの区切りになる文字 (この直後の語はコマンド位置)。
+fn is_command_separator(c: char) -> bool {
+    matches!(c, ';' | '&' | '|' | '\n' | '(' | ')' | '{' | '}')
+}
+
+/// PowerShell のコマンドレット形式 (`Get-ChildItem` のような `Verb-Noun`) か。
+fn is_cmdlet_like(w: &str) -> bool {
+    let Some((verb, noun)) = w.split_once('-') else {
+        return false;
+    };
+    let capitalized = |s: &str| {
+        let mut cs = s.chars();
+        s.len() >= 2
+            && cs.next().is_some_and(|c| c.is_ascii_uppercase())
+            && cs.all(|c| c.is_ascii_alphanumeric())
+    };
+    capitalized(verb) && capitalized(noun) && verb.chars().skip(1).any(|c| c.is_ascii_lowercase())
+}
+
+/// 引数位置に `$` の付かない `(…)` があるか (他シェルのコマンド置換。bash なら `$(…)`)。
+/// `foo()` / `foo ()` (関数定義)、`$(` `<(` `>(` `=(` (置換・配列)、コマンド位置や
+/// `if (` などのサブシェルは除く。
+fn has_bare_paren_substitution(u: &str) -> bool {
+    for (i, c) in u.char_indices() {
+        if c != '(' || u[i + 1..].trim_start().starts_with(')') {
+            continue;
+        }
+        let before = &u[..i];
+        let trimmed = before.trim_end();
+        if trimmed.len() == before.len() {
+            continue; // 直前に空白が無い: `$(` `<(` `=(` `foo(` など
+        }
+        match trimmed.chars().last() {
+            None => continue,
+            Some(last) if is_command_separator(last) => continue, // コマンド位置のサブシェル
+            Some(_) => {}
+        }
+        let word = trimmed
+            .rsplit(|ch: char| ch.is_whitespace() || is_command_separator(ch))
+            .next()
+            .unwrap_or("");
+        if matches!(
+            word,
+            "if" | "elif" | "while" | "until" | "then" | "else" | "do" | "time" | "!"
+        ) {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// bash では書かない、他のシェル特有の書き方を含むか。bash が失敗したときに注意書きを
+/// 添えるかどうかの判定にだけ使う (成功したコマンドには出さないので、多少の取りこぼしは許容)。
+///
+/// - 演算子・変数の並び: `&|`、`>>&`、`$env:NAME`
+/// - コマンド位置の語: `end` `endif` `endsw` `foreach` `begin` `and` `or` `@`、`Verb-Noun` 形式
+/// - 引数位置の `$` の付かない `(…)` (例: `for i in (seq 3)`)
+fn looks_non_bash(line: &str) -> bool {
+    let u = mask_quoted(line);
+    if u.contains("&|") || u.contains(">>&") || u.contains("$env:") {
+        return true;
+    }
+    let foreign_command = u.split(is_command_separator).any(|seg| {
+        seg.split_whitespace().next().is_some_and(|w| {
+            matches!(
+                w,
+                "end" | "endif" | "endsw" | "foreach" | "begin" | "and" | "or" | "@"
+            ) || is_cmdlet_like(w)
+        })
+    });
+    foreign_command || has_bare_paren_substitution(&u)
+}
+
+/// 外部コマンドが構文エラー (2) / コマンド未検出 (127) で失敗し、かつ他のシェルの書き方に
+/// 見えるとき、このシェルは bash の書き方で実行していると注意書きする。どのシェルの書き方かは
+/// 断定しない (誤判定を避けるため)。
+fn note_if_non_bash(line: &str, ctx: &ShellContext) -> io::Result<()> {
+    if matches!(ctx.last_status, 2 | 127) && looks_non_bash(line) {
+        execute!(
+            stdout(),
+            SetForegroundColor(Color::Rgb {
+                r: 0xe2,
+                g: 0xd9,
+                b: 0x80
+            }),
+            Print(
+                "↳ note: this shell runs commands with bash syntax; \
+                 the command looks like it is written for a different shell\r\n"
+            ),
+            ResetColor,
+        )?;
+    }
+    Ok(())
 }
 
 /// `bash -c <sh_cmd>` の Command を作る。終了時にカレントを `cwd_file` へ書き残すよう
@@ -424,6 +565,7 @@ mod tests {
             "\"$(git rev-parse --show-toplevel)\"", // 二重引用符内のコマンド置換
             "`pwd`",
             "a\nb",
+            "/tmp |& cat", // |& はパイプ
         ] {
             assert!(has_control_operator(s), "{s:?} should be chained");
         }
@@ -436,6 +578,12 @@ mod tests {
             "\"$HOME/x\"",
             "-",
             "",
+            // リダイレクトの一部の & / | はチェーンではない
+            "foo 2>&1",
+            "foo >&2",
+            "foo &>/dev/null",
+            "foo &>>log",
+            "foo >| out",
         ] {
             assert!(!has_control_operator(s), "{s:?} should not be chained");
         }
@@ -472,6 +620,47 @@ mod tests {
         assert_eq!(run_reported("cd /tmp && exit 3"), (3, Some("/tmp".into())));
         // exec で置き換わった場合は書かれない (= カレントを持ち帰らない)。
         assert_eq!(run_reported("cd /tmp && exec true"), (0, None));
+    }
+
+    #[test]
+    fn non_bash_syntax_detection() {
+        // 他のシェル特有の書き方 (bash では構文エラー / コマンド未検出になる)。
+        for s in [
+            "for i in (seq 3); echo $i; end",
+            "if test -d /tmp; echo yes; end",
+            "echo hi; and echo ok",
+            "begin; echo a; end",
+            "make &| less",
+            "echo hi >>& log",
+            "foreach i (1 2 3)",
+            "endif",
+            "@ n = 1 + 2",
+            "Get-ChildItem -Path /tmp",
+            "$env:FOO = \"x\"",
+            "echo (date)",
+        ] {
+            assert!(looks_non_bash(s), "{s:?} should look non-bash");
+        }
+        // 正しい bash の書き方は対象外 (サブシェル・配列・関数定義・各種置換・リダイレクト)。
+        for s in [
+            "ls -la | grep foo",
+            "if (true); then echo y; fi",
+            "(cd /tmp; ls)",
+            "arr=(1 2 3)",
+            "foo() { echo hi; }",
+            "foo () { echo hi; }",
+            "echo $(date)",
+            "diff <(ls a) <(ls b)",
+            "make 2>&1 | tee log",
+            "make |& tee log",
+            "echo end",
+            "echo \"; end\"",
+            "endpoint --start",
+            "git log --format='(%h) %s'",
+            "x-ray scan",
+        ] {
+            assert!(!looks_non_bash(s), "{s:?} should look like bash");
+        }
     }
 
     #[test]
