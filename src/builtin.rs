@@ -269,8 +269,33 @@ fn cd(args: &[&str], ctx: &mut ShellContext) -> io::Result<()> {
     change_dir(&target, ctx)
 }
 
+/// 外部コマンド (bash) が終了時に `cwd_file` へ書き残した最終カレントを読み、シェル本体の
+/// カレントをそこへ合わせる。`cd x && make` や貼り付けたスクリプト中の `cd` の結果を
+/// 持ち帰るため。ファイルが無い (コマンドが `exit` / シグナルで終わった) か、
+/// 同じディレクトリなら何もしない。読んだファイルは消す。
+pub(crate) fn adopt_child_cwd(cwd_file: &Path, ctx: &mut ShellContext) {
+    let Ok(dir) = std::fs::read_to_string(cwd_file) else {
+        return;
+    };
+    let _ = std::fs::remove_file(cwd_file);
+    if dir.is_empty() {
+        return;
+    }
+    let target = PathBuf::from(dir);
+    // シンボリックリンク経由の論理パスと実体パスの違いだけなら移動扱いにしない
+    // (dir_stack に同じ場所が積まれるのを防ぐ)。
+    let same = match (target.canonicalize(), std::env::current_dir()) {
+        (Ok(t), Ok(cwd)) => cwd.canonicalize().is_ok_and(|c| c == t),
+        _ => false,
+    };
+    if !same {
+        // 終了までに消されたディレクトリ等へは移れないが、その場合は今の場所に留まる。
+        let _ = change_dir(&target, ctx);
+    }
+}
+
 /// カレントディレクトリを `target` へ移し、OLDPWD・dir_stack・端末通知を更新する。
-/// cd / groot など「移動するビルトイン」が共通で使う。
+/// cd / groot など「移動するビルトイン」と、外部コマンド後の [`adopt_child_cwd`] が使う。
 fn change_dir(target: &Path, ctx: &mut ShellContext) -> io::Result<()> {
     // 移動前の cwd を控えておき、移動が成功したときだけ OLDPWD とスタックを更新する。
     // (存在しないディレクトリへの移動で OLDPWD やスタックが壊れるのを防ぐ)

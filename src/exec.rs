@@ -5,6 +5,7 @@ use crossterm::{execute, style::Print};
 use std::collections::HashMap;
 use std::io::{self, stdout};
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 
 /// `interactive`: true のとき実行前に `\r\n` を出力してプロンプトと出力を分離する。
 /// load_rc からは false で呼ぶ (起動時に空行が大量発生するのを防ぐ)。
@@ -90,8 +91,24 @@ pub fn execute_command(cmd: &str, ctx: &mut ShellContext, interactive: bool) -> 
         return Ok(());
     }
 
+    // `cd x && make` のように制御演算子でつながった行をビルトインに渡すと、2 つ目以降が
+    // 黙って捨てられる。cd は行ごと bash の cd で実行し、終了後に最終カレントを持ち帰る
+    // (下の外部コマンド経路)。他の独自ビルトインは bash が知らないので明示的にエラーにする。
+    let chained = has_control_operator(args_str);
+    if chained && name != "cd" && find_builtin(name).is_some() {
+        ctx.last_status = 1;
+        execute!(
+            stdout(),
+            Print(format!(
+                "{}: cannot be combined with other commands (&&, ;, |, ...); run it on its own line\r\n",
+                name
+            ))
+        )?;
+        return Ok(());
+    }
+
     // ビルトインは sh を経由しないので、引数の ~ / $VAR はここで自前展開する。
-    if let Some(builtin) = find_builtin(name) {
+    if let Some(builtin) = find_builtin(name).filter(|_| !chained) {
         let args = match shell_words::split(args_str) {
             Ok(parts) => parts,
             Err(e) => {
@@ -117,10 +134,11 @@ pub fn execute_command(cmd: &str, ctx: &mut ShellContext, interactive: bool) -> 
     // 終了ステータスを $? に引き継ぐ (bash -c は毎回新しいシェルなので明示が必要)。
     let prelude = build_alias_prelude(&ctx.aliases);
     let sh_cmd = format!("{}(exit {}); {}", prelude, ctx.last_status, abbr_line);
-    let mut command = shell_command("bash", &sh_cmd);
-    // フォアグラウンド実行＋ Ctrl+Z 停止の検知は job モジュールが担う。
-    // 表示用のコマンド名には abbr 展開済みの行を渡す。
-    crate::job::run_foreground(&mut command, abbr_line.trim(), ctx)
+    let cwd_file = new_cwd_file();
+    let mut command = bash_command(&sh_cmd, &cwd_file);
+    // フォアグラウンド実行＋ Ctrl+Z 停止の検知と、終了後のカレントの持ち帰りは job
+    // モジュールが担う。表示用のコマンド名には abbr 展開済みの行を渡す。
+    crate::job::run_foreground(&mut command, abbr_line.trim(), cwd_file, ctx)
 }
 
 /// 複数行コマンド (ペーストされたスクリプト) を改行込みでそのまま bash へ渡して実行する。
@@ -131,18 +149,92 @@ pub fn execute_command(cmd: &str, ctx: &mut ShellContext, interactive: bool) -> 
 fn run_script(script: &str, ctx: &mut ShellContext) -> io::Result<()> {
     let prelude = build_alias_prelude(&ctx.aliases);
     let sh_cmd = format!("{}(exit {}); {}", prelude, ctx.last_status, script);
-    let mut command = shell_command("bash", &sh_cmd);
+    let cwd_file = new_cwd_file();
+    let mut command = bash_command(&sh_cmd, &cwd_file);
     // ジョブ表示は先頭行だけを見せ、複数行であることを `…` で示す。
     let label = format!("{} …", script.lines().next().unwrap_or(script));
-    crate::job::run_foreground(&mut command, &label, ctx)
+    crate::job::run_foreground(&mut command, &label, cwd_file, ctx)
 }
 
-/// `program -c <sh_cmd>` の Command を作る。子を独立プロセスグループに入れて端末ジョブ
-/// 制御の対象にし、親シェルが無視しているシグナルを既定動作へ戻す。これをしないと
-/// Ctrl+Z で停止できず、Ctrl+C も効かない。
-fn shell_command(program: &str, sh_cmd: &str) -> std::process::Command {
-    let mut command = std::process::Command::new(program);
-    command.arg("-c").arg(sh_cmd);
+/// 外部コマンドの最終カレントを受け取る一時ファイルのパスを、実行 1 回ごとに払い出す。
+/// 置き場所はユーザー専用の `$XDG_RUNTIME_DIR` (無ければ一時ディレクトリ)。
+/// 実行ごとに別名にするのは、バックグラウンドへ回したジョブが後から書き込んでも、
+/// 別のコマンドの結果と取り違えないため。
+fn new_cwd_file() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|d| d.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    let path = dir.join(format!(
+        "my_shell_cwd.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+/// 実行行の先頭に「bash の終了時 (EXIT trap) に `$PWD` を `cwd_file` へ書く」処理を足す。
+/// bash の `cd` (チェーン・貼り付けたスクリプト・`pushd` 等) の結果をシェル本体へ持ち帰るため。
+/// EXIT trap なので、正常終了・`exit`・Ctrl+C のいずれでも書かれ、終了ステータスも変えない。
+/// 関数を alias 定義より前に置くのは、ユーザーの alias (`printf` 等) に化けないようにするため。
+/// `exec` で置き換わった場合や、スクリプトが自前の EXIT trap で上書きした場合は書かれず、
+/// カレントは持ち帰らない。
+fn with_cwd_report(sh_cmd: &str, cwd_file: &Path) -> String {
+    format!(
+        "__my_shell_report() {{ printf '%s' \"$PWD\" > {} 2>/dev/null; }}\ntrap __my_shell_report EXIT\n{}",
+        sh_single_quote(&cwd_file.to_string_lossy()),
+        sh_cmd
+    )
+}
+
+/// 引用符の外に bash の制御演算子・グループ化 (`;` `&` `|` `(` `)` 改行 `` ` ``) があるか。
+/// 二重引用符の中でも有効なコマンド置換 (`$(` / `` ` ``) も対象にする
+/// (`cd "$(git rev-parse --show-toplevel)"` を bash で評価させるため)。
+fn has_control_operator(s: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut prev = '\0';
+    for c in s.chars() {
+        if escaped {
+            escaped = false;
+            prev = '\0';
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                }
+            }
+            Some(_) => match c {
+                '\\' => escaped = true,
+                '"' => quote = None,
+                '`' => return true,
+                '(' if prev == '$' => return true,
+                _ => {}
+            },
+            None => match c {
+                '\\' => escaped = true,
+                '\'' | '"' => quote = Some(c),
+                ';' | '&' | '|' | '(' | ')' | '\n' | '`' => return true,
+                _ => {}
+            },
+        }
+        prev = c;
+    }
+    false
+}
+
+/// `bash -c <sh_cmd>` の Command を作る。終了時にカレントを `cwd_file` へ書き残すよう
+/// [`with_cwd_report`] で包む。子を独立プロセスグループに入れて端末ジョブ制御の対象にし、
+/// 親シェルが無視しているシグナルを既定動作へ戻す。これをしないと Ctrl+Z で停止できず、
+/// Ctrl+C も効かない。
+fn bash_command(sh_cmd: &str, cwd_file: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("bash");
+    command.arg("-c").arg(with_cwd_report(sh_cmd, cwd_file));
     unsafe {
         command.pre_exec(|| {
             libc::setpgid(0, 0);
@@ -318,6 +410,69 @@ fn expand_arg(s: &str, last_status: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_operator_detection() {
+        // 引用符の外の演算子・グループ化はチェーンとみなす。
+        for s in [
+            "/tmp && make",
+            "/tmp; ls",
+            "/tmp || echo ng",
+            "/tmp | cat",
+            "/tmp &",
+            "$(git rev-parse --show-toplevel)",
+            "\"$(git rev-parse --show-toplevel)\"", // 二重引用符内のコマンド置換
+            "`pwd`",
+            "a\nb",
+        ] {
+            assert!(has_control_operator(s), "{s:?} should be chained");
+        }
+        // 引用符・エスケープの中の記号や、普通の引数はチェーンではない。
+        for s in [
+            "/tmp",
+            "'a && b'",
+            "\"a; b\"",
+            "a\\;b",
+            "\"$HOME/x\"",
+            "-",
+            "",
+        ] {
+            assert!(!has_control_operator(s), "{s:?} should not be chained");
+        }
+    }
+
+    /// `with_cwd_report` で包んだ行を本物の bash で実行し、(終了ステータス, 書かれた cwd) を返す。
+    /// シェル本体のカレントは変えない (子の bash の中だけで cd する)。
+    fn run_reported(cmd: &str) -> (i32, Option<String>) {
+        let file = new_cwd_file();
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(with_cwd_report(cmd, &file))
+            .status()
+            .unwrap()
+            .code()
+            .unwrap();
+        let cwd = std::fs::read_to_string(&file).ok();
+        let _ = std::fs::remove_file(&file);
+        (status, cwd)
+    }
+
+    #[test]
+    fn cwd_report_keeps_status_and_reports_pwd() {
+        // チェーン内の cd の結果が書かれ、最後のコマンドの終了ステータスは保たれる。
+        assert_eq!(run_reported("cd /tmp && false"), (1, Some("/tmp".into())));
+        assert_eq!(run_reported("cd /tmp; true"), (0, Some("/tmp".into())));
+        // 行末コメントがあっても書かれる。
+        assert_eq!(run_reported("cd /tmp # comment").1, Some("/tmp".into()));
+        // サブシェル内の cd は bash どおり外へ漏れない。
+        let here = std::env::current_dir().unwrap();
+        let (_, cwd) = run_reported("(cd /tmp)");
+        assert_eq!(cwd.map(PathBuf::from), Some(here));
+        // exit で終わっても、その時点のカレントと終了ステータスが残る。
+        assert_eq!(run_reported("cd /tmp && exit 3"), (3, Some("/tmp".into())));
+        // exec で置き換わった場合は書かれない (= カレントを持ち帰らない)。
+        assert_eq!(run_reported("cd /tmp && exec true"), (0, None));
+    }
 
     #[test]
     fn split_first() {

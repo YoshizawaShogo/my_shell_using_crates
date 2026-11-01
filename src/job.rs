@@ -4,7 +4,7 @@
 //! 渡すことで Ctrl+Z による停止・`fg`/`bg` による再開を可能にする。
 //! ジョブ表は [`ShellContext`] が保持し、`fg`/`bg`/`jobs` ビルトインがここを操作する。
 //!
-//! `&` でのバックグラウンド実行は従来どおり `sh` 任せ (本モジュールでは追跡しない)。
+//! `&` でのバックグラウンド実行は従来どおり `bash` 任せ (本モジュールでは追跡しない)。
 //! 追跡するのは「Ctrl+Z で停止したジョブ」と「それを `bg` で再開したもの」だけ。
 
 use crate::builtin::ShellContext;
@@ -12,6 +12,7 @@ use crate::selector::{self, Selection};
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::{execute, style::Print};
 use std::io::{self, stdout};
+use std::path::PathBuf;
 use std::process::Command;
 
 const STDIN: i32 = libc::STDIN_FILENO;
@@ -39,6 +40,9 @@ pub struct Job {
     /// 表示用のコマンド行。
     pub cmd: String,
     pub state: JobState,
+    /// 終了時に bash が最終カレントを書き残す一時ファイル。`fg` で前面に戻して終わったら
+    /// そこへ移動し、バックグラウンドのまま終わったら移動せずに消す (bash と同じ挙動)。
+    pub cwd_file: PathBuf,
 }
 
 // ─── 端末・待機のヘルパ ───────────────────────────────────────────────────────
@@ -84,7 +88,18 @@ fn wait_job(pid: i32) -> Wait {
 }
 
 /// 待機結果を `last_status` とジョブ表へ反映する。停止なら指定 id (なければ新規) で登録。
-fn settle(outcome: Wait, pgid: i32, cmd: &str, reuse_id: Option<u32>, ctx: &mut ShellContext) {
+/// 前面で終わったら、bash が書き残した最終カレントへシェル本体も移動する。
+fn settle(
+    outcome: Wait,
+    pgid: i32,
+    cmd: &str,
+    reuse_id: Option<u32>,
+    cwd_file: PathBuf,
+    ctx: &mut ShellContext,
+) {
+    if !matches!(outcome, Wait::Stopped) {
+        crate::builtin::adopt_child_cwd(&cwd_file, ctx);
+    }
     match outcome {
         Wait::Stopped => {
             let id = reuse_id.unwrap_or_else(|| next_id(&ctx.jobs));
@@ -93,6 +108,7 @@ fn settle(outcome: Wait, pgid: i32, cmd: &str, reuse_id: Option<u32>, ctx: &mut 
                 pgid,
                 cmd: cmd.to_string(),
                 state: JobState::Stopped,
+                cwd_file,
             });
             let _ = print_line(id, "Stopped", cmd);
             ctx.last_status = 148; // 128 + SIGTSTP
@@ -119,8 +135,14 @@ fn print_line(id: u32, state: &str, cmd: &str) -> io::Result<()> {
 /// `command` を独立プロセスグループのフォアグラウンドジョブとして実行する。
 /// Ctrl+Z で停止したらジョブ表へ登録してプロンプトに戻る。
 ///
-/// `command` には呼び出し側で `pre_exec` (setpgid＋シグナル既定化) を設定済みであること。
-pub fn run_foreground(command: &mut Command, cmd: &str, ctx: &mut ShellContext) -> io::Result<()> {
+/// `command` には呼び出し側で `pre_exec` (setpgid＋シグナル既定化) と、終了時に
+/// 最終カレントを `cwd_file` へ書く処理を設定済みであること。
+pub fn run_foreground(
+    command: &mut Command,
+    cmd: &str,
+    cwd_file: PathBuf,
+    ctx: &mut ShellContext,
+) -> io::Result<()> {
     let shell = shell_pgid();
     crate::term::set_cooked();
     // 子には bracketed paste を解除した端末を渡す。非対応の子への貼り付けが
@@ -142,7 +164,7 @@ pub fn run_foreground(command: &mut Command, cmd: &str, ctx: &mut ShellContext) 
     crate::term::set_raw();
     let _ = execute!(stdout(), EnableBracketedPaste);
     // child は waitpid で回収済み。std Child は Drop で wait しないのでそのまま落とす。
-    settle(outcome, pid, cmd, None, ctx);
+    settle(outcome, pid, cmd, None, cwd_file, ctx);
     Ok(())
 }
 
@@ -182,7 +204,7 @@ pub fn fg(arg: Option<&str>, ctx: &mut ShellContext) -> io::Result<()> {
     crate::term::reset_title();
     crate::term::set_raw();
     let _ = execute!(stdout(), EnableBracketedPaste);
-    settle(outcome, job.pgid, &job.cmd, Some(job.id), ctx);
+    settle(outcome, job.pgid, &job.cmd, Some(job.id), job.cwd_file, ctx);
     Ok(())
 }
 
@@ -268,6 +290,8 @@ pub fn reap_finished(ctx: &mut ShellContext) -> io::Result<()> {
             job.state = JobState::Stopped;
             stopped.push((job.id, job.cmd.clone()));
         } else {
+            // バックグラウンドで終わったジョブの cd はシェル本体に反映しない (bash と同じ)。
+            let _ = std::fs::remove_file(&job.cwd_file);
             done.push((job.id, job.cmd.clone()));
         }
     }
@@ -288,5 +312,6 @@ pub fn hangup_all(ctx: &ShellContext) {
             libc::kill(-j.pgid, libc::SIGCONT);
             libc::kill(-j.pgid, libc::SIGHUP);
         }
+        let _ = std::fs::remove_file(&j.cwd_file);
     }
 }
