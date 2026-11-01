@@ -691,13 +691,18 @@ fn confirm_multiline_paste(ed: &mut LineEditor, lines: &[String]) -> io::Result<
         }
     };
 
-    // カーソル行 (最終プレビュー行) を消して行頭へ戻す。上の行は続く再描画が
+    // 実行するときはプレビューを「何を実行したか」の記録として画面に残す。ここで
+    // カーソル行 (最終プレビュー行) を消すと最終行だけが欠けて空行になるので触らない
+    // (続く出力は execute_command が改行してから始める)。
+    // キャンセル時はカーソル行を消して行頭へ戻す。上の行は続く再描画が
     // note_newline() 分だけ遡って消すので、ここでは触らない (ピッカーと同じ流儀)。
-    execute!(
-        stdout(),
-        cursor::MoveToColumn(0),
-        Clear(ClearType::FromCursorDown)
-    )?;
+    if !accepted {
+        execute!(
+            stdout(),
+            cursor::MoveToColumn(0),
+            Clear(ClearType::FromCursorDown)
+        )?;
+    }
     Ok(accepted)
 }
 
