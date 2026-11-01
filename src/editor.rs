@@ -298,15 +298,16 @@ pub fn redraw_prompt(
     //    プロンプトへ戻ったときに I 型へ戻す。同じ ANSI の再送で冪等・数バイト。
     queue!(stdout(), cursor::SetCursorStyle::SteadyBar)?;
 
-    // 1. ヘッダ先頭行へ移動してから全消去
+    // 1. ヘッダ先頭行へ移動する。ここではまだ消さない。
+    //    ヘッダ先頭から `\e[J` (以降を消去) を出すと、プロンプトが画面最上段にあるとき
+    //    (起動直後・Ctrl+L 後) 左上からの消去 = 画面全体の消去とみなされ、tmux の
+    //    scroll-on-clear 等が消す前の内容をスクロールバックへ退避する。キー入力ごとに
+    //    プロンプトがスクロールバックへ積まれてしまうので、ヘッダは上書き＋行末消去にし、
+    //    `\e[J` はヘッダの下からだけ出す (見た目は従来と同じ)。
     if ed.lines_above_cursor > 0 {
         queue!(stdout(), cursor::MoveUp(ed.lines_above_cursor))?;
     }
-    queue!(
-        stdout(),
-        cursor::MoveToColumn(0),
-        Clear(ClearType::FromCursorDown)
-    )?;
+    queue!(stdout(), cursor::MoveToColumn(0))?;
 
     // 2. ヘッダ行を描画 (表示幅を記録して lines_above_cursor の計算に使う)
     let user = std::env::var("USER").unwrap_or_else(|_| "?".to_string());
@@ -333,7 +334,13 @@ pub fn redraw_prompt(
             ResetColor,
         )?;
     }
-    queue!(stdout(), Print("\r\n"))?;
+    // ヘッダ最終行の残り (前回の描画の残骸) を消す。ちょうど端末幅で終わった場合は
+    // 行末待機状態なので消さない (ここで消すと最後の 1 文字が消えるうえ、残りも無い)。
+    if !header_display_width.is_multiple_of(term_cols as usize) {
+        queue!(stdout(), Clear(ClearType::UntilNewLine))?;
+    }
+    // ヘッダの下 (入力行以降) をまとめて消す。最上段ではないので画面全体の消去にならない。
+    queue!(stdout(), Print("\r\n"), Clear(ClearType::FromCursorDown))?;
     // ヘッダが端末幅を超えて折り返す場合の物理行数
     let header_lines = header_physical_lines(header_display_width, term_cols);
 
