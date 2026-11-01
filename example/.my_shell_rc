@@ -57,3 +57,8 @@ set PAGER  less
 # less を代替画面でページングさせ、終了時に出力を残さない (色は保持)。
 # 未設定だと git が LESS=FRX を強制し、git log が cat のように画面に残る。
 set LESS   -R
+
+# ── プロンプト (任意) ──────────────────────────────────────────────────────────
+# bash の PS1 と同じ書式。'…' の中はそのまま保存され、プロンプトを出すたびに展開される。
+# $MY_SHELL_GIT に git の状態 (例: main a1b2c3d) が入る。未設定なら既定の 2 行表示。
+# set MY_SHELL_PS1 '\e[36m\w\e[0m ${MY_SHELL_GIT:+[$MY_SHELL_GIT]}\n\$ '

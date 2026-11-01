@@ -106,6 +106,9 @@ abbr と alias の違い: `abbr` は入力した略語を Space や実行時に�
 
 `~/.my_shell_rc` の例は [`example/.my_shell_rc`](example/.my_shell_rc) を参照。
 
+プロンプトは環境変数 `MY_SHELL_PS1`（無ければ `PS1`）を bash の PS1 と同じ書式で設定すると変えられる。
+git の状態は `$MY_SHELL_GIT` で参照できる。詳しくは [MANUAL](MANUAL.md#プロンプトのカスタマイズmy_shell_ps1--ps1) を参照。
+
 # 展開
 
 - `~` / `~/...`: ホームディレクトリ（ビルトイン引数で展開）

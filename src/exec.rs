@@ -110,19 +110,16 @@ pub fn execute_command(cmd: &str, ctx: &mut ShellContext, interactive: bool) -> 
         return Ok(());
     }
 
-    // ビルトインは sh を経由しないので、引数の ~ / $VAR はここで自前展開する。
+    // ビルトインは bash を経由しないので、引数の ~ / $VAR はここで自前展開する
+    // (bash と同じく '…' の中は展開しない。split_builtin_args 参照)。
     if let Some(builtin) = find_builtin(name).filter(|_| !chained) {
-        let args = match shell_words::split(args_str) {
+        let expanded = match split_builtin_args(args_str, ctx.last_status) {
             Ok(parts) => parts,
             Err(e) => {
                 execute!(stdout(), Print(format!("parse error: {}\r\n", e)))?;
                 return Ok(());
             }
         };
-        let expanded: Vec<String> = args
-            .iter()
-            .map(|a| expand_arg(a, ctx.last_status))
-            .collect();
         let str_args: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
         let status = builtin(&str_args, ctx);
         ctx.last_status = if status.is_ok() { 0 } else { 1 };
@@ -507,45 +504,136 @@ fn expand_arg(s: &str, last_status: i32) -> String {
     let mut out = String::new();
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        if c != '$' {
-            out.push(c);
-            continue;
-        }
-        if chars.peek() == Some(&'{') {
-            chars.next(); // '{'を消費
-            let name: String = chars.by_ref().take_while(|&x| x != '}').collect();
-            out.push_str(&std::env::var(&name).unwrap_or_default());
+        if c == '$' {
+            expand_dollar(&mut chars, &mut out, last_status);
         } else {
-            match chars.peek() {
-                Some(&'$') => {
-                    chars.next();
-                    out.push_str(&std::process::id().to_string());
-                }
-                Some(&'?') => {
-                    chars.next();
-                    out.push_str(&last_status.to_string());
-                }
-                _ => {
-                    // 変数名: [a-zA-Z_][a-zA-Z0-9_]*
-                    let mut name = String::new();
-                    while let Some(&x) = chars.peek() {
-                        if x.is_alphanumeric() || x == '_' {
-                            name.push(x);
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    if name.is_empty() {
-                        out.push('$'); // 後続が英数字でない裸の $
-                    } else {
-                        out.push_str(&std::env::var(&name).unwrap_or_default());
-                    }
-                }
-            }
+            out.push(c);
         }
     }
     out
+}
+
+/// `$` の直後から変数参照を読み、展開結果を `out` に足す。
+/// `${VAR}` / `$VAR` は環境変数、`$$` は PID、`$?` は直前の終了ステータス。
+/// 後続が名前にならない裸の `$` はそのまま残す。
+fn expand_dollar(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    out: &mut String,
+    last_status: i32,
+) {
+    match chars.peek() {
+        Some(&'{') => {
+            chars.next(); // '{' を消費
+            let name: String = chars.by_ref().take_while(|&x| x != '}').collect();
+            out.push_str(&std::env::var(&name).unwrap_or_default());
+        }
+        Some(&'$') => {
+            chars.next();
+            out.push_str(&std::process::id().to_string());
+        }
+        Some(&'?') => {
+            chars.next();
+            out.push_str(&last_status.to_string());
+        }
+        _ => {
+            // 変数名: [a-zA-Z_][a-zA-Z0-9_]*
+            let mut name = String::new();
+            while let Some(&x) = chars.peek() {
+                if x.is_alphanumeric() || x == '_' {
+                    name.push(x);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if name.is_empty() {
+                out.push('$'); // 後続が英数字でない裸の $
+            } else {
+                out.push_str(&std::env::var(&name).unwrap_or_default());
+            }
+        }
+    }
+}
+
+/// ビルトインの引数を bash と同じ規則で単語に分け、展開する。
+///
+/// - `'…'` の中はそのまま (`$` も `\` も展開しない)。`set MY_SHELL_PS1 '… ${MY_SHELL_GIT} …'`
+///   のように、設定時ではなく後で展開させたい値を書けるようにするため。
+/// - `"…"` の中と引用符の外では `$VAR` `${VAR}` `$$` `$?` を展開する。
+/// - `\` は引用符の外では次の 1 文字をそのまま残し、`"…"` の中では `$` `` ` `` `"` `\` 改行の
+///   前でだけ働く (それ以外は `\` ごと残す。PS1 の `\u` `\w` などが "…" でも使える)。
+/// - 引用符の外で語の先頭にある `~` (`~` / `~/…`) はホームディレクトリに展開する。
+/// - 語の先頭の `#` 以降はコメントとして無視する。
+fn split_builtin_args(s: &str, last_status: i32) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            '#' if !in_word => break,
+            '\'' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(x) => cur.push(x),
+                        None => return Err("missing closing quote (')".to_string()),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.peek() {
+                            Some(&n) if matches!(n, '$' | '`' | '"' | '\\' | '\n') => {
+                                chars.next();
+                                if n != '\n' {
+                                    cur.push(n);
+                                }
+                            }
+                            _ => cur.push('\\'),
+                        },
+                        Some('$') => expand_dollar(&mut chars, &mut cur, last_status),
+                        Some(x) => cur.push(x),
+                        None => return Err("missing closing quote (\")".to_string()),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                match chars.next() {
+                    Some('\n') => {}
+                    Some(x) => cur.push(x),
+                    None => cur.push('\\'),
+                }
+            }
+            '$' => {
+                in_word = true;
+                expand_dollar(&mut chars, &mut cur, last_status);
+            }
+            '~' if !in_word && chars.peek().is_none_or(|&n| n == '/' || n.is_whitespace()) => {
+                in_word = true;
+                cur.push_str(&crate::history::expand_tilde("~").to_string_lossy());
+            }
+            x => {
+                in_word = true;
+                cur.push(x);
+            }
+        }
+    }
+    if in_word {
+        words.push(cur);
+    }
+    Ok(words)
 }
 
 #[cfg(test)]
@@ -661,6 +749,33 @@ mod tests {
         ] {
             assert!(!looks_non_bash(s), "{s:?} should look like bash");
         }
+    }
+
+    #[test]
+    fn builtin_args_follow_bash_quoting() {
+        let split = |s: &str| split_builtin_args(s, 5).unwrap();
+        let home = crate::history::expand_tilde("~")
+            .to_string_lossy()
+            .into_owned();
+        // 単語分割と引用符
+        assert_eq!(split("a 'b c' \"d e\""), vec!["a", "b c", "d e"]);
+        assert_eq!(split("x ''"), vec!["x", ""]);
+        // '…' の中は展開しない / "…" と引用符の外は展開する ($? = 5)
+        assert_eq!(split("'${X} $? \\w'"), vec!["${X} $? \\w"]);
+        assert_eq!(split("\"s=$?\" t=$?"), vec!["s=5", "t=5"]);
+        // "…" の中の \ は $ ` " \ の前でだけ働く (PS1 の \u \n はそのまま残る)
+        assert_eq!(split("\"\\u\\n\\$ \\\"q\\\"\""), vec!["\\u\\n$ \"q\""]);
+        // 引用符の外の \ は次の 1 文字をそのまま残す
+        assert_eq!(split("\\$X a\\ b"), vec!["$X", "a b"]);
+        // ~ は引用符の外の語頭だけ
+        assert_eq!(
+            split("~/x '~/y' a~"),
+            vec![format!("{home}/x"), "~/y".into(), "a~".into()]
+        );
+        // 語頭の # 以降はコメント
+        assert_eq!(split("a # comment"), vec!["a"]);
+        assert!(split_builtin_args("'open", 0).is_err());
+        assert!(split_builtin_args("\"open", 0).is_err());
     }
 
     #[test]

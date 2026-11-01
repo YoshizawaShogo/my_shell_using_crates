@@ -10,25 +10,7 @@ use unicode_width::UnicodeWidthStr;
 
 // ─── 配色・プロンプト定数 ─────────────────────────────────────────────────────
 
-const PROMPT_PREFIX: &str = "$ ";
-const PROMPT_PREFIX_WIDTH: u16 = 2; // "$ " は常に 2 列
-
-// 配色は iceberg (dark) パレットに合わせた落ち着いたトーン。
-const COLOR_USER_HOST: Color = Color::Rgb {
-    r: 0x84,
-    g: 0xa0,
-    b: 0xc6,
-}; // blue
-const COLOR_CWD: Color = Color::Rgb {
-    r: 0x89,
-    g: 0xb8,
-    b: 0xc2,
-}; // cyan
-const COLOR_BRANCH: Color = Color::Rgb {
-    r: 0xa0,
-    g: 0x93,
-    b: 0xc7,
-}; // purple
+// 配色は iceberg (dark) パレットに合わせた落ち着いたトーン (プロンプトの色は prompt.rs)。
 const COLOR_GHOST: Color = Color::Rgb {
     r: 0x6b,
     g: 0x70,
@@ -284,7 +266,7 @@ pub fn paste_lines(data: &str) -> Vec<String> {
 /// 次回の `MoveUp` でヘッダ先頭に戻るために使う。
 pub fn redraw_prompt(
     ed: &mut LineEditor,
-    git_info: Option<&str>,
+    prompt: &crate::prompt::Prompt,
     ghost: Option<&str>,
 ) -> io::Result<()> {
     // 端末幅は最低 1 に丸める。タブ複製直後など winsize が未伝搬の一瞬は size() が 0 を
@@ -298,58 +280,41 @@ pub fn redraw_prompt(
     //    プロンプトへ戻ったときに I 型へ戻す。同じ ANSI の再送で冪等・数バイト。
     queue!(stdout(), cursor::SetCursorStyle::SteadyBar)?;
 
-    // 1. ヘッダ先頭行へ移動する。ここではまだ消さない。
-    //    ヘッダ先頭から `\e[J` (以降を消去) を出すと、プロンプトが画面最上段にあるとき
+    // 1. プロンプト先頭行へ戻り、そこから下 (前回の描画) を消す。
+    //    先頭行から `\e[J` (以降を消去) を出すと、プロンプトが画面最上段にあるとき
     //    (起動直後・Ctrl+L 後) 左上からの消去 = 画面全体の消去とみなされ、tmux の
-    //    scroll-on-clear 等が消す前の内容をスクロールバックへ退避する。キー入力ごとに
-    //    プロンプトがスクロールバックへ積まれてしまうので、ヘッダは上書き＋行末消去にし、
-    //    `\e[J` はヘッダの下からだけ出す (見た目は従来と同じ)。
+    //    scroll-on-clear 等が消す前の内容をスクロールバックへ退避する (キー入力ごとに
+    //    プロンプトが積まれる)。そこで先頭行は `\e[K` (行の消去) で消し、`\e[J` は 1 行下から
+    //    出す。間に出力が無いので Save/RestorePosition で戻ってもずれない。最下段で 1 行下へ
+    //    動けなかった場合は先頭行を消し直すだけで、どのみち描き直すので問題ない。
     if ed.lines_above_cursor > 0 {
         queue!(stdout(), cursor::MoveUp(ed.lines_above_cursor))?;
     }
-    queue!(stdout(), cursor::MoveToColumn(0))?;
-
-    // 2. ヘッダ行を描画 (表示幅を記録して lines_above_cursor の計算に使う)
-    let user = std::env::var("USER").unwrap_or_else(|_| "?".to_string());
-    let host = hostname();
-    let cwd = full_cwd();
-    let mut header_display_width = format!("{}@{} {}", user, host, cwd).width();
     queue!(
         stdout(),
-        SetForegroundColor(COLOR_USER_HOST),
-        Print(format!("{}@{}", user, host)),
-        ResetColor,
-        Print(" "),
-        SetForegroundColor(COLOR_CWD),
-        Print(&cwd),
-        ResetColor,
+        cursor::MoveToColumn(0),
+        Clear(ClearType::CurrentLine),
+        cursor::SavePosition,
+        cursor::MoveDown(1),
+        Clear(ClearType::FromCursorDown),
+        cursor::RestorePosition,
     )?;
-    if let Some(info) = git_info {
-        let branch_text = format!(" ({})", info);
-        header_display_width += branch_text.width();
-        queue!(
-            stdout(),
-            SetForegroundColor(COLOR_BRANCH),
-            Print(branch_text),
-            ResetColor,
-        )?;
-    }
-    // ヘッダ最終行の残り (前回の描画の残骸) を消す。ちょうど端末幅で終わった場合は
-    // 行末待機状態なので消さない (ここで消すと最後の 1 文字が消えるうえ、残りも無い)。
-    if !header_display_width.is_multiple_of(term_cols as usize) {
-        queue!(stdout(), Clear(ClearType::UntilNewLine))?;
-    }
-    // ヘッダの下 (入力行以降) をまとめて消す。最上段ではないので画面全体の消去にならない。
-    queue!(stdout(), Print("\r\n"), Clear(ClearType::FromCursorDown))?;
-    // ヘッダが端末幅を超えて折り返す場合の物理行数
-    let header_lines = header_physical_lines(header_display_width, term_cols);
 
-    // 3. 入力行: "$ " プレフィックス → カーソル手前 → 残りを印字 → カーソル復元
+    // 2. ヘッダ行 (プロンプトの最後の行より上) を描く。各行が端末幅で何行に折り返すかを
+    //    足し合わせ、lines_above_cursor の計算に使う。
+    let mut header_lines = 0u16;
+    for line in &prompt.header {
+        queue!(stdout(), Print(line), Print("\r\n"))?;
+        header_lines += header_physical_lines(crate::prompt::visible_width(line), term_cols);
+    }
+
+    // 3. 入力行: プロンプトの最後の行 (既定は "$ ") → カーソル手前 → 残りを印字 → カーソル復元
     //
     // wrap-pending 対策: cursor_display が term_cols の倍数のとき端末は行末待機状態
     // になる。\r\n で折り返しを確定してからカーソル物理列を 0 にリセット。
-    let cursor_display = PROMPT_PREFIX_WIDTH + ed.buf[..ed.cursor].width() as u16;
-    queue!(stdout(), Print(PROMPT_PREFIX), Print(&ed.buf[..ed.cursor]),)?;
+    let prefix_width = crate::prompt::visible_width(&prompt.prefix) as u16;
+    let cursor_display = prefix_width + ed.buf[..ed.cursor].width() as u16;
+    queue!(stdout(), Print(&prompt.prefix), Print(&ed.buf[..ed.cursor]),)?;
     let cursor_physical_col = if cursor_display > 0 && cursor_display.is_multiple_of(term_cols) {
         queue!(stdout(), Print("\r\n"))?;
         0u16

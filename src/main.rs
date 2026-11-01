@@ -5,6 +5,7 @@ mod events;
 mod exec;
 mod history;
 mod job;
+mod prompt;
 mod provider;
 mod selector;
 mod term;
@@ -38,8 +39,9 @@ const RC_FILE: &str = "~/.my_shell_rc";
 struct Shell {
     ed: LineEditor,
     history: History,
-    /// プロンプトに出す git の状態 (`main a1b2c3d` 等)
-    git_info: Option<String>,
+    /// 描画するプロンプト (既定 or `MY_SHELL_PS1` / `PS1` を展開したもの)。
+    /// コマンドの実行後にだけ作り直し、キー入力ごとの再描画では使い回す。
+    prompt: prompt::Prompt,
     ctx: ShellContext,
     ghost: Option<String>,
     /// 履歴ナビゲーション中の位置 (None = ナビゲーション外)
@@ -55,7 +57,7 @@ impl Shell {
         Self {
             ed: LineEditor::default(),
             history: History::load(),
-            git_info: fetch_git_info(),
+            prompt: prompt::Prompt::default(),
             ctx: ShellContext::default(),
             ghost: None,
             hist_idx: None,
@@ -67,11 +69,18 @@ impl Shell {
     fn redraw(&mut self) -> io::Result<()> {
         self.history.reload();
         builtin::reload_recent_paths(&mut self.ctx);
-        redraw_prompt(
-            &mut self.ed,
-            self.git_info.as_deref(),
-            self.ghost.as_deref(),
-        )
+        redraw_prompt(&mut self.ed, &self.prompt, self.ghost.as_deref())
+    }
+
+    /// プロンプトに出す情報を作り直す: git の状態を取り直して `MY_SHELL_GIT` に入れ
+    /// (カスタム PS1 から参照できる)、プロンプトを組み立てる。起動時と、コマンドの
+    /// 実行後にだけ呼ぶ。
+    fn refresh_prompt(&mut self) {
+        let git = fetch_git_info();
+        // SAFETY: メインスレッドからのみ呼ぶ。Ctrl+T 列挙のワーカースレッドは
+        // getenv/setenv を呼ばないので environ への並行アクセスは発生しない。
+        unsafe { std::env::set_var("MY_SHELL_GIT", git.as_deref().unwrap_or("")) };
+        self.prompt = prompt::build(git.as_deref(), self.ctx.last_status);
     }
 
     /// fuzzy ピッカーを開く。ピッカー内で別種別のキー (Ctrl+R/T/G/P) が押されたら
@@ -230,7 +239,7 @@ impl Shell {
                 ResetColor,
             )?;
         }
-        self.git_info = fetch_git_info();
+        self.refresh_prompt();
         self.ghost = None;
         self.hist_idx = None;
         self.saved_input.clear();
@@ -510,6 +519,8 @@ fn run() -> io::Result<i32> {
     // あとで送るので最終的な cwd が出る。
     term::notify_cwd();
 
+    // RC で設定した MY_SHELL_PS1 / PS1 や cd を反映するため、RC の後に作る。
+    shell.refresh_prompt();
     shell.ghost = compute_ghost(&shell.ed, &shell.history);
     shell.redraw()?;
 
