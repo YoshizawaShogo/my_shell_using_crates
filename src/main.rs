@@ -72,6 +72,12 @@ impl Shell {
         redraw_prompt(&mut self.ed, &self.prompt, self.ghost.as_deref())
     }
 
+    /// 履歴をたどって表示した行を、その後に編集したか (表示中の履歴と行が違うか)。
+    fn navigation_was_edited(&self) -> bool {
+        self.hist_idx
+            .is_some_and(|i| self.history.get_cmd(i) != Some(self.ed.line()))
+    }
+
     /// プロンプトに出す情報を作り直す: git の状態を取り直して `MY_SHELL_GIT` に入れ
     /// (カスタム PS1 から参照できる)、プロンプトを組み立てる。起動時と、コマンドの
     /// 実行後にだけ呼ぶ。
@@ -365,6 +371,12 @@ impl Shell {
                 if n == 0 {
                     return Ok(false);
                 }
+                // 履歴を表示した後に行を編集していたら (表示中の履歴と行が違う)、
+                // 編集後の行を新しいプレフィックスにして最新からたどり直す。
+                // (古いプレフィックス・位置のままだと、編集後の行に一致しない履歴が出る)
+                if self.navigation_was_edited() {
+                    self.hist_idx = None;
+                }
                 // 最初の押下時: 現在のバッファをプレフィックスとして保存
                 if self.hist_idx.is_none() {
                     self.saved_input = self.ed.line().to_string();
@@ -394,6 +406,10 @@ impl Shell {
             }
 
             ShellEvent::HistoryNext => {
+                // 編集した時点で履歴のナビゲーションは終わったものとみなす。
+                if self.navigation_was_edited() {
+                    self.hist_idx = None;
+                }
                 match self.hist_idx {
                     None => {} // ナビゲーション外では無視
                     Some(i) => {
