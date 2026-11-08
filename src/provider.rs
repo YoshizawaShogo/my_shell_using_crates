@@ -91,6 +91,10 @@ fn is_executable(_: &std::fs::DirEntry) -> bool {
 ///
 /// `ctx.prefix` はパスつき現在トークン (例: `/tmp/fo`, `~/pro`, `fo`)。ファイル名部分は
 /// 部分一致 (大小無視) で照合する。
+///
+/// ディレクトリ部にグロブ (`*` `?` `[...]`) があるとき (例: `./*/logs/`) は、一致する
+/// ディレクトリをすべて展開し、その中身を名前で重複を除いて候補にする。候補の頭には
+/// トークンのディレクトリ部をそのまま付けるので、`*` を保ったまま階層を進められる。
 pub struct PathProvider {
     pub dirs_only: bool,
 }
@@ -98,10 +102,6 @@ pub struct PathProvider {
 impl CandidateProvider for PathProvider {
     fn candidates(&self, ctx: &CompletionContext<'_>) -> Vec<String> {
         let (search_dir, file_prefix, display_prefix) = parse_path_token(ctx.prefix, ctx.cwd);
-
-        let Ok(entries) = std::fs::read_dir(&search_dir) else {
-            return vec![];
-        };
 
         // 照合はすべて大小無視。`needle` はトークンのファイル名部分全体。
         let needle = file_prefix.to_lowercase();
@@ -129,8 +129,14 @@ impl CandidateProvider for PathProvider {
         // 両経路でこの優先規則を共通化している。
         let mut prefix_matches: Vec<String> = Vec::new();
         let mut fallback_matches: Vec<String> = Vec::new();
+        // グロブで複数のディレクトリを読むとき、同じ名前の候補を 1 つにまとめる。
+        let mut seen = std::collections::HashSet::new();
 
-        for e in entries.flatten() {
+        let entries = expand_glob_dirs(&search_dir)
+            .into_iter()
+            .filter_map(|dir| std::fs::read_dir(dir).ok())
+            .flat_map(|rd| rd.flatten());
+        for e in entries {
             let name = e.file_name();
             let name_str = name.to_string_lossy();
             let name_lower = name_str.to_lowercase();
@@ -151,6 +157,9 @@ impl CandidateProvider for PathProvider {
             }
             let slash = if is_dir { "/" } else { "" };
             let candidate = format!("{}{}{}", display_prefix, name_str, slash);
+            if !seen.insert(candidate.clone()) {
+                continue;
+            }
             if is_prefix {
                 prefix_matches.push(candidate);
             } else {
@@ -166,6 +175,110 @@ impl CandidateProvider for PathProvider {
             prefix_matches
         }
     }
+}
+
+/// グロブで展開するディレクトリ数の上限 (`/*/*/` のような広すぎる指定で固まらないため)。
+const MAX_GLOB_DIRS: usize = 512;
+
+/// グロブの記号 (`*` `?` `[`) を含むか。
+fn has_glob(s: &str) -> bool {
+    s.contains(['*', '?', '['])
+}
+
+/// パスの各要素にあるグロブを展開し、一致するディレクトリをすべて返す。グロブを
+/// 含まなければ `dir` だけを返す (存在確認は呼び出し側の `read_dir` に任せる)。
+/// bash と同じく、`.` で始まらないパターンは隠しファイル (`.` 始まり) に一致させない。
+fn expand_glob_dirs(dir: &Path) -> Vec<PathBuf> {
+    if !has_glob(&dir.to_string_lossy()) {
+        return vec![dir.to_path_buf()];
+    }
+    let mut dirs = vec![PathBuf::new()];
+    for comp in dir.components() {
+        let comp = comp.as_os_str().to_string_lossy();
+        if has_glob(&comp) {
+            let mut next = Vec::new();
+            for d in &dirs {
+                let Ok(rd) = std::fs::read_dir(d) else {
+                    continue;
+                };
+                for e in rd.flatten() {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    if glob_match(&comp, &name) && e.path().is_dir() {
+                        next.push(d.join(&*name));
+                    }
+                }
+            }
+            next.sort();
+            next.truncate(MAX_GLOB_DIRS);
+            dirs = next;
+        } else {
+            for d in &mut dirs {
+                d.push(&*comp);
+            }
+        }
+        if dirs.is_empty() {
+            break;
+        }
+    }
+    dirs
+}
+
+/// `name` がグロブのパターン `pat` に一致するか。`*` (任意の文字列)・`?` (任意の 1 文字)・
+/// `[abc]` `[a-z]` `[!x]` `[^x]` (文字クラス) に対応する。`.` で始まる名前には、
+/// パターンも `.` で始まるときだけ一致する。
+fn glob_match(pat: &str, name: &str) -> bool {
+    if name.starts_with('.') && !pat.starts_with('.') {
+        return false;
+    }
+    let p: Vec<char> = pat.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    glob_match_chars(&p, &n)
+}
+
+fn glob_match_chars(p: &[char], n: &[char]) -> bool {
+    match p.first() {
+        None => n.is_empty(),
+        Some('*') => (0..=n.len()).any(|i| glob_match_chars(&p[1..], &n[i..])),
+        Some('?') => !n.is_empty() && glob_match_chars(&p[1..], &n[1..]),
+        Some('[') => {
+            let Some(&c) = n.first() else {
+                return false;
+            };
+            match match_char_class(p, c) {
+                Some((len, true)) => glob_match_chars(&p[len..], &n[1..]),
+                Some((_, false)) => false,
+                // 閉じ `]` が無ければ `[` はただの文字
+                None => c == '[' && glob_match_chars(&p[1..], &n[1..]),
+            }
+        }
+        Some(&c) => n.first() == Some(&c) && glob_match_chars(&p[1..], &n[1..]),
+    }
+}
+
+/// `p` 先頭の文字クラス (`[...]`) を読み、(消費した長さ, `c` が一致したか) を返す。
+/// 閉じ `]` が無ければ `None`。先頭 (否定の `!`/`^` の直後) の `]` は文字として扱う。
+fn match_char_class(p: &[char], c: char) -> Option<(usize, bool)> {
+    let mut i = 1;
+    let negate = matches!(p.get(i), Some('!' | '^'));
+    if negate {
+        i += 1;
+    }
+    let start = i;
+    let mut matched = false;
+    while i < p.len() {
+        if p[i] == ']' && i > start {
+            return Some((i + 1, matched != negate));
+        }
+        if i + 2 < p.len() && p[i + 1] == '-' && p[i + 2] != ']' {
+            matched |= p[i] <= c && c <= p[i + 2];
+            i += 3;
+        } else {
+            matched |= p[i] == c;
+            i += 1;
+        }
+    }
+    None
 }
 
 /// トークンをディレクトリ部とファイルプレフィックスに分解する。
@@ -362,6 +475,68 @@ mod tests {
         assert_eq!(dir, PathBuf::from("/home/x/sub/"));
         assert_eq!(file, "fo");
         assert_eq!(disp, "sub/");
+    }
+
+    #[test]
+    fn glob_match_patterns() {
+        assert!(glob_match("*", "logs"));
+        assert!(glob_match("a*z", "abcz") && !glob_match("a*z", "abc"));
+        assert!(glob_match("?b", "ab") && !glob_match("?b", "b"));
+        assert!(glob_match("[ab]x", "bx") && !glob_match("[ab]x", "cx"));
+        assert!(glob_match("[a-c]1", "b1") && !glob_match("[a-c]1", "d1"));
+        assert!(glob_match("[!a]1", "b1") && !glob_match("[!a]1", "a1"));
+        assert!(glob_match("[]]", "]")); // 先頭の ] は文字
+        assert!(glob_match("[x", "[x")); // 閉じ ] が無い [ は文字
+        // 隠しファイルにはパターンも . で始まるときだけ一致 (bash と同じ)
+        assert!(!glob_match("*", ".git") && glob_match(".*", ".git"));
+    }
+
+    /// `./*/logs/` のようにディレクトリ部にグロブがあるとき、一致する全ディレクトリの
+    /// 中身を重複なく候補にし、`*` を保ったまま返す。
+    #[test]
+    fn path_candidates_expand_glob_directories() {
+        let dir = std::env::temp_dir().join(format!("prov_glob_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (sub, files) in [
+            ("a/logs", &["x.log", "common.log"][..]),
+            ("b/logs", &["y.log", "common.log"][..]),
+            (".hidden/logs", &["h.log"][..]),
+        ] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+            for f in files {
+                std::fs::write(dir.join(sub).join(f), b"").unwrap();
+            }
+        }
+        std::fs::create_dir_all(dir.join("c")).unwrap(); // logs が無いディレクトリ
+        std::fs::create_dir_all(dir.join("a/logs/sub")).unwrap();
+        let history = History::load();
+        let cands = |prefix: &str, dirs_only: bool| {
+            let ctx = CompletionContext {
+                prefix,
+                cwd: &dir,
+                history: &history,
+                tab_end_in_token: None,
+            };
+            PathProvider { dirs_only }.candidates(&ctx)
+        };
+        assert_eq!(
+            cands("./*/logs/", false),
+            vec![
+                "./*/logs/common.log",
+                "./*/logs/sub/",
+                "./*/logs/x.log",
+                "./*/logs/y.log"
+            ]
+        );
+        assert_eq!(cands("./*/logs/co", false), vec!["./*/logs/common.log"]);
+        assert_eq!(cands("./[ab]/logs/", true), vec!["./[ab]/logs/sub/"]);
+        // 絶対パスでも同じ
+        let abs = format!("{}/*/logs/y", dir.display());
+        assert_eq!(
+            cands(&abs, false),
+            vec![format!("{}/*/logs/y.log", dir.display())]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// tab_end フィルタ経路でも「トークン全体の前方一致」を最優先する。
