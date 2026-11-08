@@ -134,32 +134,16 @@ impl Shell {
         // 入力が空のときは cd モード: ディレクトリのみ列挙し `cd <path>` で挿入する。
         let empty = self.ed.is_empty();
         // カーソル前のトークンを取得（owned にして借用を切る）
-        let token: String = {
-            let before = &self.ed.line()[..self.ed.cursor()];
-            let token_start = before.rfind(' ').map(|i| i + 1).unwrap_or(0);
-            before[token_start..].to_owned()
-        };
-        // トークンに '/' が含まれる場合はそのディレクトリをルートにする
-        let (root, token_query, dir_part) = if !token.is_empty() && token.contains('/') {
-            let last_slash = token.rfind('/').unwrap();
-            let dir = token[..=last_slash].to_owned();
-            let file_part = token[last_slash + 1..].to_owned();
-            let root = if dir.starts_with('/') {
-                std::path::PathBuf::from(&dir)
-            } else if let Some(rest) = dir.strip_prefix("~/") {
-                let home = std::env::var("HOME").unwrap_or_default();
-                std::path::PathBuf::from(home).join(rest)
-            } else {
-                cwd.join(&dir)
-            };
-            let query = if file_part.is_empty() {
-                None
-            } else {
-                Some(file_part)
-            };
-            (root, query, Some(dir))
-        } else {
-            (cwd.clone(), None, None)
+        let token = completion::current_token(&self.ed.line()[..self.ed.cursor()]).to_owned();
+        // トークンに '/' が含まれる場合はそのディレクトリをルートにし、残りを初期クエリに
+        // する。分割とディレクトリの解決 (~/ ・絶対・相対) は Tab 補完と同じ関数を使う。
+        let (root, token_query, dir_part) = match provider::parse_path_token(&token, &cwd) {
+            (_, _, "") => (cwd.clone(), None, None), // '/' を含まない
+            (dir, file, disp) => (
+                dir,
+                (!file.is_empty()).then(|| file.to_owned()),
+                Some(disp.to_owned()),
+            ),
         };
         // 切り替えで来たときは引き継いだクエリを優先する
         let initial_query = carried.or(token_query);

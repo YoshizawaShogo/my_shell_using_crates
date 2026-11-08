@@ -332,15 +332,18 @@ fn classify(prefix: &str) -> CompletionKind {
 }
 
 /// `prefix` の最後のホワイトスペースの次のバイト位置 (= 現在トークンの開始位置)。
+/// 全角スペースなど複数バイトの空白もあるので、空白のバイト長ぶん進める
+/// (`+ 1` だと文字の途中を指し、スライスで panic する)。
 fn token_start_pos(prefix: &str) -> usize {
     prefix
-        .rfind(|c: char| c.is_whitespace())
-        .map(|i| i + 1)
-        .unwrap_or(0)
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(0, |(i, c)| i + c.len_utf8())
 }
 
 /// カーソル直前の現在トークン文字列。
-fn current_token(prefix: &str) -> &str {
+pub(crate) fn current_token(prefix: &str) -> &str {
     &prefix[token_start_pos(prefix)..]
 }
 
@@ -409,6 +412,14 @@ mod tests {
         assert_eq!(token_start_pos("git comm"), 4);
         assert_eq!(token_start_pos("git"), 0);
         assert_eq!(token_start_pos("a b c"), 4);
+    }
+
+    #[test]
+    fn token_start_after_multibyte_whitespace() {
+        // 全角スペース (U+3000, 3 バイト) も空白。区切りの直後は文字境界でなければならない。
+        assert_eq!(token_start_pos("ls\u{3000}src"), "ls\u{3000}".len());
+        assert_eq!(current_token("ls\u{3000}src"), "src");
+        assert_eq!(current_token("ls\u{3000}"), "");
     }
 
     #[test]

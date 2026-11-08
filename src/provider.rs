@@ -175,7 +175,7 @@ impl CandidateProvider for PathProvider {
 /// 例: `"/tmp/fo"` → `(PathBuf("/tmp"), "fo", "/tmp/")`
 /// 例: `"~/pro"` → `(PathBuf("~"), "pro", "~/")`
 /// 例: `"fo"` → `(cwd, "fo", "")`
-fn parse_path_token<'a>(token: &'a str, cwd: &Path) -> (PathBuf, &'a str, &'a str) {
+pub(crate) fn parse_path_token<'a>(token: &'a str, cwd: &Path) -> (PathBuf, &'a str, &'a str) {
     match token.rfind('/') {
         Some(slash) => {
             let dir_part = &token[..=slash]; // "/tmp/" や "~/"
